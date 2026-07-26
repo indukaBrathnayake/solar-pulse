@@ -1,0 +1,204 @@
+/* ============================================================
+   Solar Pulse · instrument panel under a tropical night sky
+   palette: night #0D1626 · panel #14213A · brass #F4B942
+            teal #46B5AD · leaf #58C08A · coral #EF6F5E · ice #A9BFD4
+   ============================================================ */
+
+:root {
+  --night: #0D1626;
+  --panel: #14213A;
+  --panel-2: #182948;
+  --line: #24365C;
+  --brass: #F4B942;
+  --teal: #46B5AD;
+  --leaf: #58C08A;
+  --coral: #EF6F5E;
+  --ice: #A9BFD4;
+  --text: #EDF3FA;
+  --dim: #7C90AB;
+  --radius: 18px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background:
+    radial-gradient(1200px 500px at 70% -10%, #17294A 0%, transparent 60%),
+    radial-gradient(900px 420px at 10% 110%, #112240 0%, transparent 55%),
+    var(--night);
+  color: var(--text);
+  font-family: "Space Grotesk", system-ui, sans-serif;
+  min-height: 100vh;
+  padding: 22px clamp(14px, 4vw, 48px) 60px;
+}
+
+.mono { font-family: "IBM Plex Mono", monospace; }
+
+/* ---------------- header ---------------- */
+.top {
+  display: flex; flex-wrap: wrap; gap: 14px;
+  align-items: center; justify-content: space-between;
+  margin-bottom: 18px;
+}
+.wordmark { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.wordmark h1 { font-size: 1.35rem; letter-spacing: 0.24em; font-weight: 700; }
+.rig { color: var(--dim); font-size: 0.8rem; letter-spacing: 0.04em; }
+
+.mark-dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--dim); align-self: center;
+  transition: background 0.4s;
+}
+body.live .mark-dot { background: var(--leaf); animation: heartbeat 2.4s ease-in-out infinite; }
+@keyframes heartbeat { 0%,100% { box-shadow: 0 0 0 0 rgba(88,192,138,0.55);} 50% { box-shadow: 0 0 0 9px rgba(88,192,138,0);} }
+
+/* ---------------- status pills ---------------- */
+.pills { display: flex; gap: 8px; flex-wrap: wrap; }
+.pill {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 6px 12px; border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(20,33,58,0.75);
+  font-size: 0.74rem; letter-spacing: 0.06em; color: var(--dim);
+  transition: color 0.3s, border-color 0.3s;
+}
+.pill i { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); transition: background 0.3s; }
+.pill.on       { color: var(--text); border-color: rgba(88,192,138,0.5); }
+.pill.on i     { background: var(--leaf); }
+.pill.gold     { color: var(--text); border-color: rgba(244,185,66,0.55); }
+.pill.gold i   { background: var(--brass); }
+.pill.warn     { color: var(--coral); border-color: rgba(239,111,94,0.6); }
+.pill.warn i   { background: var(--coral); }
+.hidden { display: none !important; }
+
+/* ---------------- offline banner ---------------- */
+.offline-banner {
+  background: rgba(239,111,94,0.12);
+  border: 1px solid rgba(239,111,94,0.45);
+  color: #FFB4A8;
+  padding: 10px 16px; border-radius: 12px;
+  font-size: 0.85rem; margin-bottom: 16px;
+}
+
+/* ---------------- energy river ---------------- */
+.river-wrap {
+  background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 8px 6px 0;
+  margin-bottom: 18px;
+  overflow: hidden;
+}
+.river { width: 100%; height: auto; display: block; }
+
+.conduit { fill: none; stroke: var(--line); stroke-width: 6; stroke-linecap: round; }
+.flow {
+  fill: none; stroke-width: 6; stroke-linecap: round;
+  stroke-dasharray: 14 22;
+  opacity: 0;
+  transition: opacity 0.5s;
+}
+#flow-pv   { stroke: var(--brass); }
+#flow-load { stroke: var(--teal); }
+
+.river-wrap.pv-on   #flow-pv,
+.river-wrap.load-on #flow-load { opacity: 1; animation: flowdash 1.1s linear infinite; }
+.river-wrap.load-on #flow-pv.reverse { animation-direction: reverse; }
+@keyframes flowdash { to { stroke-dashoffset: -36; } }
+
+#sun-rays line { stroke: var(--brass); stroke-width: 5; stroke-linecap: round; opacity: 0.35; transition: opacity 0.6s; }
+.sun-core { fill: #1D2B4C; stroke: var(--brass); stroke-width: 3; transition: fill 0.6s; }
+.river-wrap.pv-on .sun-core { fill: rgba(244,185,66,0.16); }
+.river-wrap.pv-on #sun-rays line { opacity: 1; }
+.river-wrap.pv-on #sun-rays { animation: spin 14s linear infinite; transform-origin: 0 0; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.batt-shell { fill: #101C36; stroke: var(--teal); stroke-width: 3; }
+.batt-nub   { fill: var(--teal); }
+.batt-fill  { fill: rgba(70,181,173,0.30); transition: y 1.2s ease, height 1.2s ease; }
+.batt-wave  { fill: rgba(70,181,173,0.5); animation: waveslide 5s linear infinite; }
+@keyframes waveslide { from { transform: translateX(0);} to { transform: translateX(120px);} }
+
+.home-body   { fill: #101C36; stroke: var(--ice); stroke-width: 3; }
+.home-roof   { fill: none; stroke: var(--ice); stroke-width: 3; stroke-linecap: round; }
+.home-window { fill: #1D2B4C; transition: fill 0.6s; }
+.river-wrap.load-on .home-window { fill: var(--brass); filter: drop-shadow(0 0 8px rgba(244,185,66,0.7)); }
+
+.node-value { fill: var(--text); font-family: "IBM Plex Mono", monospace; font-size: 20px; font-weight: 600; text-anchor: middle; }
+.node-mini  { fill: var(--ice);  font-family: "IBM Plex Mono", monospace; font-size: 13px; text-anchor: middle; }
+.node-label { fill: var(--dim);  font-size: 13px; letter-spacing: 0.28em; text-anchor: middle; }
+.node-sub   { fill: var(--ice);  font-size: 13px; text-anchor: middle; font-family: "IBM Plex Mono", monospace; }
+
+.river-wrap.stale { filter: grayscale(0.85) brightness(0.75); }
+
+/* ---------------- cards ---------------- */
+.cards {
+  display: grid; gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  margin-bottom: 18px;
+}
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+}
+.card-eyebrow { font-size: 0.72rem; letter-spacing: 0.2em; text-transform: uppercase; margin-bottom: 8px; }
+.card-eyebrow.brass { color: var(--brass); }
+.card-eyebrow.teal  { color: var(--teal); }
+.card-eyebrow.ice   { color: var(--ice); }
+.card-num {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: clamp(1.9rem, 4vw, 2.6rem);
+  font-weight: 600; line-height: 1;
+}
+.card-num .unit { font-size: 0.95rem; color: var(--dim); margin-left: 8px; font-weight: 400; }
+.card-sub { color: var(--dim); font-size: 0.8rem; margin-top: 10px; }
+
+/* ---------------- panels / cells ---------------- */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  margin-bottom: 18px;
+}
+.panel-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px; margin-bottom: 14px; }
+.panel-head h2 { font-size: 0.95rem; letter-spacing: 0.12em; text-transform: uppercase; }
+.panel-sub { color: var(--dim); font-size: 0.78rem; font-family: "IBM Plex Mono", monospace; }
+
+.cells { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+.cell { text-align: center; }
+.cell-bar {
+  height: 88px; border-radius: 10px;
+  background: #101C36; border: 1px solid var(--line);
+  display: flex; align-items: flex-end; overflow: hidden;
+}
+.cell-fill {
+  width: 100%; height: 0%;
+  background: linear-gradient(180deg, rgba(70,181,173,0.9), rgba(70,181,173,0.45));
+  transition: height 1s ease;
+}
+.cell-v { font-family: "IBM Plex Mono", monospace; font-size: 0.92rem; margin-top: 8px; }
+.cell-n { color: var(--dim); font-size: 0.72rem; letter-spacing: 0.2em; }
+
+/* ---------------- charts ---------------- */
+.charts { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+
+/* ---------------- footer ---------------- */
+.foot {
+  margin-top: 20px; color: var(--dim);
+  font-size: 0.78rem; display: flex; gap: 8px; flex-wrap: wrap;
+  font-family: "IBM Plex Mono", monospace;
+}
+.foot-dim { opacity: 0.65; }
+
+/* ---------------- motion preference ---------------- */
+@media (prefers-reduced-motion: reduce) {
+  .flow, #sun-rays, .batt-wave, .mark-dot { animation: none !important; }
+}
+
+@media (max-width: 620px) {
+  .node-label, .node-sub { font-size: 16px; }
+  .wordmark h1 { font-size: 1.1rem; }
+}
