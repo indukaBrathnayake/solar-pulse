@@ -3,9 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Solar Pulse · Peradeniya rig</title>
+<title>Solar Pulse · Atabage, Udagama</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -13,14 +13,14 @@
 <header class="top">
   <div class="wordmark">
     <span class="mark-dot" id="heartbeat"></span>
-    <h1>SOLAR&nbsp;PULSE</h1>
-    <span class="rig">Peradeniya rig · 580 W · LiFePO<sub>4</sub> 4S 100 Ah</span>
+    <h1>Solar Pulse</h1>
+    <span class="rig">Atabage, Udagama · 580 W · LiFePO<sub>4</sub> 4S 100 Ah</span>
   </div>
   <div class="pills" id="pills">
     <span class="pill" id="pill-esp"><i></i>Monitor</span>
     <span class="pill" id="pill-bms"><i></i>BMS link</span>
     <span class="pill" id="pill-pv"><i></i>PV</span>
-    <span class="pill" id="pill-load"><i></i>Inverter load</span>
+    <span class="pill" id="pill-load"><i></i>Inverter</span>
     <span class="pill" id="pill-bal"><i></i>Balancer</span>
     <span class="pill warn hidden" id="pill-alarm"><i></i>Alarm</span>
   </div>
@@ -30,60 +30,71 @@
   Monitor offline · showing last saved data from <span id="last-seen-banner">--</span>
 </div>
 
-<!-- ======================= ENERGY RIVER ======================= -->
-<section class="river-wrap" id="river">
-  <svg viewBox="0 0 1000 250" class="river" aria-label="Live energy flow">
-    <!-- conduits -->
-    <path id="cond-pv"   class="conduit" d="M 205 125 C 320 125, 360 125, 455 125"/>
-    <path id="flow-pv"   class="flow"    d="M 205 125 C 320 125, 360 125, 455 125"/>
-    <path id="cond-load" class="conduit" d="M 585 125 C 690 125, 730 125, 830 125"/>
-    <path id="flow-load" class="flow"    d="M 585 125 C 690 125, 730 125, 830 125"/>
+<!-- ======================= ENERGY FLOW ======================= -->
+<section class="flow-card" id="river">
+  <div class="flow-row">
 
-    <!-- sun -->
-    <g id="sun" transform="translate(130,125)">
-      <g id="sun-rays">
-        <line x1="0" y1="-58" x2="0" y2="-72"/><line x1="0" y1="58" x2="0" y2="72"/>
-        <line x1="-58" y1="0" x2="-72" y2="0"/><line x1="58" y1="0" x2="72" y2="0"/>
-        <line x1="-41" y1="-41" x2="-51" y2="-51"/><line x1="41" y1="41" x2="51" y2="51"/>
-        <line x1="-41" y1="41" x2="-51" y2="51"/><line x1="41" y1="-41" x2="51" y2="-51"/>
-      </g>
-      <circle r="44" class="sun-core"/>
-      <text y="7" class="node-value" id="pv-watts">-- W</text>
-    </g>
-    <text x="130" y="215" class="node-label">HARVEST</text>
-    <text x="130" y="233" class="node-sub" id="pv-state">waiting…</text>
+    <div class="node">
+      <div class="node-icon sun-icon" id="sun-icon">
+        <svg viewBox="0 0 60 60" class="ray-svg" id="sun-rays">
+          <g stroke="currentColor" stroke-width="4" stroke-linecap="round">
+            <line x1="30" y1="2" x2="30" y2="11"/><line x1="30" y1="49" x2="30" y2="58"/>
+            <line x1="2" y1="30" x2="11" y2="30"/><line x1="49" y1="30" x2="58" y2="30"/>
+            <line x1="9" y1="9" x2="15.5" y2="15.5"/><line x1="44.5" y1="44.5" x2="51" y2="51"/>
+            <line x1="9" y1="51" x2="15.5" y2="44.5"/><line x1="44.5" y1="15.5" x2="51" y2="9"/>
+          </g>
+        </svg>
+        <div class="sun-core"></div>
+      </div>
+      <div class="node-text">
+        <p class="node-value" id="pv-watts">-- W</p>
+        <p class="node-label">Harvest</p>
+        <p class="node-sub" id="pv-state">waiting…</p>
+      </div>
+    </div>
 
-    <!-- battery -->
-    <g id="battery" transform="translate(520,125)">
-      <rect x="-62" y="-46" width="124" height="92" rx="14" class="batt-shell"/>
-      <rect x="62" y="-14" width="10" height="28" rx="3" class="batt-nub"/>
-      <clipPath id="batt-clip"><rect x="-58" y="-42" width="116" height="84" rx="10"/></clipPath>
-      <g clip-path="url(#batt-clip)">
-        <rect id="batt-fill" x="-58" y="42" width="116" height="84" class="batt-fill"/>
-        <path id="batt-wave" class="batt-wave"
-          d="M -180 0 Q -150 -7 -120 0 T -60 0 T 0 0 T 60 0 T 120 0 T 180 0 V 90 H -180 Z"/>
-      </g>
-      <text y="-2" class="node-value" id="soc-big">--%</text>
-      <text y="22" class="node-mini" id="pack-vi">-- V · -- A</text>
-    </g>
-    <text x="520" y="215" class="node-label">BATTERY</text>
-    <text x="520" y="233" class="node-sub" id="batt-state">waiting…</text>
+    <div class="connector" id="conn-pv">
+      <div class="dashes"></div>
+    </div>
 
-    <!-- home -->
-    <g id="home" transform="translate(900,125)">
-      <path class="home-body" d="M -46 8 L 0 -38 L 46 8 L 46 46 L -46 46 Z"/>
-      <path class="home-roof" d="M -54 12 L 0 -42 L 54 12"/>
-      <rect id="home-window" x="-14" y="12" width="28" height="24" rx="3" class="home-window"/>
-    </g>
-    <text x="900" y="215" class="node-label">HOME</text>
-    <text x="900" y="233" class="node-sub" id="load-state">waiting…</text>
-  </svg>
+    <div class="node node-battery">
+      <div class="batt-shell">
+        <div class="batt-fill" id="batt-fill"><div class="batt-wave"></div></div>
+        <div class="batt-pct" id="soc-big">--%</div>
+        <div class="batt-nub"></div>
+      </div>
+      <div class="node-text">
+        <p class="node-label">Battery</p>
+        <p class="node-sub" id="batt-state">waiting…</p>
+        <p class="node-detail" id="pack-vi">-- V · -- A</p>
+      </div>
+    </div>
+
+    <div class="connector" id="conn-load">
+      <div class="dashes"></div>
+    </div>
+
+    <div class="node">
+      <div class="node-icon home-icon">
+        <svg viewBox="0 0 60 60">
+          <path d="M8 30 L30 10 L52 30 L52 54 L8 54 Z" fill="none" stroke="currentColor" stroke-width="4" stroke-linejoin="round"/>
+          <rect id="home-window" x="24" y="36" width="12" height="14" rx="2"/>
+        </svg>
+      </div>
+      <div class="node-text">
+        <p class="node-value" id="load-watts">-- W</p>
+        <p class="node-label">Home</p>
+        <p class="node-sub" id="load-state">waiting…</p>
+      </div>
+    </div>
+
+  </div>
 </section>
 
 <!-- ======================= STAT CARDS ======================= -->
 <section class="cards">
   <article class="card">
-    <p class="card-eyebrow brass">Harvested today</p>
+    <p class="card-eyebrow amber">Harvested today</p>
     <p class="card-num"><span id="today-chg">0.00</span><span class="unit">kWh</span></p>
     <p class="card-sub">peak <span id="peak-w">0</span> W · lifetime <span id="life-chg">0</span> kWh</p>
   </article>
@@ -92,12 +103,16 @@
     <p class="card-eyebrow teal">Battery</p>
     <p class="card-num"><span id="rem-ah">--</span><span class="unit">Ah left</span></p>
     <p class="card-sub">SOH <span id="soh">--</span>% · cycles <span id="cycles">--</span> · <span id="mos-line">MOS --</span></p>
+    <div class="time-remaining">
+      <div class="time-track"><div class="time-fill" id="time-fill"></div></div>
+      <p class="time-label" id="time-label">estimating…</p>
+    </div>
   </article>
 
   <article class="card">
     <p class="card-eyebrow ice">Drawn by home today</p>
     <p class="card-num"><span id="today-dis">0.00</span><span class="unit">kWh</span></p>
-    <p class="card-sub">fridge + LED circuit · lifetime <span id="life-dis">0</span> kWh</p>
+    <p class="card-sub">lifetime <span id="life-dis">0</span> kWh</p>
   </article>
 </section>
 
@@ -115,22 +130,29 @@
   </div>
 </section>
 
-<!-- ======================= CHARTS ======================= -->
-<section class="charts">
-  <div class="panel">
-    <div class="panel-head"><h2>Today · battery power</h2><p class="panel-sub">+ charging · − feeding the home</p></div>
-    <canvas id="chart-today" height="230"></canvas>
+<!-- ======================= CHART ======================= -->
+<section class="panel">
+  <div class="panel-head chart-head">
+    <h2>Generation &amp; usage</h2>
+    <div class="chart-controls">
+      <div class="seg" id="view-seg">
+        <button class="seg-btn active" data-view="day">Day</button>
+        <button class="seg-btn" data-view="month">Month</button>
+        <button class="seg-btn" data-view="year">Year</button>
+      </div>
+      <input type="date" id="pick-day" class="picker">
+      <input type="month" id="pick-month" class="picker hidden">
+      <input type="number" id="pick-year" class="picker hidden" min="2020" max="2100">
+      <button class="btn-export" id="btn-export">Export CSV</button>
+    </div>
   </div>
-  <div class="panel">
-    <div class="panel-head"><h2>Last 30 days · harvest</h2><p class="panel-sub">year <span id="year-total">0</span> kWh so far</p></div>
-    <canvas id="chart-month" height="230"></canvas>
-  </div>
+  <p class="panel-sub" id="chart-caption">Today's power, watts in and out of the battery</p>
+  <canvas id="chart-main" height="220"></canvas>
 </section>
 
 <footer class="foot">
   <span>Last data <span id="last-seen">--</span></span>
   <span id="buffered-note" class="hidden">· <span id="buffered-n">0</span> samples waiting on the ESP</span>
-  <span class="foot-dim">Battery-side measurement: loads fed straight from PV in daylight are not counted.</span>
 </footer>
 
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
