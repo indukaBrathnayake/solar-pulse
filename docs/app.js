@@ -46,6 +46,14 @@ function setPill(id, state, label) {
   p.childNodes[1].textContent = label;
 }
 
+/* ---------------- relay chip helper ---------------- */
+function chip(id, on, tone) {
+  const el = $(id);
+  if (!el) return;
+  el.classList.remove("on", "warn", "gold");
+  if (on) el.classList.add(tone);
+}
+
 function fmtHM(hours) {
   if (!isFinite(hours) || hours <= 0) return "--";
   const totalMin = Math.round(hours * 60);
@@ -130,7 +138,31 @@ function render() {
   $("time-fill").style.background = color;
   $("time-label").textContent = fresh ? label : "no recent data";
 
-  tween($("today-chg"), (live.todayChg ?? 0) / 1000, 2);
+  /* ---------- source relays, travel mode ----------
+     Sent by firmware v3. Older firmware simply omits these keys,
+     in which case the card stays on "--" and nothing breaks. */
+  const src = live.src || "none";
+  const srcTxt = src === "solar" ? "Solar + battery"
+               : src === "utility" ? "Utility · CEB"
+               : "not switched";
+  $("src-name").textContent = fresh && live.src ? srcTxt : "--";
+  $("src-why").textContent = live.why
+    ? (live.manual ? "manual · " : "automatic · ") + live.why
+    : "controller not reporting";
+  chip("chip-solar", fresh && live.relayS, "on");
+  chip("chip-util",  fresh && live.relayU, "warn");
+  chip("chip-light", fresh && live.light,  "gold");
+  $("util-min").textContent  = live.utilMin ?? 0;
+  $("pv-now").textContent    = (live.pvW ?? 0).toFixed(0);
+  $("load-now").textContent  = (live.loadW ?? 0).toFixed(0);
+
+  setPill("pill-src",
+    !fresh || !live.src ? "" : src === "solar" ? "on" : src === "utility" ? "warn" : "",
+    src === "solar" ? "On solar" : src === "utility" ? "On CEB" : "Source --");
+  $("pill-travel").classList.toggle("hidden", !live.travel);
+  if (live.travel) setPill("pill-travel", "gold", "Travel mode");
+
+  tween($("today-chg"), (live.harvestWh ?? live.todayChg ?? 0) / 1000, 2);
   tween($("today-dis"), (live.todayDis ?? 0) / 1000, 2);
   tween($("peak-w"), live.peakW ?? 0, 0);
   tween($("life-chg"), (live.lifeChg ?? 0) / 1000, 1);
@@ -317,8 +349,138 @@ $("btn-export").addEventListener("click", () => {
   downloadText(`solar-pulse-${currentRows.kind}-${currentRows.date}.csv`, csv);
 });
 
+/* ============================================================
+   MONTHLY TAB
+   Built from /daily, the one-row-per-day log the ESP32 keeps in
+   its own flash and mirrors to Firebase. Twelve bars, one per
+   month of the chosen year, plus a table of the same numbers.
+   ============================================================ */
+const MONTH_NAMES = ["January","February","March","April","May","June",
+                     "July","August","September","October","November","December"];
+let monthlyChart = null;
+let monthlyRows = null;
+
+function themeColor(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+async function loadMonthlyTab() {
+  const year = String($("pick-myear").value || new Date().getFullYear());
+
+  const rows = (await ensureDailyCache()).filter((r) => r.date.startsWith(year));
+  const kwh = Array(12).fill(0), used = Array(12).fill(0), days = Array(12).fill(0);
+  rows.forEach((r) => {
+    const m = parseInt(r.date.slice(5, 7), 10) - 1;
+    if (m < 0 || m > 11) return;
+    // harvestWh is firmware v3; fall back to chgWh for older rows
+    kwh[m]  += (r.harvestWh ?? r.chgWh ?? 0) / 1000;
+    used[m] += (r.disWh || 0) / 1000;
+    days[m] += 1;
+  });
+
+  const total = kwh.reduce((a, b) => a + b, 0);
+  const totalUsed = used.reduce((a, b) => a + b, 0);
+  const totalDays = days.reduce((a, b) => a + b, 0);
+  let bestIdx = 0;
+  kwh.forEach((v, i) => { if (v > kwh[bestIdx]) bestIdx = i; });
+
+  /* ---- summary cards ---- */
+  $("yr-kwh").textContent      = total.toFixed(1);
+  $("yr-days").textContent     = totalDays;
+  $("yr-best").textContent     = total > 0 ? MONTH_NAMES[bestIdx].slice(0, 3) : "--";
+  $("yr-best-kwh").textContent = kwh[bestIdx].toFixed(1);
+  $("yr-used").textContent     = totalUsed.toFixed(1);
+  $("yr-days2").textContent    = totalDays;
+
+  /* ---- bar chart ---- */
+  const labels = MONTH_NAMES.map((m) => m.slice(0, 3));
+  const solar = themeColor("--amber"), blue = themeColor("--use"), dim = themeColor("--muted");
+  const grid = themeColor("--grid");
+  const datasets = [
+    { label: "Harvested", data: kwh,  backgroundColor: solar, borderRadius: 6 },
+    { label: "Used",      data: used, backgroundColor: blue,  borderRadius: 6 },
+  ];
+
+  if (!monthlyChart) {
+    monthlyChart = new Chart($("chart-monthly"), {
+      type: "bar",
+      data: { labels, datasets },
+      options: {
+        maintainAspectRatio: false,
+        animation: { duration: 300 },
+        plugins: { legend: { labels: { boxWidth: 14, boxHeight: 3, font: { size: 11 } } } },
+        scales: { y: { beginAtZero: true, title: { display: true, text: "kWh" } } },
+      },
+    });
+  } else {
+    monthlyChart.data.labels = labels;
+    monthlyChart.data.datasets = datasets;
+  }
+  const o = monthlyChart.options;
+  o.scales.x.ticks = Object.assign(o.scales.x.ticks || {}, { color: dim });
+  o.scales.y.ticks = Object.assign(o.scales.y.ticks || {}, { color: dim });
+  o.scales.x.grid = Object.assign(o.scales.x.grid || {}, { color: grid });
+  o.scales.y.grid = Object.assign(o.scales.y.grid || {}, { color: grid });
+  o.scales.y.title.color = dim;
+  o.plugins.legend.labels.color = dim;
+  monthlyChart.update();
+
+  /* ---- table ---- */
+  $("mtbody").innerHTML =
+    kwh.map((v, i) =>
+      `<tr><td>${MONTH_NAMES[i]}</td><td>${v.toFixed(2)}</td>` +
+      `<td>${used[i].toFixed(2)}</td><td>${days[i]}</td></tr>`).join("") +
+    `<tr class="mtotal"><td>Total ${year}</td><td>${total.toFixed(2)}</td>` +
+    `<td>${totalUsed.toFixed(2)}</td><td>${totalDays}</td></tr>`;
+
+  $("monthly-caption").textContent =
+    `Total kWh harvested each month of ${year} · ${total.toFixed(1)} kWh so far`;
+
+  monthlyRows = {
+    kind: "monthly", date: year,
+    columns: ["month", "harvested_kWh", "used_kWh", "days_logged"],
+    rows: kwh.map((v, i) => ({
+      month: `${year}-${String(i + 1).padStart(2, "0")}`,
+      harvested_kWh: v.toFixed(3),
+      used_kWh: used[i].toFixed(3),
+      days_logged: days[i],
+    })),
+  };
+}
+
+$("pick-myear").value = String(new Date().getFullYear());
+$("pick-myear").addEventListener("change", loadMonthlyTab);
+$("btn-export-month").addEventListener("click", () => {
+  if (!monthlyRows) return;
+  downloadText(`solar-pulse-monthly-${monthlyRows.date}.csv`,
+               toCSV(monthlyRows.columns, monthlyRows.rows));
+});
+
+/* ---------------- bottom tab bar ---------------- */
+document.querySelectorAll(".nav-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".nav-btn").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    const tab = btn.dataset.tab;
+    $("tab-live").classList.toggle("hidden", tab !== "live");
+    $("tab-monthly").classList.toggle("hidden", tab !== "monthly");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    if (tab === "monthly") loadMonthlyTab();
+    else if (chart) chart.resize();
+  });
+});
+
 /* ---------------- wire it up ---------------- */
 db.ref("live").on("value", (snap) => { live = snap.val(); render(); });
 setInterval(render, 3000);             // staleness watchdog, faster tick for a live feel
 refreshChart();
-setInterval(() => { dailyCache = null; refreshChart(); }, 30 * 60 * 1000);
+setInterval(() => {
+  dailyCache = null;
+  refreshChart();
+  if (!$("tab-monthly").classList.contains("hidden")) loadMonthlyTab();
+}, 30 * 60 * 1000);
+
+/* redraw the monthly bars when the theme toggle flips the palette */
+new MutationObserver(() => {
+  if (monthlyChart && !$("tab-monthly").classList.contains("hidden")) loadMonthlyTab();
+}).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });

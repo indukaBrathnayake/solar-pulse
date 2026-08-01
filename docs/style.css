@@ -484,15 +484,18 @@ html[data-theme="light"] .batt-pct { text-shadow: 0 1px 4px rgba(255, 255, 255, 
   .pills::-webkit-scrollbar { display: none; }
   .pill { flex-shrink: 0; }
 
-  /* flow stacks vertically: sun → battery → home, current flows DOWN */
-  .flow-row { flex-direction: column; align-items: stretch; gap: 4px; }
-  .node { width: 100%; flex-direction: row; justify-content: flex-start; text-align: left; gap: 14px; }
+  /* flow stacks vertically: sun → battery → home, current flows DOWN.
+     Each row is centered as a unit (icon + text together) instead of
+     hugging the left edge, so the connector dashes below can also sit
+     on the card's centre line. */
+  .flow-row { flex-direction: column; align-items: center; gap: 4px; }
+  .node { width: 100%; flex-direction: row; justify-content: center; text-align: left; gap: 14px; }
   .node-text { align-items: flex-start; }
   .node-icon, .batt-shell { flex-shrink: 0; }
   .node-value, .node-label, .node-sub, .node-detail { margin-top: 0; }
   .node-detail { white-space: normal; }
 
-  .connector { flex: none; width: 4px; height: 26px; margin: 0 0 0 37px; }
+  .connector { flex: none; width: 4px; height: 26px; margin: 0 auto; }
   #conn-pv .dashes   { background-image: repeating-linear-gradient(180deg, var(--amber) 0 12px, transparent 12px 22px); }
   #conn-load .dashes { background-image: repeating-linear-gradient(180deg, var(--gen) 0 12px, transparent 12px 22px); }
   .flow-card.pv-on #conn-pv .dashes,
@@ -532,3 +535,103 @@ html[data-theme="light"] .batt-pct { text-shadow: 0 1px 4px rgba(255, 255, 255, 
     animation: none !important;
   }
 }
+
+/* ============================================================
+   v3 additions
+   · bottom tab bar (Live / Monthly)
+   · source card: which relay is carrying the house
+   · monthly table
+   ============================================================ */
+
+/* the toast sits above the nav bar now */
+body { padding-bottom: 96px; }
+
+.tab-panel { display: block; }
+
+/* ---------------- source card ---------------- */
+.card.accent-src::before { background: linear-gradient(180deg, var(--violet), transparent); }
+.card-eyebrow.violet { color: var(--violet); }
+.card.accent-src .card-num {
+  font-family: "Chakra Petch", sans-serif;
+  font-size: clamp(1.05rem, 2.2vw, 1.35rem);
+  letter-spacing: 0.02em; font-weight: 700;
+}
+
+.relay-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.relay-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 0.68rem; letter-spacing: 0.04em;
+  border: 1px solid var(--line); border-radius: 999px;
+  padding: 4px 10px; color: var(--muted);
+  transition: color 0.25s, border-color 0.25s, background 0.25s;
+}
+.relay-chip i {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--idle-icon); transition: background 0.25s, box-shadow 0.25s;
+}
+.relay-chip.on   { color: var(--ok-text);   border-color: rgba(115, 191, 105, 0.45); background: var(--gen-soft); }
+.relay-chip.on i { background: var(--gen);   box-shadow: 0 0 8px var(--gen); }
+.relay-chip.warn   { color: var(--warn-text); border-color: rgba(242, 73, 92, 0.5); background: var(--coral-soft); }
+.relay-chip.warn i { background: var(--coral); box-shadow: 0 0 8px var(--coral); }
+.relay-chip.gold   { color: var(--gold-text); border-color: rgba(255, 176, 32, 0.5); background: var(--amber-soft); }
+.relay-chip.gold i { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+
+/* ---------------- monthly tab ---------------- */
+.mtable {
+  width: 100%; border-collapse: collapse; margin-top: 18px;
+  font-family: "JetBrains Mono", monospace; font-size: 0.76rem;
+}
+.mtable th {
+  text-align: right; color: var(--muted); font-weight: 500;
+  padding: 8px 6px; border-bottom: 1px solid var(--line);
+  font-family: "Outfit", sans-serif; letter-spacing: 0.03em;
+}
+.mtable th:first-child, .mtable td:first-child { text-align: left; }
+.mtable td {
+  text-align: right; padding: 7px 6px;
+  border-bottom: 1px solid var(--grid);
+  font-variant-numeric: tabular-nums;
+}
+.mtable td:first-child { color: var(--muted); font-family: "Outfit", sans-serif; }
+.mtable tr.mtotal td {
+  border-top: 1px solid var(--line); border-bottom: 0;
+  font-weight: 800; color: var(--amber); padding-top: 10px;
+}
+.mtable tr.mtotal td:first-child { color: var(--amber); }
+
+/* ---------------- bottom tab bar ---------------- */
+.bottom-nav {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+  display: flex; gap: 4px;
+  padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  border-top: 1px solid var(--line);
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+}
+.nav-btn {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px;
+  background: none; border: 0; cursor: pointer;
+  color: var(--muted); font-family: "Chakra Petch", sans-serif;
+  font-size: 0.66rem; letter-spacing: 0.14em; text-transform: uppercase;
+  padding: 7px 0 5px; border-radius: 12px;
+  transition: color 0.2s, background 0.2s;
+}
+.nav-btn:hover { color: var(--ink); }
+.nav-btn.active { color: var(--amber); background: var(--amber-soft); }
+
+@media (max-width: 760px) {
+  body { padding-bottom: 96px; }
+  .mtable { font-size: 0.7rem; }
+  .mtable th, .mtable td { padding: 6px 3px; }
+
+  /* The pill strip is already a horizontal scroller on a phone, and the
+     "Powering the house" card says the same thing with more detail.
+     Drop the source pill here so the strip does not get longer than it
+     was before v3. The travel pill stays: it is hidden unless you are
+     actually away, and that is worth seeing at a glance. */
+  #pill-src { display: none; }
+}
+
+/* keep the alarm toast clear of the tab bar */
+.toast { bottom: 88px; }
+@media (max-width: 760px) { .toast { bottom: 82px; } }

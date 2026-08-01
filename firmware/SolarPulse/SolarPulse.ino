@@ -1,16 +1,28 @@
 /*
  * ============================================================
- *  SolarPulse final - ESP32 solar & battery monitor
- *  JK BMS (BLE, JK02_32S, hw v11) -> Firebase RTDB
+ *  SolarPulse v3 - ESP32 solar, battery and load controller
+ *  JK BMS (BLE, JK02_32S, hw v11) -> Firebase RTDB + local API
  *
- *  FIXED IN:
+ *  v2 -> v3 adds, without touching the BLE/BMS layer:
+ *   - gap-free logging. Every sample is written to flash first
+ *     and uploaded from a persistent queue with a committed
+ *     read offset, so nothing is lost across WiFi cuts or
+ *     reboots and the graph has no holes.
+ *   - daily harvest in kWh, persisted and reset at local
+ *     midnight from NTP time.
+ *   - a 400-day daily-totals log on flash, aggregated into
+ *     monthly totals for the new "Monthly" tab.
+ *   - a source-selection state machine driving two relays
+ *     (utility / inverter) with a dead time between them.
+ *   - travel mode on a physical switch: lights on 18:00,
+ *     off 23:30, every day.
+ *   - ESPAsyncWebServer on the LAN with a JSON API and a
+ *     small dashboard served from LittleFS.
+ *
+ *  KEPT FROM v2 (do not "fix"):
  *   - The JK BMS exposes TWO characteristics with UUID 0xFFE1:
  *       handle 0x03  properties 0x0C  -> WRITE  (commands)
  *       handle 0x05  properties 0x12  -> NOTIFY (data)
- *     v1 called getCharacteristic(0xFFE1), which returns only one
- *     of them, so commands went to the notify characteristic and
- *     the BMS never replied. v2 enumerates all characteristics
- *     and picks each one by its properties.
  *   - Connects with an explicit BLE_ADDR_PUBLIC address type.
  *   - Re-sends the cell-info command until frames actually arrive.
  *   - BLE starts before WiFi; setMTU() removed.
@@ -19,7 +31,9 @@
  *  Board    : ESP32 Dev Module
  *  Partition: Huge APP (3MB No OTA/1MB SPIFFS)
  *  Core     : esp32 by Espressif 2.0.17
- *  Library  : NimBLE-Arduino 1.4.x
+ *  Libraries: NimBLE-Arduino 1.4.x
+ *             ESP Async WebServer (me-no-dev)
+ *             AsyncTCP (me-no-dev)
  *
  *  Protocol offsets follow syssi/esphome-jk-bms (JK02_32S). [1]
  * ============================================================
@@ -29,9 +43,13 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
 #include <LittleFS.h>
 #include <NimBLEDevice.h>
+#include <ESPAsyncWebServer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <time.h>
 #include "config.h"
 
@@ -39,8 +57,12 @@
 void integrateEnergy();
 void saveCounters();
 void pushDaily(bool closing);
+void rolloverCheck();
+void appendDailyRow(int32_t stamp);
 
-// ---------------- BMS data model ----------------
+// ============================================================
+//  BMS data model  (unchanged from v2)
+// ============================================================
 struct BmsData {
   float cell[4]       = {0};
   float packV         = 0;
@@ -59,13 +81,51 @@ struct BmsData {
 };
 BmsData bms;
 
-// ---------------- energy accounting ----------------
+// ============================================================
+//  energy accounting
+// ============================================================
 float   todayChgWh = 0, todayDisWh = 0, todayPeakW = 0;
+float   todayPvWh  = 0;            // only used when PV_ADC_ENABLE
 double  lifeChgWh  = 0, lifeDisWh  = 0;
 int32_t dayStamp   = 0;
 bool    ntpSynced  = false;
 
-// ---------------- plumbing ----------------
+float   pvW = 0;                   // instantaneous array power, W
+float   loadW = 0;                 // instantaneous house draw, W
+
+// harvest = what actually went into storage, or true PV power when
+// a PV-side meter is fitted. See config.h section 6.
+static inline float harvestWhToday() {
+#if PV_ADC_ENABLE
+  return todayPvWh;
+#else
+  return todayChgWh;
+#endif
+}
+
+// ============================================================
+//  relay / mode state
+// ============================================================
+enum Source : uint8_t { SRC_NONE = 0, SRC_SOLAR = 1, SRC_UTILITY = 2 };
+
+Source   srcActual   = SRC_NONE;   // what is closed right now
+Source   srcTarget   = SRC_NONE;   // what the changeover is heading to
+Source   manualSrc   = SRC_NONE;   // web override, SRC_NONE = automatic
+uint32_t manualSince = 0;
+uint32_t srcSince    = 0;
+uint32_t deadUntil   = 0;
+bool     inChangeover = false;
+bool     topUpEngaged = false;     // loads parked on utility to charge faster
+const char* srcReason = "boot";
+
+bool     travelMode  = false;      // physical switch closed
+bool     lightOn     = false;      // lighting relay state
+bool     manualLight = false;      // web toggle used when not travelling
+uint32_t utilitySecToday = 0;      // how long the house ran on CEB today
+
+// ============================================================
+//  plumbing
+// ============================================================
 Preferences prefs;
 NimBLEClient* bleClient = nullptr;
 NimBLERemoteCharacteristic* chrFfe1 = nullptr;   // UUID 0xFFE1: the only characteristic the real app uses
@@ -73,9 +133,20 @@ volatile uint8_t rawLogLeft = 10;                // print the first few raw noti
 volatile bool bleConnected = false;
 uint8_t  frameBuf[400];
 uint16_t frameLen = 0;
-uint32_t tLive = 0, tHist = 0, tOff = 0, tDaily = 0, tNvs = 0, tWifi = 0, tPoll = 0;
+uint32_t tLive = 0, tLog = 0, tDaily = 0, tNvs = 0, tWifi = 0, tPoll = 0;
+uint32_t tUp = 0, tRoll = 0, tRelay = 0;
 uint32_t lastEnergyMs = 0;
-uint16_t bufferedLines = 0;
+uint16_t bufferedLines = 0;        // samples still waiting in the queue
+
+bool     fsOk = false;
+uint32_t queuePos = 0;             // byte offset of the first unsent record
+int32_t  clockAdj = 0;             // seconds to add to records logged before NTP
+SemaphoreHandle_t fsLock = nullptr;
+
+AsyncWebServer server(80);
+
+#define FS_LOCK()   do { if (fsLock) xSemaphoreTake(fsLock, portMAX_DELAY); } while (0)
+#define FS_UNLOCK() do { if (fsLock) xSemaphoreGive(fsLock); } while (0)
 
 // ============================================================
 //  helpers
@@ -95,6 +166,17 @@ static uint8_t sumCrc(const uint8_t* d, uint16_t n) {
 
 time_t nowEpoch() { time_t t; time(&t); return t; }
 
+// The clock is restored from NVS at boot, so this is true within a
+// few minutes even before the first NTP reply of the session.
+bool timeReady() { return nowEpoch() > 1700000000L; }
+
+bool localNow(struct tm* out) {
+  time_t t = nowEpoch();
+  if (t < 1700000000L) return false;
+  localtime_r(&t, out);
+  return true;
+}
+
 int32_t dateStamp(time_t t) {
   struct tm tmv; localtime_r(&t, &tmv);
   return (tmv.tm_year + 1900) * 10000 + (tmv.tm_mon + 1) * 100 + tmv.tm_mday;
@@ -103,9 +185,40 @@ void dateString(time_t t, char* out) {
   struct tm tmv; localtime_r(&t, &tmv);
   strftime(out, 12, "%Y-%m-%d", &tmv);
 }
+// 20260801 -> "2026-08-01"
+void stampToString(int32_t s, char* out) {
+  snprintf(out, 12, "%04d-%02d-%02d", (int)(s / 10000), (int)((s / 100) % 100), (int)(s % 100));
+}
+
+bool bmsFresh() { return bms.lastFrameMs && millis() - bms.lastFrameMs < 15000; }
+bool bmsLost()  { return !bms.lastFrameMs || millis() - bms.lastFrameMs > 300000UL; }
+
+const char* srcName(Source s) {
+  return s == SRC_SOLAR ? "solar" : s == SRC_UTILITY ? "utility" : "none";
+}
+
+// tiny JSON scalar reader, enough for our own single-level records
+static String jsonRaw(const String& s, const char* key) {
+  String k = String("\"") + key + "\":";
+  int p = s.indexOf(k);
+  if (p < 0) return String();
+  p += k.length();
+  int e = p;
+  while (e < (int)s.length() && s[e] != ',' && s[e] != '}') e++;
+  return s.substring(p, e);
+}
+static long  jsonLong (const String& s, const char* key) { return jsonRaw(s, key).toInt(); }
+static float jsonFloat(const String& s, const char* key) { return jsonRaw(s, key).toFloat(); }
+static String withTs(const String& line, long ts) {
+  int p = line.indexOf("\"t\":");
+  if (p < 0) return line;
+  int e = line.indexOf(',', p);
+  if (e < 0) return line;
+  return line.substring(0, p + 4) + String(ts) + line.substring(e);
+}
 
 // ============================================================
-//  JK BMS frame parsing (JK02_32S)
+//  JK BMS frame parsing (JK02_32S)   -- unchanged from v2
 // ============================================================
 void parseCellInfo(const uint8_t* d) {
   for (int i = 0; i < 4; i++) bms.cell[i] = u16(d, 6 + i * 2) * 0.001f;
@@ -245,10 +358,38 @@ void bleConnectTask() {
 }
 
 // ============================================================
+//  PV-side metering (optional, see config.h section 6)
+// ============================================================
+float readPvWatts() {
+#if PV_ADC_ENABLE
+  float mv = analogReadMilliVolts(PV_VOLT_PIN) * PV_VOLT_DIVIDER;
+  float v  = mv / 1000.0f;
+  float i  = (analogReadMilliVolts(PV_CURR_PIN) - PV_CURR_ZERO_MV) / PV_CURR_MV_PER_A;
+  if (i < 0) i = 0;
+  return v * i;
+#else
+  // no PV meter: everything that flows into the pack is harvest
+  return bms.packW > 0 ? bms.packW : 0;
+#endif
+}
+
+// The array is counted as producing when real power is going into
+// storage during daylight. Used by the relay state machine.
+bool solarProducing() {
+  struct tm tmv;
+  bool haveTime = localNow(&tmv);
+  bool daylight = !haveTime || (tmv.tm_hour >= PV_HOUR_START && tmv.tm_hour < PV_HOUR_END);
+  return bmsFresh() && daylight && pvW > SOLAR_OK_W;
+}
+
+// ============================================================
 //  energy integration + day rollover
 // ============================================================
 void integrateEnergy() {
   uint32_t nowMs = millis();
+  pvW   = readPvWatts();
+  loadW = bms.packW < 0 ? -bms.packW : 0;
+
   if (lastEnergyMs == 0) { lastEnergyMs = nowMs; return; }
   float dt = (nowMs - lastEnergyMs) / 1000.0f;
   lastEnergyMs = nowMs;
@@ -258,27 +399,44 @@ void integrateEnergy() {
   if (bms.packI >  CURRENT_DEADBAND) { todayChgWh += wh;  lifeChgWh += wh; }
   if (bms.packI < -CURRENT_DEADBAND) { todayDisWh += -wh; lifeDisWh += -wh; }
   if (bms.packW > todayPeakW) todayPeakW = bms.packW;
+  todayPvWh += pvW * dt / 3600.0f;
 
+  rolloverCheck();
+}
+
+// Runs from integrateEnergy AND from loop(), so midnight is not
+// missed when the BLE link happens to be down at 00:00.
+void rolloverCheck() {
+  if (!timeReady()) return;
   int32_t ds = dateStamp(nowEpoch());
-  if (dayStamp == 0) dayStamp = ds;
-  if (ds != dayStamp) {
-    pushDaily(true);
-    todayChgWh = todayDisWh = todayPeakW = 0;
-    dayStamp = ds;
-    saveCounters();
-  }
+  if (dayStamp == 0) { dayStamp = ds; return; }
+  if (ds == dayStamp) return;
+
+  Serial.printf("[day] rollover %ld -> %ld, harvest %.1f Wh\n",
+                (long)dayStamp, (long)ds, harvestWhToday());
+  pushDaily(true);                 // close yesterday in Firebase
+  appendDailyRow(dayStamp);        // and in local flash
+  todayChgWh = todayDisWh = todayPeakW = todayPvWh = 0;
+  utilitySecToday = 0;
+  topUpEngaged = false;
+  dayStamp = ds;
+  saveCounters();
 }
 
 // ============================================================
-//  persistence
+//  persistence (NVS)
 // ============================================================
 void saveCounters() {
   prefs.putFloat("tc", todayChgWh);
   prefs.putFloat("td", todayDisWh);
   prefs.putFloat("tp", todayPeakW);
+  prefs.putFloat("tv", todayPvWh);
   prefs.putDouble("lc", lifeChgWh);
   prefs.putDouble("ld", lifeDisWh);
   prefs.putInt("day", dayStamp);
+  prefs.putUInt("qp", queuePos);
+  prefs.putInt("adj", clockAdj);
+  prefs.putUInt("us", utilitySecToday);
   prefs.putLong64("ep", (int64_t)nowEpoch());
 }
 
@@ -286,9 +444,12 @@ void loadCounters() {
   todayChgWh = prefs.getFloat("tc", 0);
   todayDisWh = prefs.getFloat("td", 0);
   todayPeakW = prefs.getFloat("tp", 0);
+  todayPvWh  = prefs.getFloat("tv", 0);
   lifeChgWh  = prefs.getDouble("lc", 0);
   lifeDisWh  = prefs.getDouble("ld", 0);
   dayStamp   = prefs.getInt("day", 0);
+  clockAdj   = prefs.getInt("adj", 0);
+  utilitySecToday = prefs.getUInt("us", 0);
   int64_t ep = prefs.getLong64("ep", 0);
   if (ep > 1700000000LL) {
     struct timeval tv = { .tv_sec = (time_t)ep, .tv_usec = 0 };
@@ -309,6 +470,9 @@ int buildLiveJson(char* out, size_t cap) {
     "\"chgMos\":%s,\"disMos\":%s,\"err\":%lu,\"soh\":%u,\"cyc\":%lu,"
     "\"todayChg\":%.1f,\"todayDis\":%.1f,\"peakW\":%.1f,"
     "\"lifeChg\":%.0f,\"lifeDis\":%.0f,"
+    "\"pvW\":%.1f,\"loadW\":%.1f,\"gridW\":%.1f,\"harvestWh\":%.1f,"
+    "\"src\":\"%s\",\"relayU\":%s,\"relayS\":%s,\"why\":\"%s\","
+    "\"manual\":%s,\"travel\":%s,\"light\":%s,\"utilMin\":%lu,"
     "\"bmsLink\":%s,\"rssi\":%d,\"buffered\":%u,\"heap\":%lu}",
     (long)t, ntpSynced ? "true" : "false",
     bms.packV, bms.packI, bms.packW, bms.soc, bms.remainAh,
@@ -317,14 +481,24 @@ int buildLiveJson(char* out, size_t cap) {
     bms.chgMos ? "true" : "false", bms.disMos ? "true" : "false",
     (unsigned long)bms.errBits, bms.soh, (unsigned long)bms.cycles,
     todayChgWh, todayDisWh, todayPeakW, lifeChgWh, lifeDisWh,
-    (bms.lastFrameMs && millis() - bms.lastFrameMs < 15000) ? "true" : "false",
+    pvW, loadW, srcActual == SRC_UTILITY ? loadW : 0.0f, harvestWhToday(),
+    srcName(srcActual),
+    srcActual == SRC_UTILITY ? "true" : "false",
+    srcActual == SRC_SOLAR   ? "true" : "false",
+    srcReason,
+    manualSrc != SRC_NONE ? "true" : "false",
+    travelMode ? "true" : "false", lightOn ? "true" : "false",
+    (unsigned long)(utilitySecToday / 60),
+    bmsFresh() ? "true" : "false",
     WiFi.RSSI(), bufferedLines, (unsigned long)ESP.getFreeHeap());
 }
 
 int buildSampleJson(char* out, size_t cap, time_t t) {
   return snprintf(out, cap,
-    "{\"t\":%ld,\"v\":%.2f,\"i\":%.2f,\"p\":%.1f,\"soc\":%u,\"approx\":%s}",
-    (long)t, bms.packV, bms.packI, bms.packW, bms.soc, ntpSynced ? "false" : "true");
+    "{\"t\":%ld,\"v\":%.2f,\"i\":%.2f,\"p\":%.1f,\"soc\":%u,"
+    "\"pv\":%.1f,\"src\":%u,\"approx\":%s}",
+    (long)t, bms.packV, bms.packI, bms.packW, bms.soc,
+    pvW, (unsigned)srcActual, ntpSynced ? "false" : "true");
 }
 
 // ============================================================
@@ -332,6 +506,8 @@ int buildSampleJson(char* out, size_t cap, time_t t) {
 // ============================================================
 bool fbRequest(const char* method, const String& path, const String& body) {
   if (WiFi.status() != WL_CONNECTED) return false;
+  // TLS needs a big contiguous block; skip rather than crash.
+  if (ESP.getFreeHeap() < 45000) { Serial.println("[fb] low heap, push skipped"); return false; }
   WiFiClientSecure sec;
   sec.setInsecure();
   HTTPClient http;
@@ -345,81 +521,690 @@ bool fbRequest(const char* method, const String& path, const String& body) {
 }
 
 void pushLive() {
-  static char buf[900];
+  static char buf[1400];
   buildLiveJson(buf, sizeof(buf));
   fbRequest("PUT", "/live", buf);
-}
-
-void pushHistorySample() {
-  if (!bms.lastFrameMs) return;
-  time_t t = nowEpoch();
-  char date[12]; dateString(t, date);
-  char body[160]; buildSampleJson(body, sizeof(body), t);
-  char path[48]; snprintf(path, sizeof(path), "/history/%s/%ld", date, (long)t);
-  fbRequest("PUT", path, body);
 }
 
 void pushDaily(bool closing) {
   time_t t = nowEpoch();
   if (closing) t -= 3600;
   char date[12]; dateString(t, date);
-  char body[200];
+  char body[280];
   snprintf(body, sizeof(body),
-    "{\"chgWh\":%.1f,\"disWh\":%.1f,\"peakW\":%.1f,\"minSoc\":%u,\"closed\":%s}",
-    todayChgWh, todayDisWh, todayPeakW, bms.soc, closing ? "true" : "false");
+    "{\"chgWh\":%.1f,\"disWh\":%.1f,\"harvestWh\":%.1f,\"peakW\":%.1f,"
+    "\"minSoc\":%u,\"utilMin\":%lu,\"closed\":%s}",
+    todayChgWh, todayDisWh, harvestWhToday(), todayPeakW, bms.soc,
+    (unsigned long)(utilitySecToday / 60), closing ? "true" : "false");
   char path[24]; snprintf(path, sizeof(path), "/daily/%s", date);
   fbRequest("PATCH", path, body);
 }
 
 // ============================================================
-//  offline buffer
+//  FLASH LOG STORE
+//
+//  Two files are written every LOG_INTERVAL:
+//    QUEUE_FILE   append-only JSON lines waiting to go to the
+//                 cloud. QUEUE_POS_FILE holds the byte offset of
+//                 the first record that has NOT been accepted
+//                 yet, so an upload that dies half way, or a
+//                 reboot, resumes exactly where it stopped.
+//    /h/YYYYMMDD.csv  the same sample in CSV, kept for
+//                 LOCAL_HISTORY_DAYS and served by the local UI.
+//
+//  Logging never depends on WiFi. That is the whole fix for the
+//  gaps: the record exists on flash before anyone tries to send
+//  it, and it is only forgotten once the server has said 200.
 // ============================================================
-void bufferSample() {
-  if (!bms.lastFrameMs || bufferedLines >= BUFFER_MAX_LINES) return;
-  File f = LittleFS.open("/buffer.jsonl", "a");
+void savePos() {
+  File f = LittleFS.open(QUEUE_POS_FILE, "w");
   if (!f) return;
-  char line[160];
-  buildSampleJson(line, sizeof(line), nowEpoch());
-  f.println(line);
+  f.print(queuePos);
   f.close();
-  bufferedLines++;
 }
 
-void countBufferedLines() {
+void loadPos() {
+  File f = LittleFS.open(QUEUE_POS_FILE, "r");
+  if (!f) { queuePos = prefs.getUInt("qp", 0); return; }
+  queuePos = (uint32_t)f.readString().toInt();
+  f.close();
+}
+
+// number of records still waiting, for the UI badge
+void countQueue() {
   bufferedLines = 0;
-  File f = LittleFS.open("/buffer.jsonl", "r");
+  if (!fsOk) return;
+  FS_LOCK();
+  File f = LittleFS.open(QUEUE_FILE, "r");
+  if (f) {
+    if (queuePos > f.size()) queuePos = f.size();
+    f.seek(queuePos);
+    while (f.available()) { f.readStringUntil('\n'); bufferedLines++; }
+    f.close();
+  }
+  FS_UNLOCK();
+}
+
+void resetQueue() {
+  LittleFS.remove(QUEUE_FILE);
+  queuePos = 0;
+  savePos();
+  bufferedLines = 0;
+}
+
+// Rewrite the queue so it starts at the first unsent record.
+void compactQueue() {
+  File in = LittleFS.open(QUEUE_FILE, "r");
+  if (!in) return;
+  if (queuePos >= in.size()) { in.close(); resetQueue(); return; }
+  in.seek(queuePos);
+  File out = LittleFS.open("/queue.tmp", "w");
+  if (!out) { in.close(); return; }
+  uint8_t buf[512];
+  int r;
+  while ((r = in.read(buf, sizeof(buf))) > 0) out.write(buf, r);
+  out.close();
+  in.close();
+  LittleFS.remove(QUEUE_FILE);
+  LittleFS.rename("/queue.tmp", QUEUE_FILE);
+  queuePos = 0;
+  savePos();
+  Serial.println("[queue] compacted");
+}
+
+// Last resort when the cloud has been unreachable for weeks:
+// throw away the oldest quarter so new samples keep landing.
+void dropOldest() {
+  File f = LittleFS.open(QUEUE_FILE, "r");
   if (!f) return;
-  while (f.available()) { f.readStringUntil('\n'); bufferedLines++; }
+  size_t target = f.size() / 4;
+  f.seek(target);
+  f.readStringUntil('\n');              // realign to a record boundary
+  uint32_t cut = f.position();
+  f.close();
+  // never move the pointer backwards: anything before queuePos is
+  // already at the server, compaction alone reclaims that space
+  if (cut > queuePos) queuePos = cut;
+  Serial.println("[queue] full, oldest quarter dropped");
+  compactQueue();
+}
+
+void appendHistoryCsv(time_t t) {
+  char path[32];
+  struct tm tmv; localtime_r(&t, &tmv);
+  snprintf(path, sizeof(path), HISTORY_DIR "/%04d%02d%02d.csv",
+           tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
+  bool isNew = !LittleFS.exists(path);
+  File f = LittleFS.open(path, "a");
+  if (!f) return;
+  if (isNew) f.println("t,v,i,p,soc,pv,src");
+  f.printf("%ld,%.2f,%.2f,%.1f,%u,%.1f,%u\n",
+           (long)t, bms.packV, bms.packI, bms.packW, bms.soc, pvW, (unsigned)srcActual);
   f.close();
 }
 
-void flushBuffer() {
-  if (!bufferedLines || WiFi.status() != WL_CONNECTED) return;
-  File f = LittleFS.open("/buffer.jsonl", "r");
-  if (!f) return;
-  Serial.printf("[BUF] flushing %u samples\n", bufferedLines);
+// keep only the newest LOCAL_HISTORY_DAYS files in /h.
+// Names are collected first: deleting while walking a directory
+// handle is not safe.
+void pruneHistory() {
+  if (!timeReady()) return;
+  int32_t cutoff = dateStamp(nowEpoch() - (time_t)LOCAL_HISTORY_DAYS * 86400L);
 
-  bool ok = true;
-  while (f.available() && ok) {
-    String body = "{";
-    int n = 0;
-    while (f.available() && n < 20) {
-      String line = f.readStringUntil('\n');
-      line.trim();
-      if (line.length() < 10) continue;
-      int tp = line.indexOf("\"t\":") + 4;
-      long ts = line.substring(tp, line.indexOf(',', tp)).toInt();
-      if (ts < 1700000000L) continue;
-      char date[12]; dateString((time_t)ts, date);
-      if (n) body += ",";
-      body += "\"history/" + String(date) + "/" + String(ts) + "\":" + line;
-      n++;
+  String doomed[8];
+  int nDoomed = 0;
+
+  File dir = LittleFS.open(HISTORY_DIR);
+  if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
+  File e = dir.openNextFile();
+  while (e && nDoomed < 8) {
+    String name = String(e.name());
+    e.close();
+    int slash = name.lastIndexOf('/');
+    String base = slash >= 0 ? name.substring(slash + 1) : name;
+    if (base.endsWith(".csv") && base.length() == 12) {
+      int32_t stamp = base.substring(0, 8).toInt();
+      if (stamp && stamp < cutoff) doomed[nDoomed++] = String(HISTORY_DIR "/") + base;
     }
-    body += "}";
-    if (n) ok = fbRequest("PATCH", "", body);
+    e = dir.openNextFile();
+  }
+  if (e) e.close();
+  dir.close();
+
+  for (int i = 0; i < nDoomed; i++) {
+    LittleFS.remove(doomed[i]);
+    Serial.printf("[hist] pruned %s\n", doomed[i].c_str());
+  }
+}
+
+// One row per finished day, kept for DAILY_LOG_DAYS. This is what
+// the Monthly tab is built from, and it survives independently of
+// the cloud.
+void appendDailyRow(int32_t stamp) {
+  if (!fsOk || !stamp) return;
+  char date[12]; stampToString(stamp, date);
+  FS_LOCK();
+  bool isNew = !LittleFS.exists(DAILY_FILE);
+  File f = LittleFS.open(DAILY_FILE, "a");
+  if (f) {
+    if (isNew) f.println("date,chgWh,disWh,harvestWh,peakW,endSoc,utilMin");
+    f.printf("%s,%.1f,%.1f,%.1f,%.1f,%u,%lu\n",
+             date, todayChgWh, todayDisWh, harvestWhToday(), todayPeakW,
+             bms.soc, (unsigned long)(utilitySecToday / 60));
+    f.close();
+  }
+  FS_UNLOCK();
+
+  // prune: rewrite keeping the header plus the newest DAILY_LOG_DAYS rows
+  FS_LOCK();
+  {
+    int rows = 0;
+    File in = LittleFS.open(DAILY_FILE, "r");
+    if (in) {
+      while (in.available()) { in.readStringUntil('\n'); rows++; }
+      in.close();
+    }
+    if (rows > DAILY_LOG_DAYS + 1) {
+      in = LittleFS.open(DAILY_FILE, "r");
+      File out = LittleFS.open("/daily.tmp", "w");
+      if (in && out) {
+        out.println(in.readStringUntil('\n'));            // header
+        int skip = rows - 1 - DAILY_LOG_DAYS;
+        for (int i = 0; i < skip; i++) in.readStringUntil('\n');
+        while (in.available()) {
+          String row = in.readStringUntil('\n');
+          row.trim();
+          if (row.length()) out.println(row);
+        }
+      }
+      if (in) in.close();
+      if (out) {
+        out.close();
+        LittleFS.remove(DAILY_FILE);
+        LittleFS.rename("/daily.tmp", DAILY_FILE);
+      }
+    }
+  }
+  pruneHistory();
+  FS_UNLOCK();
+}
+
+// The one place a sample is created. Called every LOG_INTERVAL
+// whatever the network is doing.
+void logSample() {
+  if (!fsOk || !bms.lastFrameMs) return;
+  time_t t = nowEpoch();
+  char line[220];
+  buildSampleJson(line, sizeof(line), t);
+
+  FS_LOCK();
+  File f = LittleFS.open(QUEUE_FILE, "a");
+  if (f) {
+    if (f.size() > QUEUE_MAX_BYTES) { f.close(); dropOldest(); f = LittleFS.open(QUEUE_FILE, "a"); }
+    if (f) { f.println(line); f.close(); bufferedLines++; }
+  }
+  appendHistoryCsv(t);
+  FS_UNLOCK();
+}
+
+// ============================================================
+//  BULK UPLOAD
+//
+//  Sends the queue oldest-first in batches of QUEUE_BATCH as one
+//  multi-path PATCH, which is Firebase's bulk endpoint. The read
+//  offset only moves after a 2xx, so a failure repeats the batch
+//  instead of skipping it.
+//
+//  Records written before the clock was ever synced carry
+//  "approx":true. Instead of dropping them (v2 did, which is
+//  exactly where the graph holes came from) they are shifted by
+//  the correction measured at the first NTP reply.
+// ============================================================
+void uploadTask() {
+  if (!fsOk || WiFi.status() != WL_CONNECTED) return;
+  if (!timeReady()) return;
+
+  String body = "{";
+  int n = 0;
+  size_t consumed = 0;
+
+  FS_LOCK();
+  File f = LittleFS.open(QUEUE_FILE, "r");
+  if (!f) { FS_UNLOCK(); return; }
+  size_t size = f.size();
+  if (queuePos > size) queuePos = size;
+  if (queuePos >= size) { f.close(); FS_UNLOCK(); if (size) { FS_LOCK(); resetQueue(); FS_UNLOCK(); } return; }
+  f.seek(queuePos);
+
+  while (f.available() && n < QUEUE_BATCH) {
+    String line = f.readStringUntil('\n');
+    consumed += line.length() + 1;
+    line.trim();
+    if (line.length() < 10) continue;
+    long ts = jsonLong(line, "t");
+    if (line.indexOf("\"approx\":true") >= 0 && clockAdj) {
+      ts += clockAdj;
+      line = withTs(line, ts);
+    }
+    if (ts < 1700000000L) continue;          // unrecoverable, skip the record
+    char date[12]; dateString((time_t)ts, date);
+    if (n) body += ",";
+    body += "\"history/" + String(date) + "/" + String(ts) + "\":" + line;
+    n++;
   }
   f.close();
-  if (ok) { LittleFS.remove("/buffer.jsonl"); bufferedLines = 0; Serial.println("[BUF] done"); }
+  FS_UNLOCK();
+  body += "}";
+
+  if (!consumed) return;
+  bool ok = n ? fbRequest("PATCH", "", body) : true;
+  if (!ok) return;
+
+  queuePos += consumed;
+  if (bufferedLines >= n) bufferedLines -= n; else bufferedLines = 0;
+
+  FS_LOCK();
+  savePos();
+  if (queuePos >= QUEUE_COMPACT_BYTES) compactQueue();
+  FS_UNLOCK();
+
+  if (n) Serial.printf("[queue] uploaded %d, %u still waiting\n", n, bufferedLines);
+}
+
+// ============================================================
+//  RELAY CONTROL
+//
+//  Two relays, one GPIO each. A relay module input is an opto LED
+//  behind a resistor: about 3 mA at 3.3 V, far below the 40 mA a
+//  GPIO can source, and both poles of the relay (Live and Neutral)
+//  are thrown by the one coil. So one pin per relay is correct.
+//  The COIL is fed from a separate 5 V supply, never from the ESP.
+//
+//  Priority: solar/battery first, utility only when the pack
+//  cannot carry the house.
+//
+//  Both relays are opened for RELAY_DEAD_TIME_MS on every change,
+//  so the two sources can never be paralleled even for a cycle.
+// ============================================================
+static inline void relayDrive(int pin, bool on) {
+  if (pin < 0) return;
+#if RELAY_ACTIVE_LOW
+  digitalWrite(pin, on ? LOW : HIGH);
+#else
+  digitalWrite(pin, on ? HIGH : LOW);
+#endif
+}
+
+void relaysAllOff() {
+  relayDrive(RELAY_UTILITY_PIN, false);
+  relayDrive(RELAY_SOLAR_PIN, false);
+}
+
+// Which source should be feeding the house right now.
+Source decideSource() {
+  // 1. a choice made in the web UI wins until it expires
+  if (manualSrc != SRC_NONE) {
+    if (MANUAL_OVERRIDE_MS == 0 || millis() - manualSince < MANUAL_OVERRIDE_MS) {
+      srcReason = "manual override";
+      return manualSrc;
+    }
+    manualSrc = SRC_NONE;                       // expired, back to automatic
+  }
+
+  // 2. no BMS telemetry -> we do not know the SoC. Keep the house
+  //    alive on utility rather than flatten an unknown pack.
+  if (bmsLost()) { srcReason = "BMS link lost, failsafe"; return SRC_UTILITY; }
+  if (!bmsFresh()) { srcReason = "waiting for BMS"; return srcActual == SRC_NONE ? SRC_UTILITY : srcActual; }
+
+  int soc = bms.soc;
+  bool solar = solarProducing();
+
+  struct tm tmv;
+  bool haveTime = localNow(&tmv);
+  int hour = haveTime ? tmv.tm_hour : 12;       // no clock: behave like daytime
+  bool evening = haveTime && (hour >= EVENING_HOUR || hour < PV_HOUR_START);
+
+  if (!evening) {
+    // ---------------- before 16:00 ----------------
+    // Deep-discharge guard first.
+    if (soc <= SOC_CRITICAL && !solar) { srcReason = "SoC critical, no sun"; return SRC_UTILITY; }
+
+    // Top-up window. The pack must be at SOC_TARGET_1600 by 16:00
+    // so the evening runs on stored energy. This hardware cannot
+    // charge from the mains directly, so the lever we have is to
+    // take the house OFF the inverter and park it on utility for a
+    // while: every watt the array makes then goes into the battery
+    // instead of into the fridge. Utility carries the house only
+    // for as long as the pack is short of target.
+    if (haveTime && hour >= TOPUP_START_HOUR && soc < SOC_TARGET_1600) {
+      if (solar || topUpEngaged) {
+        topUpEngaged = true;
+        srcReason = "topping the pack up to 99% before 16:00";
+        return SRC_UTILITY;
+      }
+      // no sun in the window: nothing to divert, so do not waste grid
+    }
+    if (soc >= SOC_TARGET_1600 || hour < TOPUP_START_HOUR) topUpEngaged = false;
+
+    srcReason = solar ? "solar carrying the house" : "running from the pack";
+    return SRC_SOLAR;
+  }
+
+  // ---------------- 16:00 to sunrise ----------------
+  topUpEngaged = false;
+  if (solar) { srcReason = "late sun still producing"; return SRC_SOLAR; }
+
+  if (srcActual == SRC_UTILITY) {
+    // hysteresis so a sagging pack does not chatter the relays
+    if (soc >= SOC_EVENING_FLOOR + SOC_RECOVER_HYST) {
+      srcReason = "pack recovered, back on battery";
+      return SRC_SOLAR;
+    }
+    srcReason = "pack below evening floor";
+    return SRC_UTILITY;
+  }
+  if (soc > SOC_EVENING_FLOOR) { srcReason = "evening, running on the pack"; return SRC_SOLAR; }
+  srcReason = "pack below evening floor";
+  return SRC_UTILITY;
+}
+
+void relayTask() {
+  uint32_t now = millis();
+
+  // finish a changeover that is in its dead time
+  if (inChangeover) {
+    if ((int32_t)(now - deadUntil) >= 0) {
+      if (srcTarget == SRC_SOLAR)   relayDrive(RELAY_SOLAR_PIN, true);
+      if (srcTarget == SRC_UTILITY) relayDrive(RELAY_UTILITY_PIN, true);
+      srcActual = srcTarget;
+      srcSince = now;
+      inChangeover = false;
+      Serial.printf("[relay] now on %s (%s)\n", srcName(srcActual), srcReason);
+    }
+    return;
+  }
+
+  Source want = decideSource();
+  if (want == srcActual) return;
+
+  // urgent cases skip the dwell timer
+  bool urgent = (want == SRC_UTILITY && bmsFresh() && bms.soc <= SOC_CRITICAL) ||
+                srcActual == SRC_NONE;
+  if (!urgent && now - srcSince < SOURCE_MIN_DWELL_MS) return;
+
+  Serial.printf("[relay] %s -> %s : %s\n", srcName(srcActual), srcName(want), srcReason);
+  relaysAllOff();                      // break before make
+  srcActual = SRC_NONE;
+  srcTarget = want;
+  deadUntil = now + RELAY_DEAD_TIME_MS;
+  inChangeover = true;
+}
+
+// how long the house has been on the grid today
+void utilityAccounting() {
+  static uint32_t last = 0;
+  static uint32_t carryMs = 0;              // keep the sub-second remainder
+  uint32_t now = millis();
+  if (last && srcActual == SRC_UTILITY) {
+    carryMs += now - last;
+    utilitySecToday += carryMs / 1000;
+    carryMs %= 1000;
+  }
+  last = now;
+}
+
+// ============================================================
+//  TRAVEL MODE
+//
+//  Switch closed = nobody home. The lighting relay is then driven
+//  purely by the clock, 18:00 on and 23:30 off, so the house looks
+//  lived in. Switch open = the web UI toggle decides, which is the
+//  behaviour when someone is home.
+//
+//  This overrides the lighting circuit only. Source selection
+//  above keeps running exactly the same either way.
+// ============================================================
+bool inTravelWindow(const struct tm& tmv) {
+  int nowMin = tmv.tm_hour * 60 + tmv.tm_min;
+  int onMin  = TRAVEL_ON_HOUR  * 60 + TRAVEL_ON_MIN;
+  int offMin = TRAVEL_OFF_HOUR * 60 + TRAVEL_OFF_MIN;
+  if (onMin <= offMin) return nowMin >= onMin && nowMin < offMin;
+  return nowMin >= onMin || nowMin < offMin;      // window crossing midnight
+}
+
+void travelTask() {
+  // --- debounced switch read ---
+  static int lastRaw = -1;
+  static uint32_t lastEdge = 0;
+  int raw = digitalRead(TRAVEL_SWITCH_PIN);
+  if (raw != lastRaw) { lastRaw = raw; lastEdge = millis(); }
+  else if (millis() - lastEdge > TRAVEL_DEBOUNCE_MS) {
+#if TRAVEL_SWITCH_ACTIVE_LOW
+    bool closed = (raw == LOW);
+#else
+    bool closed = (raw == HIGH);
+#endif
+    if (closed != travelMode) {
+      travelMode = closed;
+      Serial.printf("[travel] %s\n", travelMode ? "ON - schedule takes over the lights"
+                                                : "OFF - back to normal control");
+    }
+  }
+
+  // --- lighting relay ---
+  bool want = manualLight;
+  struct tm tmv;
+  if (travelMode && localNow(&tmv)) want = inTravelWindow(tmv);
+
+  if (want != lightOn) {
+    lightOn = want;
+    relayDrive(RELAY_LOAD_PIN, lightOn);
+    Serial.printf("[light] %s\n", lightOn ? "ON" : "OFF");
+  }
+}
+
+// ============================================================
+//  LOCAL WEB API
+//
+//  The GitHub Pages dashboard reads Firebase, so it works from
+//  anywhere. This server is the fallback that keeps working when
+//  the internet does not, and it is where /api/upload lives.
+// ============================================================
+static bool authOk(AsyncWebServerRequest* req) {
+  if (strlen(WEB_USER) == 0) return true;
+  if (req->authenticate(WEB_USER, WEB_PASS)) return true;
+  req->requestAuthentication();
+  return false;
+}
+
+// accumulates an /api/upload body across chunks
+static String uploadBuf;
+
+// One NDJSON record -> the right day CSV. Used by /api/upload so a
+// second node (or a replay script) can backfill this device.
+static void ingestLine(const String& line) {
+  if (line.length() < 10) return;
+  long ts = jsonLong(line, "t");
+  if (ts < 1700000000L) return;
+  struct tm tmv; time_t t = (time_t)ts; localtime_r(&t, &tmv);
+  char path[32];
+  snprintf(path, sizeof(path), HISTORY_DIR "/%04d%02d%02d.csv",
+           tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
+  FS_LOCK();
+  bool isNew = !LittleFS.exists(path);
+  File f = LittleFS.open(path, "a");
+  if (f) {
+    if (isNew) f.println("t,v,i,p,soc,pv,src");
+    f.printf("%ld,%.2f,%.2f,%.1f,%ld,%.1f,%ld\n", ts,
+             jsonFloat(line, "v"), jsonFloat(line, "i"), jsonFloat(line, "p"),
+             jsonLong(line, "soc"), jsonFloat(line, "pv"), jsonLong(line, "src"));
+    f.close();
+  }
+  FS_UNLOCK();
+}
+
+// month totals for one year, straight off DAILY_FILE
+static String monthlyJson(int year) {
+  float kwh[12] = {0}, used[12] = {0};
+  int   days[12] = {0};
+
+  FS_LOCK();
+  File f = LittleFS.open(DAILY_FILE, "r");
+  if (f) {
+    f.readStringUntil('\n');                       // header
+    while (f.available()) {
+      String row = f.readStringUntil('\n');
+      row.trim();
+      if (row.length() < 12) continue;
+      int y = row.substring(0, 4).toInt();
+      int m = row.substring(5, 7).toInt();
+      if (y != year || m < 1 || m > 12) continue;
+      // date,chgWh,disWh,harvestWh,peakW,endSoc,utilMin
+      int c1 = row.indexOf(',');
+      int c2 = row.indexOf(',', c1 + 1);
+      int c3 = row.indexOf(',', c2 + 1);
+      int c4 = row.indexOf(',', c3 + 1);
+      if (c1 < 0 || c2 < 0 || c3 < 0 || c4 < 0) continue;
+      float dis = row.substring(c2 + 1, c3).toFloat();
+      float har = row.substring(c3 + 1, c4).toFloat();
+      kwh[m - 1]  += har / 1000.0f;
+      used[m - 1] += dis / 1000.0f;
+      days[m - 1] += 1;
+    }
+    f.close();
+  }
+  FS_UNLOCK();
+
+  // fold today's running total in so the current month is not short
+  struct tm tmv;
+  if (localNow(&tmv) && tmv.tm_year + 1900 == year) {
+    kwh[tmv.tm_mon]  += harvestWhToday() / 1000.0f;
+    used[tmv.tm_mon] += todayDisWh / 1000.0f;
+    days[tmv.tm_mon] += 1;
+  }
+
+  String out = "{\"year\":" + String(year) + ",\"months\":[";
+  float total = 0;
+  for (int i = 0; i < 12; i++) {
+    if (i) out += ",";
+    out += "{\"m\":" + String(i + 1) +
+           ",\"kwh\":" + String(kwh[i], 3) +
+           ",\"used\":" + String(used[i], 3) +
+           ",\"days\":" + String(days[i]) + "}";
+    total += kwh[i];
+  }
+  out += "],\"totalKwh\":" + String(total, 3) + "}";
+  return out;
+}
+
+void setupWebServer() {
+  // ---- live snapshot ----
+  server.on("/api/live", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!authOk(req)) return;
+    char buf[1400];
+    buildLiveJson(buf, sizeof(buf));
+    AsyncWebServerResponse* r = req->beginResponse(200, "application/json", buf);
+    r->addHeader("Access-Control-Allow-Origin", "*");
+    req->send(r);
+  });
+
+  // ---- per-minute history for one day ----
+  server.on("/api/history", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!authOk(req)) return;
+    String date = req->hasParam("date") ? req->getParam("date")->value() : "";
+    if (date.length() != 10) { char d[12]; dateString(nowEpoch(), d); date = d; }
+    String path = String(HISTORY_DIR "/") + date.substring(0, 4) +
+                  date.substring(5, 7) + date.substring(8, 10) + ".csv";
+    if (!LittleFS.exists(path)) { req->send(404, "text/plain", "no data for " + date); return; }
+    AsyncWebServerResponse* r = req->beginResponse(LittleFS, path, "text/csv");
+    r->addHeader("Access-Control-Allow-Origin", "*");
+    req->send(r);
+  });
+
+  // ---- the whole daily log ----
+  server.on("/api/daily", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!authOk(req)) return;
+    if (!LittleFS.exists(DAILY_FILE)) { req->send(200, "text/csv", "date,chgWh,disWh,harvestWh,peakW,endSoc,utilMin\n"); return; }
+    AsyncWebServerResponse* r = req->beginResponse(LittleFS, DAILY_FILE, "text/csv");
+    r->addHeader("Access-Control-Allow-Origin", "*");
+    req->send(r);
+  });
+
+  // ---- monthly totals, drives the Monthly tab ----
+  server.on("/api/monthly", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!authOk(req)) return;
+    struct tm tmv;
+    int year = localNow(&tmv) ? tmv.tm_year + 1900 : 2026;
+    if (req->hasParam("year")) year = req->getParam("year")->value().toInt();
+    AsyncWebServerResponse* r = req->beginResponse(200, "application/json", monthlyJson(year));
+    r->addHeader("Access-Control-Allow-Origin", "*");
+    req->send(r);
+  });
+
+  // ---- bulk ingest: NDJSON body, one sample object per line ----
+  server.on("/api/upload", HTTP_POST,
+    [](AsyncWebServerRequest* req) {
+      if (!authOk(req)) return;
+      int n = 0;
+      while (uploadBuf.length()) {
+        int nl = uploadBuf.indexOf('\n');
+        String line = nl < 0 ? uploadBuf : uploadBuf.substring(0, nl);
+        uploadBuf = nl < 0 ? String() : uploadBuf.substring(nl + 1);
+        line.trim();
+        if (line.length()) { ingestLine(line); n++; }
+      }
+      req->send(200, "application/json", "{\"ok\":true,\"accepted\":" + String(n) + "}");
+    },
+    nullptr,
+    [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index, size_t total) {
+      if (index == 0) { uploadBuf = ""; uploadBuf.reserve(total < 16384 ? total + 8 : 16384); }
+      if (uploadBuf.length() > 16384) return;          // refuse to grow without bound
+      for (size_t i = 0; i < len; i++) uploadBuf += (char)data[i];
+    });
+
+  // ---- manual source selection ----
+  server.on("/api/relay", HTTP_ANY, [](AsyncWebServerRequest* req) {
+    if (!authOk(req)) return;
+    if (req->hasParam("src")) {
+      String s = req->getParam("src")->value();
+      if      (s == "auto")    manualSrc = SRC_NONE;
+      else if (s == "solar")   { manualSrc = SRC_SOLAR;   manualSince = millis(); }
+      else if (s == "utility") { manualSrc = SRC_UTILITY; manualSince = millis(); }
+      Serial.printf("[web] source request: %s\n", s.c_str());
+    }
+    if (req->hasParam("light")) {
+      manualLight = req->getParam("light")->value().toInt() != 0;
+      Serial.printf("[web] light request: %d\n", manualLight);
+    }
+    req->send(200, "application/json",
+      String("{\"src\":\"") + srcName(srcActual) + "\",\"manual\":" +
+      (manualSrc != SRC_NONE ? "true" : "false") +
+      ",\"light\":" + (lightOn ? "true" : "false") + "}");
+  });
+
+  // ---- thresholds, so the UI can label things correctly ----
+  server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!authOk(req)) return;
+    char buf[420];
+    snprintf(buf, sizeof(buf),
+      "{\"socCritical\":%d,\"socEveningFloor\":%d,\"socTarget1600\":%d,"
+      "\"eveningHour\":%d,\"topupHour\":%d,\"capacityAh\":%.0f,"
+      "\"travelOn\":\"%02d:%02d\",\"travelOff\":\"%02d:%02d\",\"logSec\":%lu}",
+      SOC_CRITICAL, SOC_EVENING_FLOOR, SOC_TARGET_1600,
+      EVENING_HOUR, TOPUP_START_HOUR, PACK_CAPACITY_AH,
+      TRAVEL_ON_HOUR, TRAVEL_ON_MIN, TRAVEL_OFF_HOUR, TRAVEL_OFF_MIN,
+      (unsigned long)(OFFLINE_LOG_MS / 1000));
+    req->send(200, "application/json", buf);
+  });
+
+  // ---- static dashboard from LittleFS /www ----
+  server.serveStatic("/", LittleFS, "/www/").setDefaultFile("index.html");
+
+  server.onNotFound([](AsyncWebServerRequest* req) {
+    req->send(404, "text/plain", "not found");
+  });
+
+  server.begin();
+  Serial.println("[web] server on port 80");
 }
 
 // ============================================================
@@ -437,53 +1222,103 @@ void wifiTask() {
 
 void onWifiUp() {
   Serial.printf("[WiFi] up, IP %s\n", WiFi.localIP().toString().c_str());
+
+  time_t before = nowEpoch();
   configTime(TZ_OFFSET_SEC, 0, NTP_1, NTP_2);
   for (int i = 0; i < 20 && nowEpoch() < 1700000000L; i++) delay(250);
-  if (nowEpoch() > 1700000000L) ntpSynced = true;
-  flushBuffer();
+
+  if (nowEpoch() > 1700000000L) {
+    if (!ntpSynced && before > 1000000000L) {
+      // how far the free-running clock had drifted. Records logged
+      // before this moment carry "approx":true and get shifted by
+      // this amount at upload, instead of being thrown away.
+      clockAdj = (int32_t)(nowEpoch() - before);
+      if (clockAdj > 86400 || clockAdj < -86400) clockAdj = 0;   // nonsense, ignore
+      Serial.printf("[time] clock corrected by %ld s\n", (long)clockAdj);
+    }
+    ntpSynced = true;
+    rolloverCheck();
+  }
+
+  if (MDNS.begin(MDNS_NAME)) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.printf("[web] http://%s.local/\n", MDNS_NAME);
+  }
 }
 
 // ============================================================
 //  setup / loop
 // ============================================================
 void setup() {
+  // Relays first, before anything can take time. Both sources open
+  // and lights off is the safe state to power up in.
+  pinMode(RELAY_UTILITY_PIN, OUTPUT);
+  pinMode(RELAY_SOLAR_PIN, OUTPUT);
+  relaysAllOff();
+  if (RELAY_LOAD_PIN >= 0) { pinMode(RELAY_LOAD_PIN, OUTPUT); relayDrive(RELAY_LOAD_PIN, false); }
+#if TRAVEL_SWITCH_ACTIVE_LOW
+  pinMode(TRAVEL_SWITCH_PIN, INPUT_PULLUP);
+#else
+  pinMode(TRAVEL_SWITCH_PIN, INPUT_PULLDOWN);
+#endif
+
   Serial.begin(115200);
   delay(2000);
   Serial.println();
-  Serial.println("=== SolarPulse v2 ===");
+  Serial.println("=== SolarPulse v3 ===");
   Serial.println("A: serial alive");
   Serial.flush();
+
+  fsLock = xSemaphoreCreateMutex();
 
   if (!prefs.begin("solar", false)) Serial.println("B: NVS failed, counters not saved");
   else                              Serial.println("B: NVS open");
   Serial.flush();
 
   loadCounters();
-  Serial.println("C: counters loaded");
+  Serial.printf("C: counters loaded, today %.1f Wh in / %.1f Wh out\n", todayChgWh, todayDisWh);
   Serial.flush();
 
   if (!LittleFS.begin(true)) {
-    Serial.println("D: LittleFS failed, offline buffer disabled");
+    Serial.println("D: LittleFS failed, offline queue disabled");
   } else {
-    countBufferedLines();
-    Serial.printf("D: LittleFS ok, %u buffered\n", bufferedLines);
+    fsOk = true;
+    if (!LittleFS.exists(HISTORY_DIR)) LittleFS.mkdir(HISTORY_DIR);
+    loadPos();
+    countQueue();
+    Serial.printf("D: LittleFS ok, %u samples queued from offset %lu\n",
+                  bufferedLines, (unsigned long)queuePos);
   }
   Serial.flush();
 
+  // read the travel switch once so the first schedule tick is right
+  {
+    int raw = digitalRead(TRAVEL_SWITCH_PIN);
+#if TRAVEL_SWITCH_ACTIVE_LOW
+    travelMode = (raw == LOW);
+#else
+    travelMode = (raw == HIGH);
+#endif
+    Serial.printf("E: travel switch on GPIO %d reads %s\n",
+                  TRAVEL_SWITCH_PIN, travelMode ? "CLOSED (travel mode)" : "open (normal)");
+  }
+
   NimBLEDevice::init("");                       // BLE before WiFi
-  Serial.println("E: NimBLE init ok");
+  Serial.println("F: NimBLE init ok");
   Serial.flush();
 
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-  Serial.println("F: BLE power set");
+  Serial.println("G: BLE power set");
   Serial.flush();
 
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.println("G: WiFi started");
+  Serial.println("H: WiFi started");
   Serial.flush();
 
-  Serial.printf("H: setup complete, heap %lu\n", (unsigned long)ESP.getFreeHeap());
+  setupWebServer();
+  Serial.printf("I: setup complete, heap %lu\n", (unsigned long)ESP.getFreeHeap());
 }
 
 void loop() {
@@ -508,20 +1343,38 @@ void loop() {
     bmsSendCaptured(CMD_CELL_INFO);
   }
 
-  if (wifiUp && now - tLive  >= LIVE_PUSH_MS)    { tLive  = now; pushLive(); }
-  if (wifiUp && now - tHist  >= HISTORY_PUSH_MS) { tHist  = now; pushHistorySample(); }
-  if (wifiUp && now - tDaily >= DAILY_PUSH_MS)   { tDaily = now; pushDaily(false); }
-  if (!wifiUp && now - tOff  >= OFFLINE_LOG_MS)  { tOff   = now; bufferSample(); }
-  if (now - tNvs >= NVS_SAVE_MS)                 { tNvs   = now; saveCounters(); }
+  // --- control loop, runs whatever the network is doing ---
+  if (now - tRelay >= 1000) {
+    tRelay = now;
+    // pvW / loadW come from BMS frames. If the link drops, report zero
+    // rather than freezing the last reading on the dashboard.
+    if (!bmsFresh()) { pvW = 0; loadW = 0; }
+    travelTask();
+    relayTask();
+    utilityAccounting();
+  }
+
+  // --- logging: flash first, always ---
+  if (now - tLog >= OFFLINE_LOG_MS) { tLog = now; logSample(); }
+
+  // --- day boundary, even if BLE is silent ---
+  if (now - tRoll >= 10000) { tRoll = now; rolloverCheck(); }
+
+  // --- cloud ---
+  if (wifiUp && now - tLive  >= LIVE_PUSH_MS)  { tLive  = now; pushLive(); }
+  if (wifiUp && now - tDaily >= DAILY_PUSH_MS) { tDaily = now; pushDaily(false); }
+  if (wifiUp && now - tUp    >= UPLOAD_TRY_MS) { tUp    = now; uploadTask(); }
+
+  if (now - tNvs >= NVS_SAVE_MS) { tNvs = now; saveCounters(); }
 
   if (now - tStat >= 10000) {
     tStat = now;
-    Serial.printf("[stat] ble=%s wifi=%s soc=%u%% %.2fV %.2fA cells %.3f/%.3f/%.3f/%.3f heap=%lu\n",
+    Serial.printf("[stat] ble=%s wifi=%s soc=%u%% %.2fV %.2fA src=%s%s q=%u heap=%lu\n",
                   bleConnected ? "up" : "down", wifiUp ? "up" : "down",
-                  bms.soc, bms.packV, bms.packI,
-                  bms.cell[0], bms.cell[1], bms.cell[2], bms.cell[3],
+                  bms.soc, bms.packV, bms.packI, srcName(srcActual),
+                  travelMode ? " travel" : "", bufferedLines,
                   (unsigned long)ESP.getFreeHeap());
   }
 
-  delay(50);
+  delay(20);
 }

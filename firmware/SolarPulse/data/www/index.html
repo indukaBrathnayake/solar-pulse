@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#0B0E17">
+<title>SolarPulse local</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <h1>SOLARPULSE <span class="tag">on-device</span></h1>
+  <span class="stamp" id="stamp">connecting…</span>
+</header>
+
+<!-- ===================== LIVE ===================== -->
+<main class="tab" id="tab-live">
+
+  <div class="grid">
+    <div class="tile amber">
+      <p class="k">Solar power</p>
+      <p class="v"><b id="pvW">--</b><i>W</i></p>
+      <p class="s" id="pvSub">array into the pack</p>
+    </div>
+    <div class="tile teal">
+      <p class="k">Battery</p>
+      <p class="v"><b id="soc">--</b><i>%</i></p>
+      <p class="s" id="packVI">-- V · -- A</p>
+      <div class="bar"><span id="socBar"></span></div>
+    </div>
+    <div class="tile blue">
+      <p class="k">Load</p>
+      <p class="v"><b id="loadW">--</b><i>W</i></p>
+      <p class="s" id="loadSub">house draw</p>
+    </div>
+    <div class="tile grey">
+      <p class="k">Utility (CEB)</p>
+      <p class="v"><b id="gridW">--</b><i>W</i></p>
+      <p class="s"><span id="utilMin">0</span> min on the grid today</p>
+    </div>
+    <div class="tile amber wide">
+      <p class="k">Harvested today</p>
+      <p class="v"><b id="today">0.00</b><i>kWh</i></p>
+      <p class="s">peak <span id="peak">0</span> W · lifetime <span id="life">0</span> kWh</p>
+    </div>
+  </div>
+
+  <section class="panel">
+    <h2>Source</h2>
+    <div class="src">
+      <div class="relay" id="relay-solar"><span class="led"></span>Inverter / solar</div>
+      <div class="relay" id="relay-util"><span class="led"></span>Utility / CEB</div>
+    </div>
+    <p class="why" id="why">…</p>
+    <div class="btns">
+      <button data-src="auto">Auto</button>
+      <button data-src="solar">Force solar</button>
+      <button data-src="utility">Force utility</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Travel mode &amp; lights</h2>
+    <p class="why">
+      Switch <b id="travel">--</b>.
+      When it is closed the lighting relay runs on the schedule
+      <span id="sched">18:00 – 23:30</span> every day, whatever the buttons say.
+    </p>
+    <div class="src">
+      <div class="relay" id="relay-light"><span class="led"></span>Lighting circuit</div>
+    </div>
+    <div class="btns">
+      <button data-light="1">Lights on</button>
+      <button data-light="0">Lights off</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Storage</h2>
+    <p class="why">
+      <b id="queued">0</b> samples still on flash waiting for the cloud ·
+      BMS link <b id="bmsLink">--</b> · free heap <b id="heap">--</b> kB
+    </p>
+    <p class="why">
+      Raw logs: <a href="/api/daily">daily.csv</a> ·
+      <a href="/api/history" id="todayCsv">today.csv</a>
+    </p>
+  </section>
+</main>
+
+<!-- ===================== MONTHLY ===================== -->
+<main class="tab hidden" id="tab-monthly">
+  <section class="panel">
+    <div class="mhead">
+      <h2>Monthly solar power</h2>
+      <input type="number" id="year" min="2020" max="2100">
+    </div>
+    <p class="why" id="mtotal">…</p>
+    <div class="chart" id="chart"></div>
+    <table class="mtable">
+      <thead><tr><th>Month</th><th>Harvested</th><th>Used</th></tr></thead>
+      <tbody id="mrows"></tbody>
+    </table>
+  </section>
+</main>
+
+<nav class="bottom">
+  <button class="active" data-tab="live"><span>◉</span>Live</button>
+  <button data-tab="monthly"><span>▤</span>Monthly</button>
+</nav>
+
+<script src="app.js"></script>
+</body>
+</html>

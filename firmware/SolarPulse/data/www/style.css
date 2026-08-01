@@ -1,0 +1,90 @@
+/* SolarPulse on-device UI. No CDN, no fonts, no network needed:
+   this page has to work when the internet is the thing that is down. */
+:root{
+  --bg:#0B0E17; --paper:#131826; --line:#232B3E; --ink:#E9EEF8; --muted:#8A94AC;
+  --amber:#FFB020; --gen:#73BF69; --use:#57A6F2; --teal:#3DD6C3; --coral:#F2495C;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  background:var(--bg);color:var(--ink);
+  font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  padding:14px 14px 78px;min-height:100vh;
+}
+.hidden{display:none!important}
+a{color:var(--use)}
+
+header{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+h1{font-size:1rem;letter-spacing:.18em;font-weight:700}
+.tag{font-size:.62rem;letter-spacing:.12em;color:var(--bg);background:var(--amber);
+     padding:2px 6px;border-radius:5px;font-weight:700}
+.stamp{margin-left:auto;color:var(--muted);font-size:.75rem}
+.stale{color:var(--coral)!important}
+
+/* ---- tiles ---- */
+.grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+.tile{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:13px 14px;
+      border-top:2px solid var(--accent,var(--line))}
+.tile.wide{grid-column:1/-1}
+.amber{--accent:var(--amber)} .teal{--accent:var(--teal)}
+.blue{--accent:var(--use)}    .grey{--accent:var(--muted)}
+.k{font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--accent,var(--muted))}
+.v{margin:4px 0 2px;font-variant-numeric:tabular-nums}
+.v b{font-size:1.9rem;font-weight:600}
+.v i{font-style:normal;font-size:.78rem;color:var(--muted);margin-left:5px}
+.s{font-size:.74rem;color:var(--muted)}
+.bar{margin-top:8px;height:6px;border-radius:3px;background:#1B2338;overflow:hidden}
+.bar span{display:block;height:100%;width:0;background:var(--teal);transition:width .4s}
+
+/* ---- panels ---- */
+.panel{background:var(--paper);border:1px solid var(--line);border-radius:14px;
+       padding:14px;margin-top:12px}
+.panel h2{font-size:.78rem;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);
+          margin-bottom:10px;font-weight:600}
+.why{font-size:.8rem;color:var(--muted);margin-top:8px}
+.why b{color:var(--ink)}
+
+.src{display:flex;gap:10px;flex-wrap:wrap}
+.relay{display:flex;align-items:center;gap:8px;font-size:.82rem;
+       border:1px solid var(--line);border-radius:10px;padding:8px 12px;flex:1;min-width:150px}
+.led{width:9px;height:9px;border-radius:50%;background:#39415A;flex:none}
+.relay.on{border-color:var(--gen);color:var(--ink)}
+.relay.on .led{background:var(--gen);box-shadow:0 0 9px var(--gen)}
+.relay.warn{border-color:var(--amber)}
+.relay.warn .led{background:var(--amber);box-shadow:0 0 9px var(--amber)}
+
+.btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.btns button{background:#1B2338;color:var(--ink);border:1px solid var(--line);
+             border-radius:9px;padding:8px 13px;font-size:.78rem;cursor:pointer}
+.btns button:hover{border-color:var(--use)}
+.btns button.sel{background:var(--use);color:#06101E;border-color:var(--use);font-weight:600}
+
+/* ---- monthly ---- */
+.mhead{display:flex;align-items:center;gap:10px}
+.mhead h2{margin:0}
+#year{margin-left:auto;background:#1B2338;color:var(--ink);border:1px solid var(--line);
+      border-radius:8px;padding:6px 8px;width:92px;font:inherit;font-size:.8rem}
+.chart{display:flex;align-items:flex-end;gap:5px;height:190px;margin:16px 0 4px}
+.col{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;height:100%}
+.col u{display:block;width:100%;background:var(--amber);border-radius:4px 4px 0 0;
+       min-height:2px;transition:height .4s}
+.col em{font-style:normal;font-size:.6rem;color:var(--muted);margin-top:5px}
+.col b{font-size:.6rem;color:var(--amber);margin-bottom:3px;font-weight:600}
+.col.now u{background:var(--gen)} .col.now b{color:var(--gen)}
+
+.mtable{width:100%;border-collapse:collapse;margin-top:14px;font-size:.78rem}
+.mtable th{text-align:right;color:var(--muted);font-weight:500;padding:6px 4px;
+           border-bottom:1px solid var(--line)}
+.mtable th:first-child{text-align:left}
+.mtable td{text-align:right;padding:6px 4px;border-bottom:1px solid #191F2E;
+           font-variant-numeric:tabular-nums}
+.mtable td:first-child{text-align:left;color:var(--muted)}
+.mtable tr.tot td{border-top:1px solid var(--line);border-bottom:0;font-weight:700;color:var(--amber)}
+
+/* ---- bottom nav ---- */
+.bottom{position:fixed;left:0;right:0;bottom:0;display:flex;
+        background:rgba(11,14,23,.94);border-top:1px solid var(--line);
+        backdrop-filter:blur(8px);padding:6px 0 max(6px,env(safe-area-inset-bottom))}
+.bottom button{flex:1;background:none;border:0;color:var(--muted);font:inherit;font-size:.7rem;
+               padding:6px 0;display:flex;flex-direction:column;align-items:center;gap:2px;cursor:pointer}
+.bottom button span{font-size:1.05rem;line-height:1}
+.bottom button.active{color:var(--amber)}

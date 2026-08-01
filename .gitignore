@@ -1,0 +1,5 @@
+firmware/SolarPulse/config.h
+
+# build output
+firmware/SolarPulse/build/
+*.bin
