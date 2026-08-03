@@ -156,6 +156,23 @@ function render() {
   $("pv-now").textContent    = (live.pvW ?? 0).toFixed(0);
   $("load-now").textContent  = (live.loadW ?? 0).toFixed(0);
 
+  /* ---------- tonight's plan ----------
+     Decided by the ESP at 18:15: did the pack reach its 99% target
+     today? If not it is a cloudy day, and the evening rule is allowed
+     to run the pack down to the relaxed floor before touching CEB.
+     Firmware older than this simply omits both keys, and the line
+     hides itself rather than showing a wrong number. */
+  const tn = $("tonight");
+  if (live.nightFloor == null) {
+    tn.classList.add("hidden");
+  } else {
+    tn.classList.remove("hidden");
+    tn.classList.toggle("rainy", !!live.rainy);
+    tn.textContent = live.rainy
+      ? `tonight: 99% target missed, pack may run down to ${live.nightFloor}% before CEB`
+      : `tonight: target reached, pack held above ${live.nightFloor}%`;
+  }
+
   setPill("pill-src",
     !fresh || !live.src ? "" : src === "solar" ? "on" : src === "utility" ? "warn" : "",
     src === "solar" ? "On solar" : src === "utility" ? "On CEB" : "Source --");
