@@ -1,0 +1,244 @@
+#pragma once
+/* ============================================================
+ *  SolarPulse - single configuration file
+ *  Everything you may want to change lives here. The .ino
+ *  should not need editing.
+ *
+ *  KEEP THIS FILE PRIVATE. It holds your WiFi password and the
+ *  Firebase write secret. .gitignore already excludes it; the
+ *  tracked copy is config.h.example.
+ * ============================================================ */
+
+/* ------------------------------------------------------------
+ *  0. TYPES USED IN FUNCTION SIGNATURES
+ *
+ *  The Arduino IDE auto-generates forward declarations for every
+ *  function in the .ino and inserts them right after the LAST
+ *  #include line -- before any of the .ino's own code has run,
+ *  including its own enums and structs. A function signature
+ *  that mentions a type the .ino defines further down (e.g.
+ *  "const char* srcName(Source s)") then fails to compile with
+ *  "'Source' was not declared in this scope", because the
+ *  auto-inserted prototype appears before the enum does.
+ *
+ *  config.h is the last #include, so anything declared here IS
+ *  visible at that insertion point. Any enum/struct used as a
+ *  parameter or return type of a top-level .ino function must
+ *  live here, not in the .ino, or this breaks again.
+ * ---------------------------------------------------------- */
+enum Source : uint8_t { SRC_NONE = 0, SRC_SOLAR = 1, SRC_UTILITY = 2 };
+
+/* ------------------------------------------------------------
+ *  1. NETWORK / CLOUD
+ * ---------------------------------------------------------- */
+#define WIFI_SSID       "your wifi name"
+#define WIFI_PASS       "your wifi password"
+
+/* JK BMS Bluetooth MAC, printed on the BMS label. */
+#define BMS_MAC         "A4:C1:38:08:19:21"
+
+/* Realtime Database host, no https:// and no trailing slash. */
+#define FIREBASE_HOST   "solar-pulse-8ba33-default-rtdb.asia-southeast1.firebasedatabase.app"
+/* Legacy database secret. Leave "" while the database is in test mode. */
+#define FIREBASE_AUTH   ""
+
+/* mDNS name -> http://solarpulse.local/ on the LAN. */
+#define MDNS_NAME       "solarpulse"
+
+/* Optional HTTP basic auth for the on-device web UI.
+ * Leave the user empty to disable authentication.       */
+#define WEB_USER        ""
+#define WEB_PASS        ""
+
+/* ------------------------------------------------------------
+ *  2. TIME
+ *  Sri Lanka is UTC+5:30 -> 5*3600 + 30*60 = 19800.
+ * ---------------------------------------------------------- */
+#define TZ_OFFSET_SEC   19800
+#define NTP_1           "pool.ntp.org"
+#define NTP_2           "time.google.com"
+
+/* ------------------------------------------------------------
+ *  3. TIMERS (all milliseconds, all non-blocking)
+ * ---------------------------------------------------------- */
+#define LIVE_PUSH_MS      15000UL    /* /live snapshot to Firebase      */
+#define HISTORY_PUSH_MS   60000UL    /* one history sample per minute   */
+#define DAILY_PUSH_MS    300000UL    /* /daily row refresh              */
+#define OFFLINE_LOG_MS    60000UL    /* flash log interval (see below)  */
+#define NVS_SAVE_MS      300000UL    /* counter save to NVS             */
+#define WIFI_RETRY_MS     20000UL    /* WiFi reconnect attempt spacing  */
+#define UPLOAD_TRY_MS     10000UL    /* backlog upload attempt spacing  */
+
+/* ------------------------------------------------------------
+ *  4. FLASH LOGGING / OFFLINE QUEUE
+ *
+ *  Every LOG_INTERVAL the firmware appends one sample to
+ *  /queue.jsonl (waiting to be uploaded) and one row to
+ *  /h/YYYYMMDD.csv (served by the on-device web UI).
+ *  It logs whether WiFi is up or down, so a failed upload can
+ *  never punch a hole in the graph.
+ * ---------------------------------------------------------- */
+#define QUEUE_FILE          "/queue.jsonl"
+#define QUEUE_POS_FILE      "/queue.pos"
+#define DAILY_FILE          "/daily.csv"
+#define HISTORY_DIR         "/h"
+
+#define QUEUE_BATCH          20      /* samples per bulk upload request */
+#define QUEUE_MAX_BYTES   300000UL   /* hard cap; oldest dropped beyond */
+#define QUEUE_COMPACT_BYTES 32768UL  /* rewrite file once this much is sent */
+
+#define LOCAL_HISTORY_DAYS   3       /* per-minute CSVs kept on flash   */
+#define DAILY_LOG_DAYS     400       /* daily totals kept (>12 months)  */
+
+/* Legacy cap kept for compatibility with the old buffer code. */
+#define BUFFER_MAX_LINES  3000
+
+/* ------------------------------------------------------------
+ *  5. ENERGY ACCOUNTING
+ * ---------------------------------------------------------- */
+#define CURRENT_DEADBAND   0.25f     /* A, below this the pack is idle  */
+#define PACK_CAPACITY_AH   100.0f
+
+/* ------------------------------------------------------------
+ *  6. OPTIONAL PV-SIDE METERING
+ *
+ *  There is no PV sensor on this rig today: "harvest" is the
+ *  power flowing INTO the battery, measured by the BMS. Loads
+ *  fed straight from the array during the day never pass the
+ *  shunt, so harvest is an undercount.
+ *
+ *  Set PV_ADC_ENABLE to 1 once a divider + current sensor are
+ *  wired to the two ADC1 pins below, and harvest switches to a
+ *  true V_solar x I_solar integration.
+ * ---------------------------------------------------------- */
+#define PV_ADC_ENABLE      0
+#define PV_VOLT_PIN        34        /* ADC1, input-only pin            */
+#define PV_CURR_PIN        35        /* ADC1, input-only pin            */
+#define PV_VOLT_DIVIDER    11.0f     /* (R1+R2)/R2 of the divider       */
+#define PV_CURR_MV_PER_A   66.0f     /* ACS712-30A = 66 mV/A            */
+#define PV_CURR_ZERO_MV    1650.0f   /* sensor output at 0 A            */
+#define PV_ADC_REF_MV      3300.0f
+
+/* ------------------------------------------------------------
+ *  7. RELAY OUTPUTS
+ *
+ *  Two source relays, one GPIO each. Each relay carries both
+ *  Live and Neutral on its own two poles; a relay module input
+ *  draws well under 5 mA from the GPIO, so one pin per relay is
+ *  correct and safe. See WIRING.md.
+ *
+ *  Pin choice matters on the classic ESP32:
+ *    GPIO 6-11  wired to the SPI flash, board will not boot
+ *    GPIO 0,2,12,15  strapping pins, wrong level blocks boot
+ *    GPIO 5     strapping pin, floats high during reset
+ *  25/26/27 are clean outputs with no boot-time behaviour, so
+ *  they are the defaults here even though the spec suggested
+ *  4 and 5.
+ * ---------------------------------------------------------- */
+#define RELAY_UTILITY_PIN   25       /* CEB mains -> loads              */
+#define RELAY_SOLAR_PIN     26       /* inverter (solar/battery) -> loads */
+#define RELAY_LOAD_PIN      27       /* lighting circuit, -1 to disable */
+
+/* Most blue relay boards are ACTIVE LOW: the coil pulls in when
+ * the input is driven to 0 V. Set to 0 for active-high boards. */
+#define RELAY_ACTIVE_LOW    1
+
+/* Both source relays are held open for this long during every
+ * changeover, so utility and inverter can never touch. */
+#define RELAY_DEAD_TIME_MS  800UL
+
+/* Minimum time in one source before another switch is allowed. */
+#define SOURCE_MIN_DWELL_MS 60000UL
+
+/* A manual choice made in the web UI expires after this and the
+ * state machine takes over again. 0 = never expires. */
+#define MANUAL_OVERRIDE_MS  1800000UL
+
+/* ------------------------------------------------------------
+ *  8. BATTERY THRESHOLDS (percent state of charge, from the BMS)
+ * ---------------------------------------------------------- */
+#define SOC_CRITICAL        20   /* daytime: fall back to utility below */
+#define SOC_EVENING_FLOOR   60   /* after 16:00, on a day that DID reach
+                                   * target: protect the pack below this */
+#define SOC_RECOVER_HYST     5   /* SoC must rise this much to go back  */
+#define SOC_TARGET_1600     99   /* wanted charge level at 16:00        */
+
+/* Top-up window: between these hours, if SoC is still short of
+ * SOC_TARGET_1600, loads are moved to utility so the whole array
+ * output goes into the battery instead of into the house. */
+#define TOPUP_START_HOUR    14
+#define EVENING_HOUR        16   /* start of the "preserve charge" mode */
+
+/* Rainy-day fallback.
+ *
+ * On a cloudy day the array may never get the pack to
+ * SOC_TARGET_1600 (99%) no matter how long loads are parked on
+ * utility, so forcing SOC_EVENING_FLOOR (60%) at nightfall would
+ * just mean falling back to the grid every single evening it
+ * rains -- exactly the outcome solar+battery is meant to avoid.
+ *
+ * At RAINY_CHECK time (18:15) the firmware checks once: did the
+ * pack reach 99% today?
+ *   - yes  -> plenty of charge, keep the normal 60% floor
+ *   - no   -> today under-produced. Stop treating that as an
+ *             emergency: run the house from the battery as deep
+ *             as SOC_RAINY_FLOOR (35%) before touching utility at
+ *             all. CEB only steps in once the pack actually hits
+ *             that lower floor, protecting the cells without
+ *             using the grid on every overcast evening.
+ */
+#define RAINY_CHECK_HOUR    18   /* 18:15 -- give the array until dusk  */
+#define RAINY_CHECK_MIN     15   /* (PV_HOUR_END is 19:00) before giving up on today's target */
+#define SOC_RAINY_FLOOR     35   /* deeper floor allowed on a day that fell short */
+
+/* Array counted as producing above this many watts into the pack. */
+#define SOLAR_OK_W          40.0f
+/* Daylight window used to tell PV charging from grid charging.  */
+#define PV_HOUR_START        6
+#define PV_HOUR_END         19
+
+/* ------------------------------------------------------------
+ *  9. TRAVEL MODE
+ *
+ *  A toggle switch to GND. Closed = away from home: the lighting
+ *  relay is driven on a fixed evening schedule so the house looks
+ *  occupied. Open = normal behaviour.
+ *
+ *  GPIO 8 (as specified) is only usable on ESP32-S2/S3/C3. On the
+ *  classic ESP32 in this build it is bonded to the SPI flash and
+ *  the board will not boot, so the default there is GPIO 32.
+ * ---------------------------------------------------------- */
+#if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32C3)
+  #define TRAVEL_SWITCH_PIN   8
+#else
+  #define TRAVEL_SWITCH_PIN   32
+#endif
+
+#define TRAVEL_SWITCH_ACTIVE_LOW 1   /* switch shorts the pin to GND    */
+#define TRAVEL_DEBOUNCE_MS       500UL
+
+#define TRAVEL_ON_HOUR    18         /* lights on  18:00                */
+#define TRAVEL_ON_MIN      0
+#define TRAVEL_OFF_HOUR   23         /* lights off 23:30                */
+#define TRAVEL_OFF_MIN    30
+
+/* ------------------------------------------------------------
+ *  10. SAFETY CHECKS - do not edit below
+ * ---------------------------------------------------------- */
+#if defined(CONFIG_IDF_TARGET_ESP32)
+  #if (TRAVEL_SWITCH_PIN >= 6) && (TRAVEL_SWITCH_PIN <= 11)
+    #error "TRAVEL_SWITCH_PIN 6-11 is wired to the SPI flash on the classic ESP32. The board will not boot. Use 32, 33, 34 or 35."
+  #endif
+  #if (RELAY_UTILITY_PIN >= 6) && (RELAY_UTILITY_PIN <= 11)
+    #error "RELAY_UTILITY_PIN 6-11 is wired to the SPI flash on the classic ESP32."
+  #endif
+  #if (RELAY_SOLAR_PIN >= 6) && (RELAY_SOLAR_PIN <= 11)
+    #error "RELAY_SOLAR_PIN 6-11 is wired to the SPI flash on the classic ESP32."
+  #endif
+  #if (RELAY_UTILITY_PIN >= 34) || (RELAY_SOLAR_PIN >= 34)
+    #error "GPIO 34-39 are input-only on the classic ESP32 and cannot drive a relay."
+  #endif
+#endif
+#if (RELAY_UTILITY_PIN == RELAY_SOLAR_PIN)
+  #error "The two source relays must be on different pins."
+#endif
