@@ -635,3 +635,12 @@ body { padding-bottom: 96px; }
 /* keep the alarm toast clear of the tab bar */
 .toast { bottom: 88px; }
 @media (max-width: 760px) { .toast { bottom: 82px; } }
+
+/* tonight's evening-floor plan, inside the source card */
+.tonight { display: flex; align-items: center; gap: 6px; }
+.tonight::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--gen); flex: none;
+}
+.tonight.rainy { color: var(--gold-text); }
+.tonight.rainy::before { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
