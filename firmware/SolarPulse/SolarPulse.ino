@@ -50,6 +50,9 @@
 #include <ESPAsyncWebServer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#if __has_include("esp_coexist.h")
+  #include "esp_coexist.h"      // WiFi/BLE radio arbitration, see setup()
+#endif
 #include <time.h>
 #include "config.h"
 
@@ -105,9 +108,8 @@ static inline float harvestWhToday() {
 
 // ============================================================
 //  relay / mode state
+//  (the enum itself lives in config.h -- see the note there on why)
 // ============================================================
-enum Source : uint8_t { SRC_NONE = 0, SRC_SOLAR = 1, SRC_UTILITY = 2 };
-
 Source   srcActual   = SRC_NONE;   // what is closed right now
 Source   srcTarget   = SRC_NONE;   // what the changeover is heading to
 Source   manualSrc   = SRC_NONE;   // web override, SRC_NONE = automatic
@@ -117,6 +119,9 @@ uint32_t deadUntil   = 0;
 bool     inChangeover = false;
 bool     topUpEngaged = false;     // loads parked on utility to charge faster
 const char* srcReason = "boot";
+
+bool     rainyCheckDone   = false; // has the 18:15 target check run today
+bool     rainyFloorActive = false; // true = today fell short, allow SOC_RAINY_FLOOR
 
 bool     travelMode  = false;      // physical switch closed
 bool     lightOn     = false;      // lighting relay state
@@ -419,6 +424,8 @@ void rolloverCheck() {
   todayChgWh = todayDisWh = todayPeakW = todayPvWh = 0;
   utilitySecToday = 0;
   topUpEngaged = false;
+  rainyCheckDone = false;          // re-run the 18:15 target check tonight
+  rainyFloorActive = false;        // back to the normal 60% floor by default
   dayStamp = ds;
   saveCounters();
 }
@@ -473,6 +480,7 @@ int buildLiveJson(char* out, size_t cap) {
     "\"pvW\":%.1f,\"loadW\":%.1f,\"gridW\":%.1f,\"harvestWh\":%.1f,"
     "\"src\":\"%s\",\"relayU\":%s,\"relayS\":%s,\"why\":\"%s\","
     "\"manual\":%s,\"travel\":%s,\"light\":%s,\"utilMin\":%lu,"
+    "\"rainy\":%s,\"nightFloor\":%d,"
     "\"bmsLink\":%s,\"rssi\":%d,\"buffered\":%u,\"heap\":%lu}",
     (long)t, ntpSynced ? "true" : "false",
     bms.packV, bms.packI, bms.packW, bms.soc, bms.remainAh,
@@ -489,6 +497,10 @@ int buildLiveJson(char* out, size_t cap) {
     manualSrc != SRC_NONE ? "true" : "false",
     travelMode ? "true" : "false", lightOn ? "true" : "false",
     (unsigned long)(utilitySecToday / 60),
+    // tonight's plan: which SoC floor the evening rule will hold to,
+    // and whether that is the relaxed rainy-day one. Decided at 18:15.
+    rainyFloorActive ? "true" : "false",
+    rainyFloorActive ? SOC_RAINY_FLOOR : SOC_EVENING_FLOOR,
     bmsFresh() ? "true" : "false",
     WiFi.RSSI(), bufferedLines, (unsigned long)ESP.getFreeHeap());
 }
@@ -850,7 +862,47 @@ Source decideSource() {
     manualSrc = SRC_NONE;                       // expired, back to automatic
   }
 
-  // 2. no BMS telemetry -> we do not know the SoC. Keep the house
+  // 2. once-daily rainy-day check, at RAINY_CHECK time (18:15).
+  //    Did the pack actually reach SOC_TARGET_1600 (99%) today? If
+  //    not, today under-produced -- most likely rain -- and holding
+  //    the normal SOC_EVENING_FLOOR (60%) would just mean falling
+  //    back to utility every such evening. Relax the floor to
+  //    SOC_RAINY_FLOOR (35%) for the rest of tonight instead, so the
+  //    battery is used properly and utility is the last resort, not
+  //    the default. This runs once per day regardless of manual
+  //    override or a momentary BMS hiccup -- it only commits when
+  //    this tick's SoC reading is actually fresh.
+  if (!rainyCheckDone) {
+    struct tm tmvChk;
+    if (localNow(&tmvChk)) {
+      bool pastCheckpoint = tmvChk.tm_hour > RAINY_CHECK_HOUR ||
+                            (tmvChk.tm_hour == RAINY_CHECK_HOUR && tmvChk.tm_min >= RAINY_CHECK_MIN);
+      if (pastCheckpoint && bmsFresh()) {
+        rainyCheckDone = true;
+        rainyFloorActive = bms.soc < SOC_TARGET_1600;
+        Serial.printf("[relay] %02d:%02d check: soc=%u%% -> %s\n",
+                      RAINY_CHECK_HOUR, RAINY_CHECK_MIN, bms.soc,
+                      rainyFloorActive ? "target missed, floor relaxed to 35% for tonight (rainy mode)"
+                                       : "target reached, normal 60% floor holds");
+
+        // Hand the house straight back to the battery on this tick.
+        // On a rainy day it is already on utility here (top-up parked
+        // it there at 14:00, then the 60% floor held it), and the
+        // recovery hysteresis below would demand SOC_RAINY_FLOOR +
+        // SOC_RECOVER_HYST = 40% before releasing it. That hysteresis
+        // exists to stop the relays chattering around the floor, not
+        // to block this once-a-day scheduled handover, so skip it here.
+        // Below the floor we fall through and utility keeps the house.
+        if (rainyFloorActive && bms.soc > SOC_RAINY_FLOOR) {
+          topUpEngaged = false;
+          srcReason = "18:15, target missed: off CEB, running the pack down to 35%";
+          return SRC_SOLAR;
+        }
+      }
+    }
+  }
+
+  // 3. no BMS telemetry -> we do not know the SoC. Keep the house
   //    alive on utility rather than flatten an unknown pack.
   if (bmsLost()) { srcReason = "BMS link lost, failsafe"; return SRC_UTILITY; }
   if (!bmsFresh()) { srcReason = "waiting for BMS"; return srcActual == SRC_NONE ? SRC_UTILITY : srcActual; }
@@ -893,17 +945,25 @@ Source decideSource() {
   topUpEngaged = false;
   if (solar) { srcReason = "late sun still producing"; return SRC_SOLAR; }
 
+  // Normal nights protect the pack at 60%. A night that missed
+  // today's 99% target (rainyFloorActive, decided at 18:15 above)
+  // is allowed down to 35% instead, so a cloudy day does not turn
+  // into "utility every evening".
+  int floor = rainyFloorActive ? SOC_RAINY_FLOOR : SOC_EVENING_FLOOR;
+  const char* floorReason = rainyFloorActive
+    ? "pack below the 35% rainy-day floor" : "pack below evening floor";
+
   if (srcActual == SRC_UTILITY) {
     // hysteresis so a sagging pack does not chatter the relays
-    if (soc >= SOC_EVENING_FLOOR + SOC_RECOVER_HYST) {
+    if (soc >= floor + SOC_RECOVER_HYST) {
       srcReason = "pack recovered, back on battery";
       return SRC_SOLAR;
     }
-    srcReason = "pack below evening floor";
+    srcReason = floorReason;
     return SRC_UTILITY;
   }
-  if (soc > SOC_EVENING_FLOOR) { srcReason = "evening, running on the pack"; return SRC_SOLAR; }
-  srcReason = "pack below evening floor";
+  if (soc > floor) { srcReason = "evening, running on the pack"; return SRC_SOLAR; }
+  srcReason = floorReason;
   return SRC_UTILITY;
 }
 
@@ -1184,12 +1244,15 @@ void setupWebServer() {
   // ---- thresholds, so the UI can label things correctly ----
   server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (!authOk(req)) return;
-    char buf[420];
+    char buf[480];
     snprintf(buf, sizeof(buf),
       "{\"socCritical\":%d,\"socEveningFloor\":%d,\"socTarget1600\":%d,"
+      "\"socRainyFloor\":%d,\"rainyCheck\":\"%02d:%02d\",\"rainyModeTonight\":%s,"
       "\"eveningHour\":%d,\"topupHour\":%d,\"capacityAh\":%.0f,"
       "\"travelOn\":\"%02d:%02d\",\"travelOff\":\"%02d:%02d\",\"logSec\":%lu}",
       SOC_CRITICAL, SOC_EVENING_FLOOR, SOC_TARGET_1600,
+      SOC_RAINY_FLOOR, RAINY_CHECK_HOUR, RAINY_CHECK_MIN,
+      rainyFloorActive ? "true" : "false",
       EVENING_HOUR, TOPUP_START_HOUR, PACK_CAPACITY_AH,
       TRAVEL_ON_HOUR, TRAVEL_ON_MIN, TRAVEL_OFF_HOUR, TRAVEL_OFF_MIN,
       (unsigned long)(OFFLINE_LOG_MS / 1000));
@@ -1205,6 +1268,33 @@ void setupWebServer() {
 
   server.begin();
   Serial.println("[web] server on port 80");
+}
+
+// Bring the web server up only after the BMS link is established, or
+// after WEB_START_GRACE_MS if the BMS never shows up (so the LAN page
+// and the API still work while you debug a BLE problem).
+//
+// Why: AsyncTCP starts its own task and ESPAsyncWebServer holds
+// buffers, and NimBLE needs contiguous heap plus radio time to make
+// the connection and read the GATT table. Starting the server first
+// was enough to stop the BMS connecting on this board.
+#ifndef WEB_START_GRACE_MS
+#define WEB_START_GRACE_MS 90000UL
+#endif
+
+void webServerTask() {
+  static bool started = false;
+  if (started) return;
+  if (!bms.lastFrameMs && millis() < WEB_START_GRACE_MS) return;
+  started = true;
+  Serial.printf("[web] starting (%s), heap %lu\n",
+                bms.lastFrameMs ? "BMS link up" : "grace period expired",
+                (unsigned long)ESP.getFreeHeap());
+  setupWebServer();
+  if (WiFi.status() == WL_CONNECTED && MDNS.begin(MDNS_NAME)) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.printf("[web] http://%s.local/\n", MDNS_NAME);
+  }
 }
 
 // ============================================================
@@ -1240,10 +1330,8 @@ void onWifiUp() {
     rolloverCheck();
   }
 
-  if (MDNS.begin(MDNS_NAME)) {
-    MDNS.addService("http", "tcp", 80);
-    Serial.printf("[web] http://%s.local/\n", MDNS_NAME);
-  }
+  // mDNS is advertised by webServerTask() once the server is actually
+  // listening, so nothing announces a port that is not open yet.
 }
 
 // ============================================================
@@ -1311,13 +1399,31 @@ void setup() {
   Serial.println("G: BLE power set");
   Serial.flush();
 
+  // WiFi and BLE share ONE 2.4 GHz radio, time-sliced by the
+  // coexistence arbiter. Tell it Bluetooth wins: the BMS link is a
+  // connection that drops if it misses its slots, while a Firebase
+  // push can simply be retried a second later.
+#if __has_include("esp_coexist.h")
+  esp_coex_preference_set(ESP_COEX_PREFER_BT);
+  Serial.println("G2: coexistence set to prefer BT");
+#endif
+
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
+  // NOTE: do NOT call WiFi.setSleep(false) here. Disabling modem
+  // sleep makes the WiFi stack hold the radio continuously and
+  // starves BLE of airtime -- with it on, the BMS either never
+  // connects or connects and then stops delivering frames. v2 left
+  // the default (WIFI_PS_MIN_MODEM) and that is what works.
+  WiFi.setSleep(true);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.println("H: WiFi started");
   Serial.flush();
 
-  setupWebServer();
+  // The web server is started later, from loop(), once the BMS link
+  // is up -- see webServerTask(). AsyncTCP's task and buffers take a
+  // sizeable bite out of the heap, and NimBLE needs room to build the
+  // connection and walk the GATT table. Coming up in that order keeps
+  // the first BLE connect in the same quiet conditions as v2.
   Serial.printf("I: setup complete, heap %lu\n", (unsigned long)ESP.getFreeHeap());
 }
 
@@ -1331,6 +1437,7 @@ void loop() {
   if (!wifiUp) wifiTask();
 
   bleConnectTask();
+  webServerTask();          // deferred until the BMS link is up
 
   uint32_t now = millis();
 
@@ -1361,9 +1468,16 @@ void loop() {
   if (now - tRoll >= 10000) { tRoll = now; rolloverCheck(); }
 
   // --- cloud ---
-  if (wifiUp && now - tLive  >= LIVE_PUSH_MS)  { tLive  = now; pushLive(); }
-  if (wifiUp && now - tDaily >= DAILY_PUSH_MS) { tDaily = now; pushDaily(false); }
-  if (wifiUp && now - tUp    >= UPLOAD_TRY_MS) { tUp    = now; uploadTask(); }
+  // Hold off every TLS handshake until the BMS link is up (or the
+  // grace period expires). A handshake allocates tens of kB and takes
+  // the radio for a moment; doing that while NimBLE is still trying to
+  // connect and read the GATT table is what makes the BMS connect
+  // intermittently. Nothing is lost by waiting: samples are already on
+  // flash and go up from the queue afterwards.
+  bool cloudOk = wifiUp && (bms.lastFrameMs || millis() >= WEB_START_GRACE_MS);
+  if (cloudOk && now - tLive  >= LIVE_PUSH_MS)  { tLive  = now; pushLive(); }
+  if (cloudOk && now - tDaily >= DAILY_PUSH_MS) { tDaily = now; pushDaily(false); }
+  if (cloudOk && now - tUp    >= UPLOAD_TRY_MS) { tUp    = now; uploadTask(); }
 
   if (now - tNvs >= NVS_SAVE_MS) { tNvs = now; saveCounters(); }
 
@@ -1376,5 +1490,5 @@ void loop() {
                   (unsigned long)ESP.getFreeHeap());
   }
 
-  delay(20);
+  delay(50);                // same cadence as the known-good v2 loop
 }
