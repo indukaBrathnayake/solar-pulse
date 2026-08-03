@@ -88,3 +88,12 @@ h1{font-size:1rem;letter-spacing:.18em;font-weight:700}
                padding:6px 0;display:flex;flex-direction:column;align-items:center;gap:2px;cursor:pointer}
 .bottom button span{font-size:1.05rem;line-height:1}
 .bottom button.active{color:var(--amber)}
+
+/* tonight's evening-floor plan */
+.tonight { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.tonight::before {
+  content: ""; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--gen); flex: none;
+}
+.tonight.rainy { color: #FFC55C; }
+.tonight.rainy::before { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
