@@ -42,6 +42,19 @@ async function poll() {
   $("why").textContent = (d.manual ? "manual · " : "automatic · ") + (d.why || "");
   $("travel").textContent = d.travel ? "CLOSED — travel mode" : "open — normal";
 
+  // Tonight's plan, decided by the 18:15 target check. Firmware that
+  // predates these keys omits them, so hide the line rather than lie.
+  const tn = $("tonight");
+  if (d.nightFloor == null) {
+    tn.classList.add("hidden");
+  } else {
+    tn.classList.remove("hidden");
+    tn.classList.toggle("rainy", !!d.rainy);
+    tn.innerHTML = d.rainy
+      ? `Tonight: 99% target <b>missed</b> — pack may run down to <b>${d.nightFloor}%</b> before CEB.`
+      : `Tonight: target reached — pack held above <b>${d.nightFloor}%</b>.`;
+  }
+
   $("queued").textContent  = d.buffered ?? 0;
   $("bmsLink").textContent = d.bmsLink ? "up" : "lost";
   $("heap").textContent    = n((d.heap || 0) / 1024);
