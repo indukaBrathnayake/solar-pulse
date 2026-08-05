@@ -7,6 +7,16 @@ const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov
 
 const n = (x, d = 0) => (x == null || isNaN(x) ? "--" : Number(x).toFixed(d));
 
+// filled from /api/config so the banner quotes the real threshold
+let cfgCutoff = 35;
+
+function fmtUptime(sec) {
+  if (!sec && sec !== 0) return "--";
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
+}
+
 /* ---------------- live ---------------- */
 async function poll() {
   let d;
@@ -55,9 +65,29 @@ async function poll() {
       : `Tonight: target reached — pack held above <b>${d.nightFloor}%</b>.`;
   }
 
+  // Battery protection banner. Load cutoff is the loudest thing the
+  // controller can do, so it gets its own always-visible strip.
+  const prot = $("protect");
+  if (d.cutoff) {
+    prot.classList.remove("hidden");
+    prot.classList.add("cut");
+    prot.innerHTML = `<b>Load disconnected</b> — pack at ${n(d.soc)}%, ` +
+                     `below the ${cfgCutoff}% cutoff. Alarm sounding.`;
+  } else if (d.buzz === 1) {
+    prot.classList.remove("hidden");
+    prot.classList.remove("cut");
+    prot.innerHTML = `<b>Low battery warning</b> — pack at ${n(d.soc)}%. ` +
+                     `Load disconnects at ${cfgCutoff}%.`;
+  } else {
+    prot.classList.add("hidden");
+  }
+
   $("queued").textContent  = d.buffered ?? 0;
   $("bmsLink").textContent = d.bmsLink ? "up" : "lost";
+  $("bleState").textContent = d.ble ?? "--";
+  $("reconn").textContent  = d.reconn ?? 0;
   $("heap").textContent    = n((d.heap || 0) / 1024);
+  $("uptime").textContent  = fmtUptime(d.up);
 
   document.querySelectorAll("[data-src]").forEach((b) => {
     const want = d.manual ? d.src : "auto";
@@ -134,6 +164,11 @@ $("todayCsv").href = "/api/history?date=" + new Date().toLocaleDateString("en-CA
 
 fetch("/api/config").then((r) => r.json()).then((c) => {
   $("sched").textContent = `${c.travelOn} – ${c.travelOff}`;
+  if (c.socLoadCutoff != null) cfgCutoff = c.socLoadCutoff;
+  if (c.socBuzzerWarn != null && c.socLoadCutoff != null) {
+    $("protRule").textContent =
+      `Buzzer warns at ${c.socBuzzerWarn}%, load disconnects at ${c.socLoadCutoff}%.`;
+  }
 }).catch(() => {});
 
 poll();
