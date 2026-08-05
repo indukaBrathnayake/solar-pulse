@@ -97,3 +97,18 @@ h1{font-size:1rem;letter-spacing:.18em;font-weight:700}
 }
 .tonight.rainy { color: #FFC55C; }
 .tonight.rainy::before { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+
+/* battery protection banner: warning amber, cutoff red */
+.protect {
+  border-radius: 12px; padding: 11px 13px; margin-bottom: 12px;
+  font-size: .82rem; line-height: 1.4;
+  border: 1px solid var(--amber); background: rgba(255,176,32,.10); color: #FFC55C;
+}
+.protect b { color: var(--amber); }
+.protect.cut {
+  border-color: var(--coral); background: rgba(242,73,92,.12); color: #FF8A96;
+  animation: protpulse 1.6s ease-in-out infinite;
+}
+.protect.cut b { color: var(--coral); }
+@keyframes protpulse { 0%,100% { opacity: 1 } 50% { opacity: .62 } }
+@media (prefers-reduced-motion: reduce) { .protect.cut { animation: none } }
