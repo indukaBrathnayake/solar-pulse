@@ -12,7 +12,9 @@ const FIREBASE_CONFIG = {
    
 };
 
-const STALE_MS = 60 * 1000;          // monitor counted offline after 60 s silence
+// The ESP pushes /live every 3 s, so 30 s of silence is ten missed
+// pushes -- comfortably a real outage rather than one dropped packet.
+const STALE_MS = 30 * 1000;
 const AMP_DEADBAND = 0.25;           // below this = idle
 const PV_HOURS = [6, 19];            // charging inside this window = PV
 const CAPACITY_AH = 100;             // pack capacity, fixed system spec
@@ -22,7 +24,8 @@ const db = firebase.database();
 
 const $ = (id) => document.getElementById(id);
 let live = null;
-let dailyCache = null;               // all /daily rows, refreshed periodically
+// /daily rows are cached per year by daysForYear(); see the data
+// layer further down.
 
 /* ---------------- number count-up ---------------- */
 function tween(el, target, decimals = 2) {
@@ -245,77 +248,210 @@ function localDate(d = new Date()) { return d.toLocaleDateString("en-CA"); }
 let currentView = "day";
 let currentRows = { labels: [], harvested: [], used: [] };  // for CSV export
 
-async function loadDay(dateStr) {
-  const snap = await db.ref("history/" + dateStr).limitToLast(500).once("value");
-  const labels = [], data = [];
-  const rows = [];
-  snap.forEach((c) => {
-    const s = c.val();
-    const t = new Date(s.t * 1000);
-    labels.push(t.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }));
-    data.push(s.p);
-    rows.push({ time: t.toISOString(), voltage: s.v, current: s.i, power: s.p, soc: s.soc });
-  });
-  setChartType("line", labels, [{
-    data, borderColor: "#F2A20C", borderWidth: 2, pointRadius: 0,
-    fill: { target: "origin", above: "rgba(242,162,12,0.10)", below: "rgba(30,140,125,0.10)" },
-    tension: 0.3,
-  }]);
-  currentRows = { kind: "day", date: dateStr, columns: ["time","voltage","current","power","soc"], rows };
-  $("chart-caption").textContent = `Power in/out of the battery on ${dateStr}`;
+/* ============================================================
+   DAY VIEW - CIRCULAR SAMPLE BUFFER
+
+   The old version read history once with .once("value") and only
+   re-read it on a tab switch or the 30-minute timer, so the "live"
+   graph was in fact a snapshot that sat still for half an hour.
+
+   Now: a fixed-size ring keyed by unix timestamp.
+     - seeded from /history/<date> on load
+     - appended from the /live listener as values arrive (3 s)
+     - appended from a child_added listener so the canonical
+       one-minute samples and any backlog upload also land
+     - deduplicated by timestamp, so nothing is ever counted twice
+     - sorted only when a sample actually arrives out of order,
+       which happens after an offline backlog is flushed
+     - bounded at RING_MAX, oldest dropped: memory cannot grow and
+       the window scrolls instead of accumulating forever
+   ============================================================ */
+const RING_MAX = 1200;
+
+const ring = {
+  rows: [],            // ascending by .t
+  seen: new Set(),     // timestamps present, for O(1) dedupe
+  date: null,          // which local date this ring holds
+};
+
+function ringReset(dateStr) {
+  ring.rows.length = 0;
+  ring.seen.clear();
+  ring.date = dateStr;
 }
 
-function ensureDailyCache() {
-  if (dailyCache) return Promise.resolve(dailyCache);
-  return db.ref("daily").limitToLast(400).once("value").then((snap) => {
-    const rows = [];
-    snap.forEach((c) => rows.push({ date: c.key, ...(c.val() || {}) }));
-    dailyCache = rows;
-    return rows;
-  });
+function ringPush(s) {
+  const ts = Number(s && s.t);
+  if (!isFinite(ts) || ts <= 0 || ring.seen.has(ts)) return false;
+  ring.seen.add(ts);
+  const n = ring.rows.length;
+  if (n && ts < ring.rows[n - 1].t) {
+    ring.rows.push(s);
+    ring.rows.sort((a, b) => a.t - b.t);      // rare: backlog arrived late
+  } else {
+    ring.rows.push(s);
+  }
+  while (ring.rows.length > RING_MAX) {
+    ring.seen.delete(ring.rows.shift().t);
+  }
+  return true;
 }
+
+/* one rAF-coalesced redraw, so a burst of samples repaints once */
+let drawQueued = false;
+function queueDayDraw() {
+  if (drawQueued || currentView !== "day") return;
+  drawQueued = true;
+  requestAnimationFrame(() => { drawQueued = false; drawDay(); });
+}
+
+function drawDay() {
+  const labels = ring.rows.map((s) =>
+    new Date(s.t * 1000).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }));
+  const gen = ring.rows.map((s) => (s.p > 0 ? s.p : 0));
+  const use = ring.rows.map((s) => (s.p < 0 ? -s.p : 0));
+
+  chart.config.type = "line";
+  chart.options.scales.y.title.text = "W";
+  chart.data.labels = labels;
+  chart.data.datasets = [
+    { label: "Generation (charging)", data: gen, borderWidth: 2, pointRadius: 0,
+      fill: "origin", tension: 0.35 },
+    { label: "Electricity use", data: use, borderWidth: 2, pointRadius: 0,
+      fill: "origin", tension: 0.35 },
+  ];
+  chart.options.plugins.legend.display = true;
+  chart.update("none");                       // no animation = no flicker
+
+  currentRows = {
+    kind: "day", date: ring.date,
+    columns: ["time", "voltage", "current", "power", "soc"],
+    rows: ring.rows.map((s) => ({
+      time: new Date(s.t * 1000).toISOString(),
+      voltage: s.v, current: s.i, power: s.p, soc: s.soc,
+    })),
+  };
+  const live = ring.date === localDate();
+  $("chart-caption").textContent = ring.rows.length
+    ? `Power in/out of the battery on ${ring.date} · ${ring.rows.length} samples${live ? " · live" : ""}`
+    : `No samples stored for ${ring.date} yet`;
+}
+
+/* child_added listener for the day currently on screen. Detached
+   whenever the day changes so listeners cannot pile up -- that was
+   the memory leak path.
+
+   loadGen guards the await: spinning the date picker fires several
+   loadDay() calls, and without it a slow earlier fetch would land
+   its rows into the newer day's ring and attach a second listener. */
+let dayRef = null;
+let loadGen = 0;
+
+function detachDayFeed() {
+  if (dayRef) { dayRef.off(); dayRef = null; }
+}
+
+async function loadDay(dateStr) {
+  const gen = ++loadGen;
+  detachDayFeed();
+  ringReset(dateStr);
+  drawDay();                                   // paint empty immediately
+
+  let snap;
+  try {
+    snap = await db.ref("history/" + dateStr).limitToLast(RING_MAX).once("value");
+  } catch (e) {
+    $("chart-caption").textContent = `Could not load ${dateStr}: ${e.message || e}`;
+    return;
+  }
+  if (gen !== loadGen) return;                 // superseded while awaiting
+
+  snap.forEach((c) => ringPush(c.val()));
+  drawDay();
+
+  // Only today keeps streaming; past days are static.
+  if (dateStr === localDate()) {
+    detachDayFeed();                           // belt and braces
+    dayRef = db.ref("history/" + dateStr).orderByKey().limitToLast(1);
+    dayRef.on("child_added", (c) => {
+      if (gen !== loadGen || ring.date !== dateStr) return;
+      if (ringPush(c.val())) queueDayDraw();
+    });
+  }
+}
+
+/* ============================================================
+   DAILY TOTALS - QUERIED PER YEAR
+
+   limitToLast(400) silently truncated anything older than ~13
+   months, so a second year of history could never be totalled
+   correctly. Key-range queries return exactly the year asked for,
+   however far back it is.
+   ============================================================ */
+const dailyByYear = new Map();
+
+function harvestKwh(r) { return (r.harvestWh ?? r.chgWh ?? 0) / 1000; }
+function usedKwh(r)    { return (r.disWh ?? 0) / 1000; }
+
+async function daysForYear(year) {
+  const key = String(year);
+  if (dailyByYear.has(key)) return dailyByYear.get(key);
+  const snap = await db.ref("daily").orderByKey()
+    .startAt(key + "-01-01").endAt(key + "-12-31").once("value");
+  const rows = [];
+  snap.forEach((c) => rows.push({ date: c.key, ...(c.val() || {}) }));
+  dailyByYear.set(key, rows);
+  return rows;
+}
+
+function invalidateDaily() { dailyByYear.clear(); }
 
 async function loadMonth(monthStr) {           // "YYYY-MM"
-  const rows = (await ensureDailyCache()).filter((r) => r.date.startsWith(monthStr));
+  detachDayFeed();
+  const rows = (await daysForYear(monthStr.slice(0, 4)))
+    .filter((r) => r.date.startsWith(monthStr));
   const labels = rows.map((r) => r.date.slice(8));
-  const harvested = rows.map((r) => (r.chgWh || 0) / 1000);
-  const used = rows.map((r) => (r.disWh || 0) / 1000);
+  const harvested = rows.map(harvestKwh);
+  const used = rows.map(usedKwh);
   setChartType("bar", labels, [
-    { label: "Harvested", data: harvested, backgroundColor: "rgba(242,162,12,0.8)", borderRadius: 4 },
-    { label: "Used", data: used, backgroundColor: "rgba(30,140,125,0.8)", borderRadius: 4 },
+    { label: "Harvested", data: harvested, borderRadius: 4 },
+    { label: "Used", data: used, borderRadius: 4 },
   ]);
   chart.options.plugins.legend.display = true;
   chart.update();
   currentRows = { kind: "month", date: monthStr,
-    columns: ["date","harvested_kWh","used_kWh"],
-    rows: rows.map((r) => ({ date: r.date, harvested_kWh: ((r.chgWh||0)/1000).toFixed(3), used_kWh: ((r.disWh||0)/1000).toFixed(3) })) };
-  const total = harvested.reduce((a,b)=>a+b,0);
+    columns: ["date", "harvested_kWh", "used_kWh"],
+    rows: rows.map((r) => ({ date: r.date,
+      harvested_kWh: harvestKwh(r).toFixed(3), used_kWh: usedKwh(r).toFixed(3) })) };
+  const total = harvested.reduce((a, b) => a + b, 0);
   $("chart-caption").textContent = `Daily harvest for ${monthStr} · ${total.toFixed(1)} kWh total`;
 }
 
 async function loadYear(yearStr) {              // "YYYY"
-  const rows = (await ensureDailyCache()).filter((r) => r.date.startsWith(yearStr));
-  const byMonth = {};
+  detachDayFeed();
+  const rows = await daysForYear(yearStr);
+  // Always twelve buckets: a month with no data must read 0, not
+  // vanish, or the bars silently shift along the axis.
+  const chg = Array(12).fill(0), dis = Array(12).fill(0);
   rows.forEach((r) => {
-    const m = r.date.slice(0, 7);
-    if (!byMonth[m]) byMonth[m] = { chg: 0, dis: 0 };
-    byMonth[m].chg += (r.chgWh || 0) / 1000;
-    byMonth[m].dis += (r.disWh || 0) / 1000;
+    const m = parseInt(r.date.slice(5, 7), 10) - 1;
+    if (m < 0 || m > 11) return;
+    chg[m] += harvestKwh(r);
+    dis[m] += usedKwh(r);
   });
-  const months = Object.keys(byMonth).sort();
-  const labels = months.map((m) => m.slice(5));
-  const harvested = months.map((m) => byMonth[m].chg);
-  const used = months.map((m) => byMonth[m].dis);
+  const labels = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
   setChartType("bar", labels, [
-    { label: "Harvested", data: harvested, backgroundColor: "rgba(242,162,12,0.8)", borderRadius: 4 },
-    { label: "Used", data: used, backgroundColor: "rgba(30,140,125,0.8)", borderRadius: 4 },
+    { label: "Harvested", data: chg, borderRadius: 4 },
+    { label: "Used", data: dis, borderRadius: 4 },
   ]);
   chart.options.plugins.legend.display = true;
   chart.update();
   currentRows = { kind: "year", date: yearStr,
-    columns: ["month","harvested_kWh","used_kWh"],
-    rows: months.map((m) => ({ month: m, harvested_kWh: byMonth[m].chg.toFixed(3), used_kWh: byMonth[m].dis.toFixed(3) })) };
-  const total = harvested.reduce((a,b)=>a+b,0);
+    columns: ["month", "harvested_kWh", "used_kWh"],
+    rows: labels.map((name, i) => ({
+      month: `${yearStr}-${String(i + 1).padStart(2, "0")}`,
+      harvested_kWh: chg[i].toFixed(3), used_kWh: dis[i].toFixed(3) })) };
+  const total = chg.reduce((a, b) => a + b, 0);
   $("chart-caption").textContent = `Monthly harvest for ${yearStr} · ${total.toFixed(1)} kWh total`;
 }
 
@@ -384,7 +520,7 @@ function themeColor(name) {
 async function loadMonthlyTab() {
   const year = String($("pick-myear").value || new Date().getFullYear());
 
-  const rows = (await ensureDailyCache()).filter((r) => r.date.startsWith(year));
+  const rows = await daysForYear(year);
   const kwh = Array(12).fill(0), used = Array(12).fill(0), days = Array(12).fill(0);
   rows.forEach((r) => {
     const m = parseInt(r.date.slice(5, 7), 10) - 1;
@@ -488,12 +624,38 @@ document.querySelectorAll(".nav-btn").forEach((btn) => {
 });
 
 /* ---------------- wire it up ---------------- */
-db.ref("live").on("value", (snap) => { live = snap.val(); render(); });
-setInterval(render, 3000);             // staleness watchdog, faster tick for a live feel
-refreshChart();
+db.ref("live").on("value", (snap) => {
+  live = snap.val();
+  render();
+
+  // Feed the live sample straight into the day ring. This is what
+  // makes the graph actually live at the ESP's 3 s cadence instead
+  // of waiting for the next one-minute history write.
+  if (live && currentView === "day" && ring.date === localDate()) {
+    if (ringPush({ t: live.ts, v: live.v, i: live.i, p: live.p, soc: live.soc })) {
+      queueDayDraw();
+    }
+  }
+});
+
+setInterval(render, 3000);             // staleness watchdog
+
+/* Midnight in the browser: roll the day view over to the new date
+   so an overnight tab does not sit on yesterday forever. */
 setInterval(() => {
-  dailyCache = null;
-  refreshChart();
+  if (currentView !== "day") return;
+  const today = localDate();
+  if (ring.date && ring.date !== today && $("pick-day").value === ring.date) {
+    $("pick-day").value = today;
+    loadDay(today);
+  }
+}, 60 * 1000);
+
+refreshChart();
+
+setInterval(() => {
+  invalidateDaily();
+  if (currentView !== "day") refreshChart();
   if (!$("tab-monthly").classList.contains("hidden")) loadMonthlyTab();
 }, 30 * 60 * 1000);
 
