@@ -17,6 +17,9 @@
 <!-- ===================== LIVE ===================== -->
 <main class="tab" id="tab-live">
 
+  <!-- battery protection: only shown when it has something to say -->
+  <div class="protect hidden" id="protect"></div>
+
   <div class="grid">
     <div class="tile amber">
       <p class="k">Solar power</p>
@@ -78,14 +81,20 @@
   </section>
 
   <section class="panel">
-    <h2>Storage</h2>
+    <h2>Health &amp; storage</h2>
     <p class="why">
-      <b id="queued">0</b> samples still on flash waiting for the cloud ·
-      BMS link <b id="bmsLink">--</b> · free heap <b id="heap">--</b> kB
+      BMS link <b id="bmsLink">--</b> · BLE <b id="bleState">--</b> ·
+      <b id="reconn">0</b> reconnects · up <b id="uptime">--</b>
     </p>
     <p class="why">
+      <b id="queued">0</b> samples still on flash waiting for the cloud ·
+      free heap <b id="heap">--</b> kB
+    </p>
+    <p class="why" id="protRule">Buzzer warns at 38%, load disconnects at 35%.</p>
+    <p class="why">
       Raw logs: <a href="/api/daily">daily.csv</a> ·
-      <a href="/api/history" id="todayCsv">today.csv</a>
+      <a href="/api/history" id="todayCsv">today.csv</a> ·
+      <a href="/api/health">health.json</a>
     </p>
   </section>
 </main>
