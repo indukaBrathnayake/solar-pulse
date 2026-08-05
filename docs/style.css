@@ -644,3 +644,20 @@ body { padding-bottom: 96px; }
 }
 .tonight.rainy { color: var(--gold-text); }
 .tonight.rainy::before { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+
+/* ============================================================
+   ESP backlog indicator (footer)
+   · default   : "N samples waiting on the ESP"
+   · .syncing  : backlog is draining into Firebase right now
+   · .done     : backlog landed, views have been re-fetched
+   ============================================================ */
+#buffered-note { transition: color 0.3s ease; }
+#buffered-note.syncing {
+  color: var(--amber);
+  animation: backlog-pulse 1.3s ease-in-out infinite;
+}
+#buffered-note.done { color: var(--gen); }
+@keyframes backlog-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+@media (prefers-reduced-motion: reduce) {
+  #buffered-note.syncing { animation: none; }
+}
