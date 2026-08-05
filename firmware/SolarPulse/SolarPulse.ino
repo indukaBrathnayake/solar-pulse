@@ -1,32 +1,95 @@
 /*
  * ============================================================
- *  SolarPulse v3 - ESP32 solar, battery and load controller
+ *  SolarPulse v4 - ESP32 solar, battery and load controller
  *  JK BMS (BLE, JK02_32S, hw v11) -> Firebase RTDB + local API
  *
- *  v2 -> v3 adds, without touching the BLE/BMS layer:
- *   - gap-free logging. Every sample is written to flash first
- *     and uploaded from a persistent queue with a committed
- *     read offset, so nothing is lost across WiFi cuts or
- *     reboots and the graph has no holes.
- *   - daily harvest in kWh, persisted and reset at local
- *     midnight from NTP time.
- *   - a 400-day daily-totals log on flash, aggregated into
- *     monthly totals for the new "Monthly" tab.
- *   - a source-selection state machine driving two relays
- *     (utility / inverter) with a dead time between them.
- *   - travel mode on a physical switch: lights on 18:00,
- *     off 23:30, every day.
- *   - ESPAsyncWebServer on the LAN with a JSON API and a
- *     small dashboard served from LittleFS.
+ *  ------------------------------------------------------------
+ *  v3 -> v4: THE THREE DEFECTS THIS RELEASE FIXES
+ *  ------------------------------------------------------------
  *
- *  KEPT FROM v2 (do not "fix"):
- *   - The JK BMS exposes TWO characteristics with UUID 0xFFE1:
- *       handle 0x03  properties 0x0C  -> WRITE  (commands)
- *       handle 0x05  properties 0x12  -> NOTIFY (data)
- *   - Connects with an explicit BLE_ADDR_PUBLIC address type.
- *   - Re-sends the cell-info command until frames actually arrive.
- *   - BLE starts before WiFi; setMTU() removed.
- *   - Staged serial markers so any failure is visible.
+ *  1. BMS DROPPED THE LINK EVERY NIGHT AROUND MIDNIGHT.
+ *
+ *     Root cause: parseCellInfo() runs inside the NimBLE notify
+ *     callback, i.e. on the BLE host task. v3 called
+ *     integrateEnergy() -> rolloverCheck() from there, and at
+ *     00:00 rolloverCheck() did a blocking TLS push to Firebase
+ *     (1-10 s), a full LittleFS rewrite of daily.csv, a history
+ *     directory prune and eleven NVS writes -- all on the BLE
+ *     host task. The host could not service the link for several
+ *     seconds, the supervision timer expired and the BMS dropped
+ *     the connection. TLS also needs several kB of stack that the
+ *     NimBLE callback does not have, which is the second way this
+ *     showed up.
+ *
+ *     Fix: the notify callback now ONLY parses bytes into a
+ *     struct. Energy integration moved to the control tick, all
+ *     network I/O to netTask, all flash I/O to the control task.
+ *     Nothing blocking is reachable from a BLE callback.
+ *
+ *  2. A SILENT BMS WAS NEVER RECOVERED.
+ *
+ *     Root cause: v3 only reconnected when NimBLE reported a
+ *     disconnect. If the ACL link stayed up but the BMS stopped
+ *     notifying, bleConnected was still true, bleConnectTask()
+ *     returned immediately, and the wake-frame resend was gated
+ *     on !bms.lastFrameMs so it only ever fired before the FIRST
+ *     frame of a session. The result was a live-but-dead link
+ *     that needed a power cycle -- exactly the reported symptom.
+ *
+ *     Fix: bleTask() supervises DATA, not just the socket. No
+ *     frame for BMS_FRAME_TIMEOUT_MS is treated as link failure
+ *     and forces a full teardown and reconnect, with exponential
+ *     backoff and a periodic keep-alive request.
+ *
+ *  3. MONTHLY / YEARLY TOTALS WERE WRONG.
+ *
+ *     Root cause A: pushDaily(closing) named the day being closed
+ *     as "now minus one hour". That is only correct if the
+ *     rollover is noticed within an hour of midnight. After a
+ *     reboot, a WiFi outage or a BLE outage the rollover fires
+ *     whenever the code next runs -- so yesterday's totals were
+ *     written under TODAY's date and then double counted.
+ *     Root cause B: a rollover during a WiFi outage lost the
+ *     /daily write completely; there was no retry.
+ *
+ *     Fix: the day being closed is named from dayStamp, never
+ *     from the clock. daily.csv is the source of truth and a
+ *     durable "last day synced" marker in NVS lets netTask push
+ *     any day that has not reached Firebase yet, however late.
+ *
+ *  ------------------------------------------------------------
+ *  ALSO IN v4
+ *  ------------------------------------------------------------
+ *   - 3 s dashboard latency: netTask keeps one TLS session open
+ *     and reuses it instead of handshaking on every push.
+ *   - Passive buzzer: warns at SOC_BUZZER_WARN, load relay opens
+ *     at SOC_LOAD_CUTOFF. Non-blocking, LEDC hardware tone.
+ *   - Relays are single pole / LIVE only; the neutral relays are
+ *     gone and the interlock is now safety critical.
+ *   - Task watchdog on all three tasks.
+ *
+ *  ------------------------------------------------------------
+ *  TASK LAYOUT   (all app tasks on core 1; core 0 runs the radios)
+ *  ------------------------------------------------------------
+ *   loopTask  prio 1   control: energy, relays, buzzer, travel,
+ *                      flash logging, day rollover. Never blocks.
+ *   bleTask   prio 3   BMS link only. May block on connect().
+ *   netTask   prio 1   WiFi, NTP, Firebase. May block on TLS.
+ *
+ *  Shared state is guarded by dataMux. The BLE callback is the
+ *  only writer of the raw frame; everything else reads a snapshot.
+ *
+ *  ------------------------------------------------------------
+ *  KEPT FROM v2/v3 (do not "fix" -- these are load bearing)
+ *   - UUID 0xFFE1 is the only characteristic used; it both
+ *     accepts the wake commands and delivers notifications.
+ *   - Connect with an explicit BLE_ADDR_PUBLIC address type.
+ *   - The two 20-byte wake frames are a fixed key captured from
+ *     the real app. Zero padding is silently ignored by the BMS.
+ *   - BLE starts before WiFi; no setMTU().
+ *   - WiFi modem sleep stays ENABLED. Disabling it starves BLE
+ *     of airtime and the BMS stops delivering frames.
+ *   - The web server starts only after the BMS link is up.
  *
  *  Board    : ESP32 Dev Module
  *  Partition: Huge APP (3MB No OTA/1MB SPIFFS)
@@ -50,51 +113,50 @@
 #include <ESPAsyncWebServer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <esp_task_wdt.h>
 #if __has_include("esp_coexist.h")
   #include "esp_coexist.h"      // WiFi/BLE radio arbitration, see setup()
 #endif
 #include <time.h>
 #include "config.h"
 
-// ---------- forward declarations ----------
-void integrateEnergy();
-void saveCounters();
-void pushDaily(bool closing);
-void rolloverCheck();
-void appendDailyRow(int32_t stamp);
+// ============================================================
+//  SECTION 1 - SHARED DATA MODEL
+// ============================================================
 
-// ============================================================
-//  BMS data model  (unchanged from v2)
-// ============================================================
-struct BmsData {
-  float cell[4]       = {0};
-  float packV         = 0;
-  float packI         = 0;       // + charging, - discharging
-  float packW         = 0;
-  float t1 = 0, t2 = 0, mosT = 0;
-  float balI          = 0;
-  uint8_t soc         = 0;
-  float remainAh      = 0;
-  float fullAh        = 0;
-  uint32_t cycles     = 0;
-  uint8_t soh         = 0;
-  uint32_t errBits    = 0;
-  bool chgMos = false, disMos = false, balancing = false;
-  uint32_t lastFrameMs = 0;
-};
-BmsData bms;
+// struct BmsData and struct Note live in config.h: the Arduino IDE
+// inserts auto-generated prototypes right after the last #include,
+// so any type named in a function signature must be visible by then.
+static BmsData          bmsShared;                 // guarded by dataMux
+static SemaphoreHandle_t dataMux = nullptr;
+static SemaphoreHandle_t fsLock  = nullptr;
 
-// ============================================================
-//  energy accounting
-// ============================================================
-float   todayChgWh = 0, todayDisWh = 0, todayPeakW = 0;
-float   todayPvWh  = 0;            // only used when PV_ADC_ENABLE
-double  lifeChgWh  = 0, lifeDisWh  = 0;
-int32_t dayStamp   = 0;
-bool    ntpSynced  = false;
+#define DATA_LOCK()   do { if (dataMux) xSemaphoreTake(dataMux, portMAX_DELAY); } while (0)
+#define DATA_UNLOCK() do { if (dataMux) xSemaphoreGive(dataMux); } while (0)
+#define FS_LOCK()     do { if (fsLock)  xSemaphoreTake(fsLock,  portMAX_DELAY); } while (0)
+#define FS_UNLOCK()   do { if (fsLock)  xSemaphoreGive(fsLock);  } while (0)
 
-float   pvW = 0;                   // instantaneous array power, W
-float   loadW = 0;                 // instantaneous house draw, W
+// Atomic snapshot for readers. Copying 90-odd bytes under the mutex
+// is far cheaper than every consumer racing individual fields.
+static BmsData bmsGet() {
+  BmsData copy;
+  DATA_LOCK();
+  copy = bmsShared;
+  DATA_UNLOCK();
+  return copy;
+}
+
+// ---- energy accounting (written only by the control task) ----
+static float   todayChgWh = 0, todayDisWh = 0, todayPeakW = 0;
+static float   todayPvWh  = 0;            // only used when PV_ADC_ENABLE
+static double  lifeChgWh  = 0, lifeDisWh  = 0;
+static int32_t dayStamp   = 0;            // YYYYMMDD of the day in progress
+static int32_t daySynced  = 0;            // last YYYYMMDD confirmed in Firebase
+static uint8_t todayMinSoc = 100;
+static bool    ntpSynced  = false;
+
+static float   pvW = 0;                   // instantaneous array power, W
+static float   loadW = 0;                 // instantaneous house draw, W
 
 // harvest = what actually went into storage, or true PV power when
 // a PV-side meter is fitted. See config.h section 6.
@@ -106,55 +168,40 @@ static inline float harvestWhToday() {
 #endif
 }
 
-// ============================================================
-//  relay / mode state
-//  (the enum itself lives in config.h -- see the note there on why)
-// ============================================================
-Source   srcActual   = SRC_NONE;   // what is closed right now
-Source   srcTarget   = SRC_NONE;   // what the changeover is heading to
-Source   manualSrc   = SRC_NONE;   // web override, SRC_NONE = automatic
-uint32_t manualSince = 0;
-uint32_t srcSince    = 0;
-uint32_t deadUntil   = 0;
-bool     inChangeover = false;
-bool     topUpEngaged = false;     // loads parked on utility to charge faster
-const char* srcReason = "boot";
+// ---- link + control state ----
+static volatile BleState bleState = BLE_OFF;
+static volatile uint32_t bleReconnects = 0;
 
-bool     rainyCheckDone   = false; // has the 18:15 target check run today
-bool     rainyFloorActive = false; // true = today fell short, allow SOC_RAINY_FLOOR
+static Source   srcActual   = SRC_NONE;   // what is closed right now
+static Source   srcTarget   = SRC_NONE;   // what the changeover is heading to
+static Source   manualSrc   = SRC_NONE;   // web override, SRC_NONE = automatic
+static uint32_t manualSince = 0;
+static uint32_t srcSince    = 0;
+static uint32_t deadUntil   = 0;
+static bool     inChangeover = false;
+static bool     topUpEngaged = false;
+static const char* srcReason = "boot";
 
-bool     travelMode  = false;      // physical switch closed
-bool     lightOn     = false;      // lighting relay state
-bool     manualLight = false;      // web toggle used when not travelling
-uint32_t utilitySecToday = 0;      // how long the house ran on CEB today
+static bool     rainyCheckDone   = false;
+static bool     rainyFloorActive = false;
 
-// ============================================================
-//  plumbing
-// ============================================================
-Preferences prefs;
-NimBLEClient* bleClient = nullptr;
-NimBLERemoteCharacteristic* chrFfe1 = nullptr;   // UUID 0xFFE1: the only characteristic the real app uses
-volatile uint8_t rawLogLeft = 10;                // print the first few raw notifications, then stop
-volatile bool bleConnected = false;
-uint8_t  frameBuf[400];
-uint16_t frameLen = 0;
-uint32_t tLive = 0, tLog = 0, tDaily = 0, tNvs = 0, tWifi = 0, tPoll = 0;
-uint32_t tUp = 0, tRoll = 0, tRelay = 0;
-uint32_t lastEnergyMs = 0;
-uint16_t bufferedLines = 0;        // samples still waiting in the queue
+static bool     travelMode  = false;
+static bool     lightOn     = false;      // switched load circuit state
+static bool     manualLight = false;
+static bool     loadCutoff  = false;      // true = protection has opened the load
+static BuzzTone buzzMode    = BUZZ_SILENT;
+static uint32_t utilitySecToday = 0;
 
-bool     fsOk = false;
-uint32_t queuePos = 0;             // byte offset of the first unsent record
-int32_t  clockAdj = 0;             // seconds to add to records logged before NTP
-SemaphoreHandle_t fsLock = nullptr;
-
-AsyncWebServer server(80);
-
-#define FS_LOCK()   do { if (fsLock) xSemaphoreTake(fsLock, portMAX_DELAY); } while (0)
-#define FS_UNLOCK() do { if (fsLock) xSemaphoreGive(fsLock); } while (0)
+// ---- plumbing ----
+static Preferences prefs;
+static bool     fsOk = false;
+static uint32_t queuePos = 0;
+static int32_t  clockAdj = 0;
+static uint16_t bufferedLines = 0;
+static AsyncWebServer server(80);
 
 // ============================================================
-//  helpers
+//  SECTION 2 - SMALL HELPERS
 // ============================================================
 static uint16_t u16(const uint8_t* d, int i) { return d[i] | (d[i + 1] << 8); }
 static uint32_t u32(const uint8_t* d, int i) {
@@ -170,10 +217,7 @@ static uint8_t sumCrc(const uint8_t* d, uint16_t n) {
 }
 
 time_t nowEpoch() { time_t t; time(&t); return t; }
-
-// The clock is restored from NVS at boot, so this is true within a
-// few minutes even before the first NTP reply of the session.
-bool timeReady() { return nowEpoch() > 1700000000L; }
+bool   timeReady() { return nowEpoch() > 1700000000L; }
 
 bool localNow(struct tm* out) {
   time_t t = nowEpoch();
@@ -195,11 +239,28 @@ void stampToString(int32_t s, char* out) {
   snprintf(out, 12, "%04d-%02d-%02d", (int)(s / 10000), (int)((s / 100) % 100), (int)(s % 100));
 }
 
-bool bmsFresh() { return bms.lastFrameMs && millis() - bms.lastFrameMs < 15000; }
-bool bmsLost()  { return !bms.lastFrameMs || millis() - bms.lastFrameMs > 300000UL; }
+// Link health is judged on DATA, never on the socket. See defect 2.
+static bool bmsFresh() {
+  uint32_t last = bmsShared.lastFrameMs;     // 32-bit read is atomic
+  return last && (millis() - last) < BMS_FRAME_TIMEOUT_MS;
+}
+static bool bmsLost() {
+  uint32_t last = bmsShared.lastFrameMs;
+  return !last || (millis() - last) > 300000UL;
+}
 
 const char* srcName(Source s) {
   return s == SRC_SOLAR ? "solar" : s == SRC_UTILITY ? "utility" : "none";
+}
+const char* bleStateName(BleState s) {
+  switch (s) {
+    case BLE_IDLE:       return "idle";
+    case BLE_CONNECTING: return "connecting";
+    case BLE_DISCOVER:   return "discovering";
+    case BLE_WAIT_DATA:  return "waiting";
+    case BLE_STREAMING:  return "streaming";
+    default:             return "off";
+  }
 }
 
 // tiny JSON scalar reader, enough for our own single-level records
@@ -223,32 +284,42 @@ static String withTs(const String& line, long ts) {
 }
 
 // ============================================================
-//  JK BMS frame parsing (JK02_32S)   -- unchanged from v2
+//  SECTION 3 - JK BMS PROTOCOL
+//
+//  parseCellInfo() runs on the NimBLE host task. It must stay a
+//  pure memcpy-and-scale routine: no flash, no network, no NVS,
+//  no logging beyond a counter. See defect 1 in the header.
 // ============================================================
-void parseCellInfo(const uint8_t* d) {
-  for (int i = 0; i < 4; i++) bms.cell[i] = u16(d, 6 + i * 2) * 0.001f;
-  bms.mosT      = s16(d, 144) * 0.1f;
-  bms.packV     = u32(d, 150) * 0.001f;
-  bms.packI     = s32(d, 158) * 0.001f;
-  bms.packW     = bms.packV * bms.packI;
-  bms.t1        = s16(d, 162) * 0.1f;
-  bms.t2        = s16(d, 164) * 0.1f;
-  bms.errBits   = u32(d, 166);
-  bms.balI      = s16(d, 170) * 0.001f;
-  bms.balancing = d[172] != 0x00;
-  bms.soc       = d[173];
-  bms.remainAh  = u32(d, 174) * 0.001f;
-  bms.fullAh    = u32(d, 178) * 0.001f;
-  bms.cycles    = u32(d, 182);
-  bms.soh       = d[190];
-  bms.chgMos    = d[198] != 0;
-  bms.disMos    = d[199] != 0;
-  bms.lastFrameMs = millis();
+static uint8_t  frameBuf[400];
+static uint16_t frameLen = 0;
+static volatile uint8_t rawLogLeft = 10;
+
+static void parseCellInfo(const uint8_t* d) {
+  DATA_LOCK();
+  for (int i = 0; i < 4; i++) bmsShared.cell[i] = u16(d, 6 + i * 2) * 0.001f;
+  bmsShared.mosT      = s16(d, 144) * 0.1f;
+  bmsShared.packV     = u32(d, 150) * 0.001f;
+  bmsShared.packI     = s32(d, 158) * 0.001f;
+  bmsShared.packW     = bmsShared.packV * bmsShared.packI;
+  bmsShared.t1        = s16(d, 162) * 0.1f;
+  bmsShared.t2        = s16(d, 164) * 0.1f;
+  bmsShared.errBits   = u32(d, 166);
+  bmsShared.balI      = s16(d, 170) * 0.001f;
+  bmsShared.balancing = d[172] != 0x00;
+  bmsShared.soc       = d[173];
+  bmsShared.remainAh  = u32(d, 174) * 0.001f;
+  bmsShared.fullAh    = u32(d, 178) * 0.001f;
+  bmsShared.cycles    = u32(d, 182);
+  bmsShared.soh       = d[190];
+  bmsShared.chgMos    = d[198] != 0;
+  bmsShared.disMos    = d[199] != 0;
+  bmsShared.lastFrameMs = millis();
+  bmsShared.frameCount++;
+  DATA_UNLOCK();
   rawLogLeft = 0;                       // stop raw dumping once parsing works
-  integrateEnergy();
 }
 
-void assembleFrame(const uint8_t* data, size_t len) {
+static void assembleFrame(const uint8_t* data, size_t len) {
   if (len >= 4 && data[0]==0x55 && data[1]==0xAA && data[2]==0xEB && data[3]==0x90)
     frameLen = 0;
   if (frameLen + len > sizeof(frameBuf)) { frameLen = 0; return; }
@@ -263,7 +334,7 @@ void assembleFrame(const uint8_t* data, size_t len) {
   }
 }
 
-void notifyCB(NimBLERemoteCharacteristic* c, uint8_t* data, size_t len, bool) {
+static void notifyCB(NimBLERemoteCharacteristic* c, uint8_t* data, size_t len, bool) {
   if (rawLogLeft) {
     rawLogLeft--;
     Serial.printf("[BLE] notify h=0x%02X len=%u first8=", c->getHandle(), (unsigned)len);
@@ -273,18 +344,15 @@ void notifyCB(NimBLERemoteCharacteristic* c, uint8_t* data, size_t len, bool) {
   assembleFrame(data, len);
 }
 
-// command frame: AA 55 90 EB | cmd | len | value(4B LE) | ... | crc[19]
 // ---------------------------------------------------------------
 // Reverse-engineered from a real JK app BLE capture (btsnoop) on
 // this exact BMS (hw V21H). These two 20-byte frames are sent
 // verbatim by the official app before it will stream cell data.
 // The trailing bytes are NOT random/session-based: they were
 // identical across two separate connection sessions captured
-// 14 minutes apart, so they are a fixed key this firmware checks
-// for. Zero-padding (what earlier firmware versions sent) is
-// silently ignored by the BMS -- that was the whole bug.
-// Both go to UUID 0xFFE1 only. 0xFFE2 and 0xFFE3 are never
-// touched by the real app and are not used here.
+// 14 minutes apart, so they are a fixed key this firmware relies
+// on. Zero-padding is silently ignored by the BMS.
+// Both go to UUID 0xFFE1 only.
 // ---------------------------------------------------------------
 static const uint8_t CMD_DEVICE_INFO[20] = {
   0xAA,0x55,0x90,0xEB,0x97,0x00,
@@ -297,76 +365,235 @@ static const uint8_t CMD_CELL_INFO[20] = {
   0xD4,0x62
 };
 
-void bmsSendCaptured(const uint8_t* frame) {
-  if (!chrFfe1) return;
-  chrFfe1->writeValue((uint8_t*)frame, 20, false);   // write without response, exactly as captured
-}
+// ============================================================
+//  SECTION 4 - BLE LINK TASK
+//
+//  Owns the whole BMS connection lifecycle. This is the only
+//  task allowed to call NimBLE connect/disconnect, so there is
+//  no way for two contexts to fight over the client handle.
+// ============================================================
+static NimBLEClient* bleClient = nullptr;
+static NimBLERemoteCharacteristic* chrFfe1 = nullptr;
+static volatile bool bleLinkUp = false;        // ACL state from callbacks
 
 class ClientCB : public NimBLEClientCallbacks {
-  void onConnect(NimBLEClient*) override { bleConnected = true; }
+  void onConnect(NimBLEClient*) override { bleLinkUp = true; }
   void onDisconnect(NimBLEClient*) override {
-    bleConnected = false;
-    chrFfe1 = nullptr;
+    bleLinkUp = false;
+    chrFfe1 = nullptr;                          // handle is dead, never reuse
     Serial.println("[BLE] disconnected");
   }
 };
+static ClientCB clientCb;                       // static: never leaks
 
-// find UUID 0xFFE1 specifically. This one characteristic both
-// accepts the wake commands and delivers all notifications.
-bool discoverChars() {
+static void bmsSend(const uint8_t* frame) {
+  NimBLERemoteCharacteristic* c = chrFfe1;
+  if (!c || !bleLinkUp) return;
+  c->writeValue((uint8_t*)frame, 20, false);    // write without response
+}
+
+// Walk the GATT table and subscribe. Returns false on any problem;
+// the caller then tears the link down rather than limping on.
+static bool bleDiscover() {
   chrFfe1 = nullptr;
   rawLogLeft = 10;
 
   NimBLERemoteService* svc = bleClient->getService(NimBLEUUID((uint16_t)0xFFE0));
   if (!svc) { Serial.println("[BLE] service 0xffe0 missing"); return false; }
 
-  chrFfe1 = svc->getCharacteristic(NimBLEUUID((uint16_t)0xFFE1));
-  if (!chrFfe1) { Serial.println("[BLE] characteristic 0xffe1 missing"); return false; }
+  NimBLERemoteCharacteristic* c = svc->getCharacteristic(NimBLEUUID((uint16_t)0xFFE1));
+  if (!c) { Serial.println("[BLE] characteristic 0xffe1 missing"); return false; }
 
   Serial.printf("[BLE] ffe1 handle=0x%02X notify=%d writeNR=%d\n",
-                chrFfe1->getHandle(), chrFfe1->canNotify(), chrFfe1->canWriteNoResponse());
+                c->getHandle(), c->canNotify(), c->canWriteNoResponse());
 
-  if (!chrFfe1->canNotify() || !chrFfe1->subscribe(true, notifyCB, true)) {
+  if (!c->canNotify() || !c->subscribe(true, notifyCB, true)) {
     Serial.println("[BLE] subscribe to 0xffe1 failed");
     return false;
   }
+  chrFfe1 = c;
   Serial.println("[BLE] subscribed to 0xffe1");
   return true;
 }
 
-void bleConnectTask() {
-  static uint32_t lastTry = 0;
-  if (bleConnected || millis() - lastTry < 10000) return;
-  lastTry = millis();
+// Full teardown. Called on every failure path so a half-open link
+// or a stale characteristic handle can never survive into the next
+// attempt -- that was one of the ways v3 got stuck.
+static void bleTeardown(const char* why) {
+  Serial.printf("[BLE] teardown: %s\n", why);
+  chrFfe1 = nullptr;
+  if (bleClient && bleClient->isConnected()) bleClient->disconnect();
+  // give the stack a moment to run the disconnect callback
+  for (int i = 0; i < 20 && bleLinkUp; i++) vTaskDelay(pdMS_TO_TICKS(25));
+  bleLinkUp = false;
+}
 
-  if (!bleClient) {
-    bleClient = NimBLEDevice::createClient();
-    bleClient->setClientCallbacks(new ClientCB(), false);
-    bleClient->setConnectTimeout(10);
+static void bleTask(void*) {
+  esp_task_wdt_add(NULL);
+
+  uint32_t backoff      = BLE_BACKOFF_MIN_MS;
+  uint32_t nextAttempt  = 0;
+  uint32_t stateSince   = millis();
+  uint32_t lastKeepAlive = 0;
+  // frameCount at the moment we subscribed. "Has this session
+  // produced data?" must be judged against THIS connection, not
+  // against lastFrameMs, which survives a reconnect and would make
+  // every retry look instantly healthy.
+  uint32_t framesAtSubscribe = 0;
+
+  bleClient = NimBLEDevice::createClient();
+  bleClient->setClientCallbacks(&clientCb, false);
+  bleClient->setConnectTimeout(BLE_CONNECT_TIMEOUT_S);
+  bleState = BLE_IDLE;
+
+  for (;;) {
+    esp_task_wdt_reset();
+    uint32_t now = millis();
+
+    switch (bleState) {
+
+      case BLE_IDLE:
+        if ((int32_t)(now - nextAttempt) >= 0) {
+          bleState = BLE_CONNECTING;
+          stateSince = now;
+        }
+        break;
+
+      case BLE_CONNECTING: {
+        Serial.printf("[BLE] connecting (backoff %lus)...\n", (unsigned long)(backoff / 1000));
+        bool ok = bleClient->connect(NimBLEAddress(BMS_MAC, BLE_ADDR_PUBLIC));
+        if (!ok) {
+          Serial.println("[BLE] connect failed (JK app still open?)");
+          bleTeardown("connect failed");
+          backoff = min(backoff * 2, (uint32_t)BLE_BACKOFF_MAX_MS);
+          nextAttempt = millis() + backoff;
+          bleState = BLE_IDLE;
+          break;
+        }
+        Serial.println("[BLE] connected");
+        bleState = BLE_DISCOVER;
+        stateSince = millis();
+        break;
+      }
+
+      case BLE_DISCOVER: {
+        vTaskDelay(pdMS_TO_TICKS(300));         // let the stack settle
+        if (!bleDiscover()) {
+          bleTeardown("discovery failed");
+          backoff = min(backoff * 2, (uint32_t)BLE_BACKOFF_MAX_MS);
+          nextAttempt = millis() + backoff;
+          bleState = BLE_IDLE;
+          break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(300));
+        bmsSend(CMD_DEVICE_INFO);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        bmsSend(CMD_CELL_INFO);
+        Serial.println("[BLE] wake sequence sent");
+        framesAtSubscribe = bmsShared.frameCount;
+        lastKeepAlive = millis();
+        stateSince    = millis();
+        bleState      = BLE_WAIT_DATA;
+        break;
+      }
+
+      case BLE_WAIT_DATA: {
+        if (!bleLinkUp) {
+          bleTeardown("link dropped while waiting for data");
+          backoff = min(backoff * 2, (uint32_t)BLE_BACKOFF_MAX_MS);
+          nextAttempt = millis() + backoff;
+          bleState = BLE_IDLE;
+          break;
+        }
+        if (bmsShared.frameCount != framesAtSubscribe) {   // data on THIS link
+          Serial.println("[BLE] streaming");
+          // Backoff is NOT forgiven here. One frame proves the link
+          // came up, not that it will stay up; BLE_STREAMING clears
+          // the backoff only after BLE_STABLE_AFTER_MS of real data.
+          stateSince = millis();
+          bleState   = BLE_STREAMING;
+          break;
+        }
+        // Still waiting for the first frame of this session. Re-poking
+        // here is legitimate -- the stream has not started yet -- but
+        // each write chirps the BMS buzzer, so keep it slow.
+        if (now - lastKeepAlive >= BMS_NUDGE_AFTER_MS) {
+          lastKeepAlive = now;
+          Serial.println("[BLE] no frames yet, resending wake sequence");
+          bmsSend(CMD_DEVICE_INFO);
+          vTaskDelay(pdMS_TO_TICKS(150));
+          bmsSend(CMD_CELL_INFO);
+        }
+        if (now - stateSince > BMS_HANDSHAKE_MS) {
+          bleTeardown("subscribed but BMS never sent data");
+          bleReconnects++;
+          backoff = min(backoff * 2, (uint32_t)BLE_BACKOFF_MAX_MS);
+          nextAttempt = millis() + backoff;
+          bleState = BLE_IDLE;
+        }
+        break;
+      }
+
+      case BLE_STREAMING: {
+        // THE FIX FOR DEFECT 2. A live socket is not a live link:
+        // supervise the data, and treat silence as failure.
+        //
+        // Backoff is only forgiven once the session has actually held
+        // up for BLE_STABLE_AFTER_MS. Resetting it on the first frame
+        // (v4.0) meant a link that connected, delivered one frame and
+        // dropped kept retrying at the 3 s floor forever -- a BLE
+        // connection, and therefore a BMS buzzer chirp, every 3 s.
+        if (backoff != BLE_BACKOFF_MIN_MS && now - stateSince >= BLE_STABLE_AFTER_MS) {
+          backoff = BLE_BACKOFF_MIN_MS;
+          Serial.println("[BLE] link stable, backoff reset");
+        }
+
+        if (!bleLinkUp) {
+          bleTeardown("stack reported disconnect");
+          bleReconnects++;
+          backoff = min(backoff * 2, (uint32_t)BLE_BACKOFF_MAX_MS);
+          nextAttempt = millis() + backoff;
+          bleState = BLE_IDLE;
+          break;
+        }
+        if (!bmsFresh()) {
+          bleTeardown("no frame for 20 s, link is dead");
+          bleReconnects++;
+          backoff = min(backoff * 2, (uint32_t)BLE_BACKOFF_MAX_MS);
+          nextAttempt = millis() + backoff;
+          bleState = BLE_IDLE;
+          break;
+        }
+
+        // NO unconditional keep-alive. The BMS chirps its buzzer on
+        // every command write it accepts, and it does not need the
+        // request repeated -- the notify subscription streams on its
+        // own. Only re-prime if the stream has actually gone quiet,
+        // and then at most once per BMS_NUDGE_AFTER_MS.
+        uint32_t quietFor = millis() - bmsShared.lastFrameMs;
+        if (quietFor >= BMS_NUDGE_AFTER_MS && now - lastKeepAlive >= BMS_NUDGE_AFTER_MS) {
+          lastKeepAlive = now;
+          Serial.printf("[BLE] stream quiet %lu ms, re-priming\n", (unsigned long)quietFor);
+          bmsSend(CMD_CELL_INFO);
+        }
+        break;
+      }
+
+      default:
+        bleState = BLE_IDLE;
+        break;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
-
-  Serial.println("[BLE] connecting...");
-  if (!bleClient->connect(NimBLEAddress(BMS_MAC, BLE_ADDR_PUBLIC))) {
-    Serial.println("[BLE] connect failed (JK app still open?)");
-    return;
-  }
-  Serial.println("[BLE] connected");
-
-  delay(300);
-  if (!discoverChars()) { bleClient->disconnect(); return; }
-
-  delay(300);
-  bmsSendCaptured(CMD_DEVICE_INFO);
-  delay(300);
-  bmsSendCaptured(CMD_CELL_INFO);
-  Serial.println("[BLE] wake sequence sent");
 }
 
 // ============================================================
-//  PV-side metering (optional, see config.h section 6)
+//  SECTION 5 - PV METERING + ENERGY INTEGRATION
 // ============================================================
-float readPvWatts() {
+static float readPvWatts(const BmsData& b) {
 #if PV_ADC_ENABLE
+  (void)b;
   float mv = analogReadMilliVolts(PV_VOLT_PIN) * PV_VOLT_DIVIDER;
   float v  = mv / 1000.0f;
   float i  = (analogReadMilliVolts(PV_CURR_PIN) - PV_CURR_ZERO_MV) / PV_CURR_MV_PER_A;
@@ -374,66 +601,51 @@ float readPvWatts() {
   return v * i;
 #else
   // no PV meter: everything that flows into the pack is harvest
-  return bms.packW > 0 ? bms.packW : 0;
+  return b.packW > 0 ? b.packW : 0;
 #endif
 }
 
-// The array is counted as producing when real power is going into
-// storage during daylight. Used by the relay state machine.
-bool solarProducing() {
+static bool solarProducing() {
   struct tm tmv;
   bool haveTime = localNow(&tmv);
   bool daylight = !haveTime || (tmv.tm_hour >= PV_HOUR_START && tmv.tm_hour < PV_HOUR_END);
   return bmsFresh() && daylight && pvW > SOLAR_OK_W;
 }
 
-// ============================================================
-//  energy integration + day rollover
-// ============================================================
-void integrateEnergy() {
+// Time-based integration on the control tick. v3 integrated inside
+// the BLE callback, so the sample rate followed the BMS frame rate
+// and a stalled link silently froze the counters.
+static void integrateEnergy(const BmsData& b) {
+  static uint32_t lastMs = 0;
   uint32_t nowMs = millis();
-  pvW   = readPvWatts();
-  loadW = bms.packW < 0 ? -bms.packW : 0;
 
-  if (lastEnergyMs == 0) { lastEnergyMs = nowMs; return; }
-  float dt = (nowMs - lastEnergyMs) / 1000.0f;
-  lastEnergyMs = nowMs;
-  if (dt <= 0 || dt > 10) return;
+  if (!bmsFresh()) {                 // no trustworthy data: pause cleanly
+    lastMs = 0;
+    pvW = 0;
+    loadW = 0;
+    return;
+  }
 
-  float wh = bms.packW * dt / 3600.0f;
-  if (bms.packI >  CURRENT_DEADBAND) { todayChgWh += wh;  lifeChgWh += wh; }
-  if (bms.packI < -CURRENT_DEADBAND) { todayDisWh += -wh; lifeDisWh += -wh; }
-  if (bms.packW > todayPeakW) todayPeakW = bms.packW;
+  pvW   = readPvWatts(b);
+  loadW = b.packW < 0 ? -b.packW : 0;
+
+  if (lastMs == 0) { lastMs = nowMs; return; }
+  float dt = (nowMs - lastMs) / 1000.0f;
+  lastMs = nowMs;
+  if (dt <= 0 || dt > 5.0f) return;  // clamp: a gap is not energy
+
+  float wh = b.packW * dt / 3600.0f;
+  if (b.packI >  CURRENT_DEADBAND) { todayChgWh += wh;  lifeChgWh += wh; }
+  if (b.packI < -CURRENT_DEADBAND) { todayDisWh += -wh; lifeDisWh += -wh; }
+  if (b.packW > todayPeakW) todayPeakW = b.packW;
+  if (b.soc && b.soc < todayMinSoc) todayMinSoc = b.soc;
   todayPvWh += pvW * dt / 3600.0f;
-
-  rolloverCheck();
-}
-
-// Runs from integrateEnergy AND from loop(), so midnight is not
-// missed when the BLE link happens to be down at 00:00.
-void rolloverCheck() {
-  if (!timeReady()) return;
-  int32_t ds = dateStamp(nowEpoch());
-  if (dayStamp == 0) { dayStamp = ds; return; }
-  if (ds == dayStamp) return;
-
-  Serial.printf("[day] rollover %ld -> %ld, harvest %.1f Wh\n",
-                (long)dayStamp, (long)ds, harvestWhToday());
-  pushDaily(true);                 // close yesterday in Firebase
-  appendDailyRow(dayStamp);        // and in local flash
-  todayChgWh = todayDisWh = todayPeakW = todayPvWh = 0;
-  utilitySecToday = 0;
-  topUpEngaged = false;
-  rainyCheckDone = false;          // re-run the 18:15 target check tonight
-  rainyFloorActive = false;        // back to the normal 60% floor by default
-  dayStamp = ds;
-  saveCounters();
 }
 
 // ============================================================
-//  persistence (NVS)
+//  SECTION 6 - PERSISTENCE
 // ============================================================
-void saveCounters() {
+static void saveCounters() {
   prefs.putFloat("tc", todayChgWh);
   prefs.putFloat("td", todayDisWh);
   prefs.putFloat("tp", todayPeakW);
@@ -441,13 +653,15 @@ void saveCounters() {
   prefs.putDouble("lc", lifeChgWh);
   prefs.putDouble("ld", lifeDisWh);
   prefs.putInt("day", dayStamp);
+  prefs.putInt("dsyn", daySynced);
+  prefs.putUChar("mso", todayMinSoc);
   prefs.putUInt("qp", queuePos);
   prefs.putInt("adj", clockAdj);
   prefs.putUInt("us", utilitySecToday);
   prefs.putLong64("ep", (int64_t)nowEpoch());
 }
 
-void loadCounters() {
+static void loadCounters() {
   todayChgWh = prefs.getFloat("tc", 0);
   todayDisWh = prefs.getFloat("td", 0);
   todayPeakW = prefs.getFloat("tp", 0);
@@ -455,6 +669,8 @@ void loadCounters() {
   lifeChgWh  = prefs.getDouble("lc", 0);
   lifeDisWh  = prefs.getDouble("ld", 0);
   dayStamp   = prefs.getInt("day", 0);
+  daySynced  = prefs.getInt("dsyn", 0);
+  todayMinSoc = prefs.getUChar("mso", 100);
   clockAdj   = prefs.getInt("adj", 0);
   utilitySecToday = prefs.getUInt("us", 0);
   int64_t ep = prefs.getLong64("ep", 0);
@@ -465,9 +681,10 @@ void loadCounters() {
 }
 
 // ============================================================
-//  JSON builders
+//  SECTION 7 - JSON BUILDERS
 // ============================================================
-int buildLiveJson(char* out, size_t cap) {
+static int buildLiveJson(char* out, size_t cap) {
+  BmsData b = bmsGet();
   time_t t = nowEpoch();
   return snprintf(out, cap,
     "{\"ts\":%ld,\"ntp\":%s,"
@@ -481,13 +698,15 @@ int buildLiveJson(char* out, size_t cap) {
     "\"src\":\"%s\",\"relayU\":%s,\"relayS\":%s,\"why\":\"%s\","
     "\"manual\":%s,\"travel\":%s,\"light\":%s,\"utilMin\":%lu,"
     "\"rainy\":%s,\"nightFloor\":%d,"
-    "\"bmsLink\":%s,\"rssi\":%d,\"buffered\":%u,\"heap\":%lu}",
+    "\"cutoff\":%s,\"buzz\":%u,"
+    "\"bmsLink\":%s,\"ble\":\"%s\",\"reconn\":%lu,"
+    "\"rssi\":%d,\"buffered\":%u,\"heap\":%lu,\"up\":%lu}",
     (long)t, ntpSynced ? "true" : "false",
-    bms.packV, bms.packI, bms.packW, bms.soc, bms.remainAh,
-    bms.cell[0], bms.cell[1], bms.cell[2], bms.cell[3],
-    bms.t1, bms.t2, bms.mosT, bms.balI, bms.balancing ? "true" : "false",
-    bms.chgMos ? "true" : "false", bms.disMos ? "true" : "false",
-    (unsigned long)bms.errBits, bms.soh, (unsigned long)bms.cycles,
+    b.packV, b.packI, b.packW, b.soc, b.remainAh,
+    b.cell[0], b.cell[1], b.cell[2], b.cell[3],
+    b.t1, b.t2, b.mosT, b.balI, b.balancing ? "true" : "false",
+    b.chgMos ? "true" : "false", b.disMos ? "true" : "false",
+    (unsigned long)b.errBits, b.soh, (unsigned long)b.cycles,
     todayChgWh, todayDisWh, todayPeakW, lifeChgWh, lifeDisWh,
     pvW, loadW, srcActual == SRC_UTILITY ? loadW : 0.0f, harvestWhToday(),
     srcName(srcActual),
@@ -497,93 +716,136 @@ int buildLiveJson(char* out, size_t cap) {
     manualSrc != SRC_NONE ? "true" : "false",
     travelMode ? "true" : "false", lightOn ? "true" : "false",
     (unsigned long)(utilitySecToday / 60),
-    // tonight's plan: which SoC floor the evening rule will hold to,
-    // and whether that is the relaxed rainy-day one. Decided at 18:15.
     rainyFloorActive ? "true" : "false",
     rainyFloorActive ? SOC_RAINY_FLOOR : SOC_EVENING_FLOOR,
+    loadCutoff ? "true" : "false", (unsigned)buzzMode,
     bmsFresh() ? "true" : "false",
-    WiFi.RSSI(), bufferedLines, (unsigned long)ESP.getFreeHeap());
+    bleStateName(bleState), (unsigned long)bleReconnects,
+    WiFi.RSSI(), bufferedLines,
+    (unsigned long)ESP.getFreeHeap(), (unsigned long)(millis() / 1000));
 }
 
-int buildSampleJson(char* out, size_t cap, time_t t) {
+static int buildSampleJson(char* out, size_t cap, time_t t, const BmsData& b) {
   return snprintf(out, cap,
     "{\"t\":%ld,\"v\":%.2f,\"i\":%.2f,\"p\":%.1f,\"soc\":%u,"
     "\"pv\":%.1f,\"src\":%u,\"approx\":%s}",
-    (long)t, bms.packV, bms.packI, bms.packW, bms.soc,
+    (long)t, b.packV, b.packI, b.packW, b.soc,
     pvW, (unsigned)srcActual, ntpSynced ? "false" : "true");
 }
 
 // ============================================================
-//  Firebase REST
+//  SECTION 8 - FIREBASE OVER A PERSISTENT TLS SESSION
+//
+//  A fresh handshake costs ~1.5 s and ~40 kB, which is why v3
+//  could not push faster than every 15 s. One session is opened
+//  and reused; it is dropped and rebuilt on error, when it goes
+//  stale, or when free heap falls below HEAP_TLS_FLOOR.
+//
+//  Only netTask may call these.
 // ============================================================
-bool fbRequest(const char* method, const String& path, const String& body) {
+static WiFiClientSecure* tls = nullptr;
+static uint32_t tlsLastUse = 0;
+
+static void tlsDrop(const char* why) {
+  if (!tls) return;
+  Serial.printf("[fb] TLS session dropped: %s\n", why);
+  tls->stop();
+  delete tls;
+  tls = nullptr;
+}
+
+static bool tlsEnsure() {
+  if (tls) {
+    bool stale = (millis() - tlsLastUse) > TLS_IDLE_MAX_MS;
+    if (stale || !tls->connected()) tlsDrop(stale ? "idle timeout" : "peer closed");
+  }
+  if (!tls && ESP.getFreeHeap() < HEAP_TLS_FLOOR) return false;
+  if (!tls) {
+    tls = new WiFiClientSecure();
+    if (!tls) return false;
+    tls->setInsecure();               // see README known limits
+    tls->setTimeout(8);
+  }
+  return true;
+}
+
+static bool fbRequest(const char* method, const String& path, const String& body) {
   if (WiFi.status() != WL_CONNECTED) return false;
-  // TLS needs a big contiguous block; skip rather than crash.
-  if (ESP.getFreeHeap() < 45000) { Serial.println("[fb] low heap, push skipped"); return false; }
-  WiFiClientSecure sec;
-  sec.setInsecure();
-  HTTPClient http;
-  String url = "https://" + String(FIREBASE_HOST) + path + ".json";
+  if (!tlsEnsure()) { Serial.println("[fb] low heap, push skipped"); return false; }
+
+  // The path MUST start with '/'. An empty path used to yield
+  //   https://<host>.json
+  // which is a different HOSTNAME, not the database root -- DNS fails,
+  // sendRequest returns <= 0, and the caller sees a permanent failure.
+  // That is what silently broke every backlog upload: the root
+  // multi-path PATCH is the one call that passes a root path.
+  String p = path;
+  if (p.length() == 0 || p[0] != '/') p = "/" + p;
+
+  String url = "https://" + String(FIREBASE_HOST) + p + ".json";
   if (strlen(FIREBASE_AUTH)) url += "?auth=" + String(FIREBASE_AUTH);
-  if (!http.begin(sec, url)) return false;
+
+  HTTPClient http;
+  http.setReuse(true);                // keep the socket for the next push
+  http.setConnectTimeout(6000);
+  http.setTimeout(8000);
+  if (!http.begin(*tls, url)) { tlsDrop("begin failed"); return false; }
   http.addHeader("Content-Type", "application/json");
   int code = http.sendRequest(method, body);
   http.end();
+
+  if (code <= 0) { tlsDrop("transport error"); return false; }
+  tlsLastUse = millis();
   return code >= 200 && code < 300;
 }
 
-void pushLive() {
-  static char buf[1400];
+static void pushLive() {
+  static char buf[1500];
   buildLiveJson(buf, sizeof(buf));
   fbRequest("PUT", "/live", buf);
 }
 
-void pushDaily(bool closing) {
-  time_t t = nowEpoch();
-  if (closing) t -= 3600;
-  char date[12]; dateString(t, date);
+// Write one day's totals under an EXPLICIT date. Never derives the
+// date from the current clock -- that was defect 3, root cause A.
+static bool pushDailyFor(int32_t stamp, float chg, float dis, float harvest,
+                         float peak, uint8_t minSoc, uint32_t utilMin, bool closed) {
+  if (!stamp) return false;
+  char date[12]; stampToString(stamp, date);
   char body[280];
   snprintf(body, sizeof(body),
     "{\"chgWh\":%.1f,\"disWh\":%.1f,\"harvestWh\":%.1f,\"peakW\":%.1f,"
     "\"minSoc\":%u,\"utilMin\":%lu,\"closed\":%s}",
-    todayChgWh, todayDisWh, harvestWhToday(), todayPeakW, bms.soc,
-    (unsigned long)(utilitySecToday / 60), closing ? "true" : "false");
+    chg, dis, harvest, peak, minSoc, (unsigned long)utilMin,
+    closed ? "true" : "false");
   char path[24]; snprintf(path, sizeof(path), "/daily/%s", date);
-  fbRequest("PATCH", path, body);
+  return fbRequest("PATCH", path, body);
+}
+
+// today's running totals, refreshed while the day is still open
+static void pushDailyToday() {
+  if (!dayStamp) return;
+  pushDailyFor(dayStamp, todayChgWh, todayDisWh, harvestWhToday(),
+               todayPeakW, todayMinSoc, utilitySecToday / 60, false);
 }
 
 // ============================================================
-//  FLASH LOG STORE
-//
-//  Two files are written every LOG_INTERVAL:
-//    QUEUE_FILE   append-only JSON lines waiting to go to the
-//                 cloud. QUEUE_POS_FILE holds the byte offset of
-//                 the first record that has NOT been accepted
-//                 yet, so an upload that dies half way, or a
-//                 reboot, resumes exactly where it stopped.
-//    /h/YYYYMMDD.csv  the same sample in CSV, kept for
-//                 LOCAL_HISTORY_DAYS and served by the local UI.
-//
-//  Logging never depends on WiFi. That is the whole fix for the
-//  gaps: the record exists on flash before anyone tries to send
-//  it, and it is only forgotten once the server has said 200.
+//  SECTION 9 - FLASH LOG STORE
 // ============================================================
-void savePos() {
+static void savePos() {
   File f = LittleFS.open(QUEUE_POS_FILE, "w");
   if (!f) return;
   f.print(queuePos);
   f.close();
 }
 
-void loadPos() {
+static void loadPos() {
   File f = LittleFS.open(QUEUE_POS_FILE, "r");
   if (!f) { queuePos = prefs.getUInt("qp", 0); return; }
   queuePos = (uint32_t)f.readString().toInt();
   f.close();
 }
 
-// number of records still waiting, for the UI badge
-void countQueue() {
+static void countQueue() {
   bufferedLines = 0;
   if (!fsOk) return;
   FS_LOCK();
@@ -597,15 +859,14 @@ void countQueue() {
   FS_UNLOCK();
 }
 
-void resetQueue() {
+static void resetQueue() {
   LittleFS.remove(QUEUE_FILE);
   queuePos = 0;
   savePos();
   bufferedLines = 0;
 }
 
-// Rewrite the queue so it starts at the first unsent record.
-void compactQueue() {
+static void compactQueue() {
   File in = LittleFS.open(QUEUE_FILE, "r");
   if (!in) return;
   if (queuePos >= in.size()) { in.close(); resetQueue(); return; }
@@ -624,24 +885,20 @@ void compactQueue() {
   Serial.println("[queue] compacted");
 }
 
-// Last resort when the cloud has been unreachable for weeks:
-// throw away the oldest quarter so new samples keep landing.
-void dropOldest() {
+static void dropOldest() {
   File f = LittleFS.open(QUEUE_FILE, "r");
   if (!f) return;
   size_t target = f.size() / 4;
   f.seek(target);
-  f.readStringUntil('\n');              // realign to a record boundary
+  f.readStringUntil('\n');
   uint32_t cut = f.position();
   f.close();
-  // never move the pointer backwards: anything before queuePos is
-  // already at the server, compaction alone reclaims that space
   if (cut > queuePos) queuePos = cut;
   Serial.println("[queue] full, oldest quarter dropped");
   compactQueue();
 }
 
-void appendHistoryCsv(time_t t) {
+static void appendHistoryCsv(time_t t, const BmsData& b) {
   char path[32];
   struct tm tmv; localtime_r(&t, &tmv);
   snprintf(path, sizeof(path), HISTORY_DIR "/%04d%02d%02d.csv",
@@ -651,14 +908,11 @@ void appendHistoryCsv(time_t t) {
   if (!f) return;
   if (isNew) f.println("t,v,i,p,soc,pv,src");
   f.printf("%ld,%.2f,%.2f,%.1f,%u,%.1f,%u\n",
-           (long)t, bms.packV, bms.packI, bms.packW, bms.soc, pvW, (unsigned)srcActual);
+           (long)t, b.packV, b.packI, b.packW, b.soc, pvW, (unsigned)srcActual);
   f.close();
 }
 
-// keep only the newest LOCAL_HISTORY_DAYS files in /h.
-// Names are collected first: deleting while walking a directory
-// handle is not safe.
-void pruneHistory() {
+static void pruneHistory() {
   if (!timeReady()) return;
   int32_t cutoff = dateStamp(nowEpoch() - (time_t)LOCAL_HISTORY_DAYS * 86400L);
 
@@ -688,26 +942,40 @@ void pruneHistory() {
   }
 }
 
-// One row per finished day, kept for DAILY_LOG_DAYS. This is what
-// the Monthly tab is built from, and it survives independently of
-// the cloud.
-void appendDailyRow(int32_t stamp) {
+// daily.csv is the SOURCE OF TRUTH for monthly and yearly totals.
+// It is written first, before anything tries to reach the network,
+// so a rollover during an outage still produces a correct record.
+static void appendDailyRow(int32_t stamp) {
   if (!fsOk || !stamp) return;
   char date[12]; stampToString(stamp, date);
-  FS_LOCK();
-  bool isNew = !LittleFS.exists(DAILY_FILE);
-  File f = LittleFS.open(DAILY_FILE, "a");
-  if (f) {
-    if (isNew) f.println("date,chgWh,disWh,harvestWh,peakW,endSoc,utilMin");
-    f.printf("%s,%.1f,%.1f,%.1f,%.1f,%u,%lu\n",
-             date, todayChgWh, todayDisWh, harvestWhToday(), todayPeakW,
-             bms.soc, (unsigned long)(utilitySecToday / 60));
-    f.close();
-  }
-  FS_UNLOCK();
 
-  // prune: rewrite keeping the header plus the newest DAILY_LOG_DAYS rows
   FS_LOCK();
+  // Idempotence: never write the same day twice, however many times
+  // a rollover is retried after a reboot.
+  bool already = false;
+  File chk = LittleFS.open(DAILY_FILE, "r");
+  if (chk) {
+    while (chk.available()) {
+      String row = chk.readStringUntil('\n');
+      if (row.startsWith(date)) { already = true; break; }
+    }
+    chk.close();
+  }
+
+  if (!already) {
+    bool isNew = !LittleFS.exists(DAILY_FILE);
+    File f = LittleFS.open(DAILY_FILE, "a");
+    if (f) {
+      if (isNew) f.println("date,chgWh,disWh,harvestWh,peakW,minSoc,utilMin");
+      f.printf("%s,%.1f,%.1f,%.1f,%.1f,%u,%lu\n",
+               date, todayChgWh, todayDisWh, harvestWhToday(), todayPeakW,
+               todayMinSoc, (unsigned long)(utilitySecToday / 60));
+      f.close();
+      Serial.printf("[day] %s written to daily.csv\n", date);
+    }
+  }
+
+  // prune: keep the header plus the newest DAILY_LOG_DAYS rows
   {
     int rows = 0;
     File in = LittleFS.open(DAILY_FILE, "r");
@@ -740,13 +1008,13 @@ void appendDailyRow(int32_t stamp) {
   FS_UNLOCK();
 }
 
-// The one place a sample is created. Called every LOG_INTERVAL
-// whatever the network is doing.
-void logSample() {
-  if (!fsOk || !bms.lastFrameMs) return;
+static void logSample() {
+  if (!fsOk) return;
+  BmsData b = bmsGet();
+  if (!b.lastFrameMs) return;
   time_t t = nowEpoch();
   char line[220];
-  buildSampleJson(line, sizeof(line), t);
+  buildSampleJson(line, sizeof(line), t, b);
 
   FS_LOCK();
   File f = LittleFS.open(QUEUE_FILE, "a");
@@ -754,24 +1022,110 @@ void logSample() {
     if (f.size() > QUEUE_MAX_BYTES) { f.close(); dropOldest(); f = LittleFS.open(QUEUE_FILE, "a"); }
     if (f) { f.println(line); f.close(); bufferedLines++; }
   }
-  appendHistoryCsv(t);
+  appendHistoryCsv(t, b);
   FS_UNLOCK();
 }
 
 // ============================================================
-//  BULK UPLOAD
+//  SECTION 10 - DAY ROLLOVER
 //
-//  Sends the queue oldest-first in batches of QUEUE_BATCH as one
-//  multi-path PATCH, which is Firebase's bulk endpoint. The read
-//  offset only moves after a 2xx, so a failure repeats the batch
-//  instead of skipping it.
-//
-//  Records written before the clock was ever synced carry
-//  "approx":true. Instead of dropping them (v2 did, which is
-//  exactly where the graph holes came from) they are shifted by
-//  the correction measured at the first NTP reply.
+//  Runs on the control task only. The day being closed is always
+//  named by dayStamp, never by the clock, so a rollover noticed
+//  late (reboot, outage, NTP step) still lands on the right date.
 // ============================================================
-void uploadTask() {
+static void rolloverCheck() {
+  if (!timeReady()) return;
+  int32_t ds = dateStamp(nowEpoch());
+  if (dayStamp == 0) { dayStamp = ds; return; }
+  if (ds == dayStamp) return;
+
+  Serial.printf("[day] rollover %ld -> %ld, harvest %.1f Wh\n",
+                (long)dayStamp, (long)ds, harvestWhToday());
+
+  // 1. durable record first. netTask picks it up from here whenever
+  //    the network allows, so an outage cannot lose the day.
+  appendDailyRow(dayStamp);
+
+  // 2. reset for the new day
+  todayChgWh = todayDisWh = todayPeakW = todayPvWh = 0;
+  todayMinSoc = 100;
+  utilitySecToday = 0;
+  topUpEngaged = false;
+  rainyCheckDone = false;
+  rainyFloorActive = false;
+  dayStamp = ds;
+  saveCounters();
+}
+
+// Push the oldest finished day that has not reached Firebase yet.
+// Returns false when there is nothing left to send.
+//
+// This is what makes monthly and yearly totals survive an outage:
+// daily.csv is written at rollover regardless of the network, and
+// daySynced (in NVS) only advances on a confirmed 2xx, so every day
+// eventually lands under its own correct date exactly once.
+static bool syncOneDay() {
+  if (!fsOk || !timeReady()) return false;
+
+  int32_t bestStamp = 0;
+  float chg = 0, dis = 0, har = 0, peak = 0;
+  int   minSoc = 100;
+  long  utilMin = 0;
+
+  FS_LOCK();
+  File f = LittleFS.open(DAILY_FILE, "r");
+  if (f) {
+    f.readStringUntil('\n');                       // header
+    while (f.available()) {
+      String row = f.readStringUntil('\n');
+      row.trim();
+      if (row.length() < 12) continue;
+      int32_t stamp = row.substring(0, 4).toInt() * 10000 +
+                      row.substring(5, 7).toInt() * 100 +
+                      row.substring(8, 10).toInt();
+      if (stamp <= daySynced) continue;            // already in the cloud
+      if (bestStamp && stamp >= bestStamp) continue;
+      int c[6], ci = 0;
+      for (int i = 0; i < (int)row.length() && ci < 6; i++)
+        if (row[i] == ',') c[ci++] = i;
+      if (ci < 6) continue;
+      bestStamp = stamp;                           // oldest unsynced wins
+      chg  = row.substring(c[0] + 1, c[1]).toFloat();
+      dis  = row.substring(c[1] + 1, c[2]).toFloat();
+      har  = row.substring(c[2] + 1, c[3]).toFloat();
+      peak = row.substring(c[3] + 1, c[4]).toFloat();
+      minSoc  = row.substring(c[4] + 1, c[5]).toInt();
+      utilMin = row.substring(c[5] + 1).toInt();
+    }
+    f.close();
+  }
+  FS_UNLOCK();
+
+  if (!bestStamp) return false;
+  if (!pushDailyFor(bestStamp, chg, dis, har, peak,
+                    (uint8_t)minSoc, (uint32_t)utilMin, true)) return false;
+
+  daySynced = bestStamp;
+  prefs.putInt("dsyn", daySynced);
+  Serial.printf("[day] %ld synced to Firebase\n", (long)bestStamp);
+  return true;
+}
+
+// A few per call, so a first boot against an existing daily.csv (or
+// a long outage) backfills in minutes rather than hours, without
+// ever monopolising netTask.
+#define DAILY_SYNC_PER_PASS 4
+static void syncPendingDaily() {
+  for (int i = 0; i < DAILY_SYNC_PER_PASS; i++) {
+    if (!syncOneDay()) return;
+    esp_task_wdt_reset();
+  }
+}
+
+// ============================================================
+//  SECTION 11 - BULK UPLOAD (history backlog)
+// ============================================================
+static void uploadTask() {
   if (!fsOk || WiFi.status() != WL_CONNECTED) return;
   if (!timeReady()) return;
 
@@ -784,7 +1138,12 @@ void uploadTask() {
   if (!f) { FS_UNLOCK(); return; }
   size_t size = f.size();
   if (queuePos > size) queuePos = size;
-  if (queuePos >= size) { f.close(); FS_UNLOCK(); if (size) { FS_LOCK(); resetQueue(); FS_UNLOCK(); } return; }
+  if (queuePos >= size) {
+    f.close();
+    if (size) resetQueue();
+    FS_UNLOCK();
+    return;
+  }
   f.seek(queuePos);
 
   while (f.available() && n < QUEUE_BATCH) {
@@ -797,7 +1156,7 @@ void uploadTask() {
       ts += clockAdj;
       line = withTs(line, ts);
     }
-    if (ts < 1700000000L) continue;          // unrecoverable, skip the record
+    if (ts < 1700000000L) continue;
     char date[12]; dateString((time_t)ts, date);
     if (n) body += ",";
     body += "\"history/" + String(date) + "/" + String(ts) + "\":" + line;
@@ -808,7 +1167,10 @@ void uploadTask() {
   body += "}";
 
   if (!consumed) return;
-  bool ok = n ? fbRequest("PATCH", "", body) : true;
+  // Root-level multi-path PATCH: https://<host>/.json with a body of
+  // {"history/<date>/<ts>": {...}, ...}. The path is "/", not "" --
+  // see the normalisation note in fbRequest().
+  bool ok = n ? fbRequest("PATCH", "/", body) : true;
   if (!ok) return;
 
   queuePos += consumed;
@@ -823,19 +1185,12 @@ void uploadTask() {
 }
 
 // ============================================================
-//  RELAY CONTROL
+//  SECTION 12 - RELAY CONTROL  (single pole, LIVE only)
 //
-//  Two relays, one GPIO each. A relay module input is an opto LED
-//  behind a resistor: about 3 mA at 3.3 V, far below the 40 mA a
-//  GPIO can source, and both poles of the relay (Live and Neutral)
-//  are thrown by the one coil. So one pin per relay is correct.
-//  The COIL is fed from a separate 5 V supply, never from the ESP.
-//
-//  Priority: solar/battery first, utility only when the pack
-//  cannot carry the house.
-//
-//  Both relays are opened for RELAY_DEAD_TIME_MS on every change,
-//  so the two sources can never be paralleled even for a cycle.
+//  With the neutral relays removed, break-before-make on live is
+//  the ONLY thing keeping utility and inverter apart. Every write
+//  to the source relays goes through setSourceRelays(), which
+//  cannot express "both on".
 // ============================================================
 static inline void relayDrive(int pin, bool on) {
   if (pin < 0) return;
@@ -846,32 +1201,26 @@ static inline void relayDrive(int pin, bool on) {
 #endif
 }
 
-void relaysAllOff() {
-  relayDrive(RELAY_UTILITY_PIN, false);
-  relayDrive(RELAY_SOLAR_PIN, false);
+// The interlock. One argument, so no caller can ever energise both
+// source relays; SRC_NONE opens both.
+static void setSourceRelays(Source s) {
+  relayDrive(RELAY_UTILITY_PIN, s == SRC_UTILITY);
+  relayDrive(RELAY_SOLAR_PIN,   s == SRC_SOLAR);
 }
 
-// Which source should be feeding the house right now.
-Source decideSource() {
+static Source decideSource() {
+  BmsData b = bmsGet();
+
   // 1. a choice made in the web UI wins until it expires
   if (manualSrc != SRC_NONE) {
     if (MANUAL_OVERRIDE_MS == 0 || millis() - manualSince < MANUAL_OVERRIDE_MS) {
       srcReason = "manual override";
       return manualSrc;
     }
-    manualSrc = SRC_NONE;                       // expired, back to automatic
+    manualSrc = SRC_NONE;
   }
 
-  // 2. once-daily rainy-day check, at RAINY_CHECK time (18:15).
-  //    Did the pack actually reach SOC_TARGET_1600 (99%) today? If
-  //    not, today under-produced -- most likely rain -- and holding
-  //    the normal SOC_EVENING_FLOOR (60%) would just mean falling
-  //    back to utility every such evening. Relax the floor to
-  //    SOC_RAINY_FLOOR (35%) for the rest of tonight instead, so the
-  //    battery is used properly and utility is the last resort, not
-  //    the default. This runs once per day regardless of manual
-  //    override or a momentary BMS hiccup -- it only commits when
-  //    this tick's SoC reading is actually fresh.
+  // 2. once-daily rainy-day check at 18:15 (see config.h section 8)
   if (!rainyCheckDone) {
     struct tm tmvChk;
     if (localNow(&tmvChk)) {
@@ -879,61 +1228,46 @@ Source decideSource() {
                             (tmvChk.tm_hour == RAINY_CHECK_HOUR && tmvChk.tm_min >= RAINY_CHECK_MIN);
       if (pastCheckpoint && bmsFresh()) {
         rainyCheckDone = true;
-        rainyFloorActive = bms.soc < SOC_TARGET_1600;
+        rainyFloorActive = b.soc < SOC_TARGET_1600;
         Serial.printf("[relay] %02d:%02d check: soc=%u%% -> %s\n",
-                      RAINY_CHECK_HOUR, RAINY_CHECK_MIN, bms.soc,
-                      rainyFloorActive ? "target missed, floor relaxed to 35% for tonight (rainy mode)"
-                                       : "target reached, normal 60% floor holds");
-
-        // Hand the house straight back to the battery on this tick.
-        // On a rainy day it is already on utility here (top-up parked
-        // it there at 14:00, then the 60% floor held it), and the
-        // recovery hysteresis below would demand SOC_RAINY_FLOOR +
-        // SOC_RECOVER_HYST = 40% before releasing it. That hysteresis
-        // exists to stop the relays chattering around the floor, not
-        // to block this once-a-day scheduled handover, so skip it here.
-        // Below the floor we fall through and utility keeps the house.
-        if (rainyFloorActive && bms.soc > SOC_RAINY_FLOOR) {
+                      RAINY_CHECK_HOUR, RAINY_CHECK_MIN, b.soc,
+                      rainyFloorActive ? "target missed, floor relaxed for tonight"
+                                       : "target reached, normal floor holds");
+        if (rainyFloorActive && b.soc > SOC_RAINY_FLOOR) {
           topUpEngaged = false;
-          srcReason = "18:15, target missed: off CEB, running the pack down to 35%";
+          srcReason = "18:15, target missed: off CEB, running the pack down";
           return SRC_SOLAR;
         }
       }
     }
   }
 
-  // 3. no BMS telemetry -> we do not know the SoC. Keep the house
-  //    alive on utility rather than flatten an unknown pack.
+  // 3. no BMS telemetry -> SoC unknown, keep the house alive on
+  //    utility rather than flatten a pack we cannot see
   if (bmsLost()) { srcReason = "BMS link lost, failsafe"; return SRC_UTILITY; }
-  if (!bmsFresh()) { srcReason = "waiting for BMS"; return srcActual == SRC_NONE ? SRC_UTILITY : srcActual; }
+  if (!bmsFresh()) {
+    srcReason = "waiting for BMS";
+    return srcActual == SRC_NONE ? SRC_UTILITY : srcActual;
+  }
 
-  int soc = bms.soc;
+  int soc = b.soc;
   bool solar = solarProducing();
 
   struct tm tmv;
   bool haveTime = localNow(&tmv);
-  int hour = haveTime ? tmv.tm_hour : 12;       // no clock: behave like daytime
+  int hour = haveTime ? tmv.tm_hour : 12;
   bool evening = haveTime && (hour >= EVENING_HOUR || hour < PV_HOUR_START);
 
   if (!evening) {
     // ---------------- before 16:00 ----------------
-    // Deep-discharge guard first.
     if (soc <= SOC_CRITICAL && !solar) { srcReason = "SoC critical, no sun"; return SRC_UTILITY; }
 
-    // Top-up window. The pack must be at SOC_TARGET_1600 by 16:00
-    // so the evening runs on stored energy. This hardware cannot
-    // charge from the mains directly, so the lever we have is to
-    // take the house OFF the inverter and park it on utility for a
-    // while: every watt the array makes then goes into the battery
-    // instead of into the fridge. Utility carries the house only
-    // for as long as the pack is short of target.
     if (haveTime && hour >= TOPUP_START_HOUR && soc < SOC_TARGET_1600) {
       if (solar || topUpEngaged) {
         topUpEngaged = true;
-        srcReason = "topping the pack up to 99% before 16:00";
+        srcReason = "topping the pack up before 16:00";
         return SRC_UTILITY;
       }
-      // no sun in the window: nothing to divert, so do not waste grid
     }
     if (soc >= SOC_TARGET_1600 || hour < TOPUP_START_HOUR) topUpEngaged = false;
 
@@ -945,36 +1279,29 @@ Source decideSource() {
   topUpEngaged = false;
   if (solar) { srcReason = "late sun still producing"; return SRC_SOLAR; }
 
-  // Normal nights protect the pack at 60%. A night that missed
-  // today's 99% target (rainyFloorActive, decided at 18:15 above)
-  // is allowed down to 35% instead, so a cloudy day does not turn
-  // into "utility every evening".
-  int floor = rainyFloorActive ? SOC_RAINY_FLOOR : SOC_EVENING_FLOOR;
+  int floorSoc = rainyFloorActive ? SOC_RAINY_FLOOR : SOC_EVENING_FLOOR;
   const char* floorReason = rainyFloorActive
-    ? "pack below the 35% rainy-day floor" : "pack below evening floor";
+    ? "pack below the rainy-day floor" : "pack below evening floor";
 
   if (srcActual == SRC_UTILITY) {
-    // hysteresis so a sagging pack does not chatter the relays
-    if (soc >= floor + SOC_RECOVER_HYST) {
+    if (soc >= floorSoc + SOC_RECOVER_HYST) {
       srcReason = "pack recovered, back on battery";
       return SRC_SOLAR;
     }
     srcReason = floorReason;
     return SRC_UTILITY;
   }
-  if (soc > floor) { srcReason = "evening, running on the pack"; return SRC_SOLAR; }
+  if (soc > floorSoc) { srcReason = "evening, running on the pack"; return SRC_SOLAR; }
   srcReason = floorReason;
   return SRC_UTILITY;
 }
 
-void relayTask() {
+static void relayTask() {
   uint32_t now = millis();
 
-  // finish a changeover that is in its dead time
   if (inChangeover) {
     if ((int32_t)(now - deadUntil) >= 0) {
-      if (srcTarget == SRC_SOLAR)   relayDrive(RELAY_SOLAR_PIN, true);
-      if (srcTarget == SRC_UTILITY) relayDrive(RELAY_UTILITY_PIN, true);
+      setSourceRelays(srcTarget);
       srcActual = srcTarget;
       srcSince = now;
       inChangeover = false;
@@ -986,23 +1313,22 @@ void relayTask() {
   Source want = decideSource();
   if (want == srcActual) return;
 
-  // urgent cases skip the dwell timer
-  bool urgent = (want == SRC_UTILITY && bmsFresh() && bms.soc <= SOC_CRITICAL) ||
+  BmsData b = bmsGet();
+  bool urgent = (want == SRC_UTILITY && bmsFresh() && b.soc <= SOC_CRITICAL) ||
                 srcActual == SRC_NONE;
   if (!urgent && now - srcSince < SOURCE_MIN_DWELL_MS) return;
 
   Serial.printf("[relay] %s -> %s : %s\n", srcName(srcActual), srcName(want), srcReason);
-  relaysAllOff();                      // break before make
+  setSourceRelays(SRC_NONE);            // break before make
   srcActual = SRC_NONE;
   srcTarget = want;
   deadUntil = now + RELAY_DEAD_TIME_MS;
   inChangeover = true;
 }
 
-// how long the house has been on the grid today
-void utilityAccounting() {
+static void utilityAccounting() {
   static uint32_t last = 0;
-  static uint32_t carryMs = 0;              // keep the sub-second remainder
+  static uint32_t carryMs = 0;
   uint32_t now = millis();
   if (last && srcActual == SRC_UTILITY) {
     carryMs += now - last;
@@ -1013,26 +1339,156 @@ void utilityAccounting() {
 }
 
 // ============================================================
-//  TRAVEL MODE
+//  SECTION 13 - BUZZER  (passive, LEDC, fully non-blocking)
 //
-//  Switch closed = nobody home. The lighting relay is then driven
-//  purely by the clock, 18:00 on and 23:30 off, so the house looks
-//  lived in. Switch open = the web UI toggle decides, which is the
-//  behaviour when someone is home.
+//  A melody is a list of {frequency, duration}. buzzerTick() walks
+//  it on millis() and writes one LEDC register per step, so the
+//  tone costs no CPU time and cannot delay relay or BLE work.
+//  Frequency 0 is a rest; duration 0 ends the melody.
 //
-//  This overrides the lighting circuit only. Source selection
-//  above keeps running exactly the same either way.
+//  Split in two on purpose:
+//    protectionUpdate()  policy, 250 ms control tick
+//    buzzerTick()        output, every loop pass (~20 ms)
 // ============================================================
-bool inTravelWindow(const struct tm& tmv) {
+// Warning: a gentle rising three-note chime. Meant to be noticed
+// without being alarming -- shutdown is still 3 SoC points away.
+static const Note MELODY_WARN[] = {
+  { 784, 140 }, {   0,  70 },      // G5
+  { 988, 140 }, {   0,  70 },      // B5
+  {1175, 220 }, {   0,   0 },      // D6
+};
+// Alarm: urgent triple beep, load has been disconnected.
+static const Note MELODY_ALARM[] = {
+  {1568, 120 }, {   0,  80 },
+  {1568, 120 }, {   0,  80 },
+  {1568, 120 }, {   0,   0 },
+};
+
+static const Note* melody     = nullptr;
+static uint8_t     melodyLen  = 0;
+static uint8_t     melodyIdx  = 0;
+static uint32_t    noteUntil  = 0;
+static uint32_t    lastMelody = 0;
+
+static void buzzerOutput(uint16_t freq) {
+  if (BUZZER_PIN < 0) return;
+  if (freq == 0) ledcWrite(BUZZER_LEDC_CH, 0);
+  else {
+    ledcWriteTone(BUZZER_LEDC_CH, freq);
+    ledcWrite(BUZZER_LEDC_CH, BUZZER_DUTY);
+  }
+}
+
+static void melodyStart(const Note* m, uint8_t len) {
+  melody    = m;
+  melodyLen = len;
+  melodyIdx = 0;
+  noteUntil = millis();
+  lastMelody = millis();
+}
+
+// ---- policy: runs on the 250 ms control tick ----
+//
+// Decides the two protection states from SoC. Hysteresis of
+// SOC_ALARM_HYST on both thresholds, so a pack sitting exactly on
+// 35% or 38% cannot chatter the load relay or stutter the buzzer.
+//
+//   SoC >  38          silent
+//   SoC <= 38          warning melody
+//   SoC <= 35          load relay opens, alarm melody
+//   recover at +2 points above each threshold
+static void protectionUpdate() {
+  BmsData b = bmsGet();
+
+  if (!bmsFresh()) {
+    // Never act on a stale reading. Once the link has been gone
+    // long enough to be called lost, silence the alarm too --
+    // the load relay stays as-is until real data returns.
+    if (bmsLost() && buzzMode != BUZZ_SILENT) {
+      buzzMode = BUZZ_SILENT;
+      melody = nullptr;
+      buzzerOutput(0);
+    }
+    return;
+  }
+
+  int soc = b.soc;
+
+  if (loadCutoff) {
+    if (soc >= SOC_LOAD_CUTOFF + SOC_ALARM_HYST) {
+      loadCutoff = false;
+      Serial.printf("[prot] SoC %d%%, load reconnected\n", soc);
+    }
+  } else if (soc <= SOC_LOAD_CUTOFF) {
+    loadCutoff = true;
+    Serial.printf("[prot] SoC %d%%, LOAD DISCONNECTED\n", soc);
+  }
+
+  BuzzTone want;
+  if (loadCutoff)                    want = BUZZ_ALARM;
+  else if (soc <= SOC_BUZZER_WARN)   want = BUZZ_WARN;
+  else if (buzzMode != BUZZ_SILENT &&
+           soc < SOC_BUZZER_WARN + SOC_ALARM_HYST) want = buzzMode;
+  else                               want = BUZZ_SILENT;
+
+  if (want != buzzMode) {
+    buzzMode = want;
+    lastMelody = 0;                  // sound the new state at once
+    if (want == BUZZ_SILENT) { melody = nullptr; buzzerOutput(0); }
+    Serial.printf("[buzz] %s (soc %d%%)\n",
+                  want == BUZZ_ALARM ? "ALARM" : want == BUZZ_WARN ? "warn" : "silent", soc);
+  }
+}
+
+// ---- output: runs on every loop pass (~20 ms) ----
+//
+// Only touches the melody cursor and one LEDC register. Kept off
+// the 250 ms tick because the shortest note is 70 ms and coarser
+// quantisation would wreck the rhythm.
+static void buzzerTick() {
+  uint32_t now = millis();
+
+  // start the next repetition when the gap has elapsed
+  if (buzzMode != BUZZ_SILENT && !melody) {
+    uint32_t period = (buzzMode == BUZZ_ALARM) ? BUZZER_ALARM_PERIOD_MS : BUZZER_WARN_PERIOD_MS;
+    if (now - lastMelody >= period) {
+      if (buzzMode == BUZZ_ALARM)
+        melodyStart(MELODY_ALARM, sizeof(MELODY_ALARM) / sizeof(Note));
+      else
+        melodyStart(MELODY_WARN, sizeof(MELODY_WARN) / sizeof(Note));
+    }
+  }
+
+  // advance one step at a time, never waiting
+  if (melody && (int32_t)(now - noteUntil) >= 0) {
+    if (melodyIdx >= melodyLen) {
+      melody = nullptr;
+      buzzerOutput(0);
+    } else {
+      const Note& n = melody[melodyIdx++];
+      buzzerOutput(n.freq);
+      noteUntil = now + n.ms;
+      if (n.ms == 0) { melody = nullptr; buzzerOutput(0); }
+    }
+  }
+}
+
+// ============================================================
+//  SECTION 14 - TRAVEL MODE + LOAD RELAY
+//
+//  The load relay serves two masters. Battery protection wins:
+//  below SOC_LOAD_CUTOFF the circuit is opened no matter what the
+//  schedule or the web toggle say.
+// ============================================================
+static bool inTravelWindow(const struct tm& tmv) {
   int nowMin = tmv.tm_hour * 60 + tmv.tm_min;
   int onMin  = TRAVEL_ON_HOUR  * 60 + TRAVEL_ON_MIN;
   int offMin = TRAVEL_OFF_HOUR * 60 + TRAVEL_OFF_MIN;
   if (onMin <= offMin) return nowMin >= onMin && nowMin < offMin;
-  return nowMin >= onMin || nowMin < offMin;      // window crossing midnight
+  return nowMin >= onMin || nowMin < offMin;
 }
 
-void travelTask() {
-  // --- debounced switch read ---
+static void travelTask() {
   static int lastRaw = -1;
   static uint32_t lastEdge = 0;
   int raw = digitalRead(TRAVEL_SWITCH_PIN);
@@ -1045,29 +1501,26 @@ void travelTask() {
 #endif
     if (closed != travelMode) {
       travelMode = closed;
-      Serial.printf("[travel] %s\n", travelMode ? "ON - schedule takes over the lights"
+      Serial.printf("[travel] %s\n", travelMode ? "ON - schedule owns the load"
                                                 : "OFF - back to normal control");
     }
   }
 
-  // --- lighting relay ---
   bool want = manualLight;
   struct tm tmv;
   if (travelMode && localNow(&tmv)) want = inTravelWindow(tmv);
+  if (loadCutoff) want = false;              // protection overrides everything
 
   if (want != lightOn) {
     lightOn = want;
     relayDrive(RELAY_LOAD_PIN, lightOn);
-    Serial.printf("[light] %s\n", lightOn ? "ON" : "OFF");
+    Serial.printf("[load] %s%s\n", lightOn ? "ON" : "OFF",
+                  loadCutoff ? " (battery protection)" : "");
   }
 }
 
 // ============================================================
-//  LOCAL WEB API
-//
-//  The GitHub Pages dashboard reads Firebase, so it works from
-//  anywhere. This server is the fallback that keeps working when
-//  the internet does not, and it is where /api/upload lives.
+//  SECTION 15 - LOCAL WEB API
 // ============================================================
 static bool authOk(AsyncWebServerRequest* req) {
   if (strlen(WEB_USER) == 0) return true;
@@ -1076,11 +1529,8 @@ static bool authOk(AsyncWebServerRequest* req) {
   return false;
 }
 
-// accumulates an /api/upload body across chunks
 static String uploadBuf;
 
-// One NDJSON record -> the right day CSV. Used by /api/upload so a
-// second node (or a replay script) can backfill this device.
 static void ingestLine(const String& line) {
   if (line.length() < 10) return;
   long ts = jsonLong(line, "t");
@@ -1102,7 +1552,6 @@ static void ingestLine(const String& line) {
   FS_UNLOCK();
 }
 
-// month totals for one year, straight off DAILY_FILE
 static String monthlyJson(int year) {
   float kwh[12] = {0}, used[12] = {0};
   int   days[12] = {0};
@@ -1110,7 +1559,7 @@ static String monthlyJson(int year) {
   FS_LOCK();
   File f = LittleFS.open(DAILY_FILE, "r");
   if (f) {
-    f.readStringUntil('\n');                       // header
+    f.readStringUntil('\n');
     while (f.available()) {
       String row = f.readStringUntil('\n');
       row.trim();
@@ -1118,7 +1567,6 @@ static String monthlyJson(int year) {
       int y = row.substring(0, 4).toInt();
       int m = row.substring(5, 7).toInt();
       if (y != year || m < 1 || m > 12) continue;
-      // date,chgWh,disWh,harvestWh,peakW,endSoc,utilMin
       int c1 = row.indexOf(',');
       int c2 = row.indexOf(',', c1 + 1);
       int c3 = row.indexOf(',', c2 + 1);
@@ -1156,18 +1604,20 @@ static String monthlyJson(int year) {
   return out;
 }
 
-void setupWebServer() {
-  // ---- live snapshot ----
+static void addCors(AsyncWebServerResponse* r) {
+  r->addHeader("Access-Control-Allow-Origin", "*");
+}
+
+static void setupWebServer() {
   server.on("/api/live", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (!authOk(req)) return;
-    char buf[1400];
+    char buf[1500];
     buildLiveJson(buf, sizeof(buf));
     AsyncWebServerResponse* r = req->beginResponse(200, "application/json", buf);
-    r->addHeader("Access-Control-Allow-Origin", "*");
+    addCors(r);
     req->send(r);
   });
 
-  // ---- per-minute history for one day ----
   server.on("/api/history", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (!authOk(req)) return;
     String date = req->hasParam("date") ? req->getParam("date")->value() : "";
@@ -1176,31 +1626,31 @@ void setupWebServer() {
                   date.substring(5, 7) + date.substring(8, 10) + ".csv";
     if (!LittleFS.exists(path)) { req->send(404, "text/plain", "no data for " + date); return; }
     AsyncWebServerResponse* r = req->beginResponse(LittleFS, path, "text/csv");
-    r->addHeader("Access-Control-Allow-Origin", "*");
+    addCors(r);
     req->send(r);
   });
 
-  // ---- the whole daily log ----
   server.on("/api/daily", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (!authOk(req)) return;
-    if (!LittleFS.exists(DAILY_FILE)) { req->send(200, "text/csv", "date,chgWh,disWh,harvestWh,peakW,endSoc,utilMin\n"); return; }
+    if (!LittleFS.exists(DAILY_FILE)) {
+      req->send(200, "text/csv", "date,chgWh,disWh,harvestWh,peakW,minSoc,utilMin\n");
+      return;
+    }
     AsyncWebServerResponse* r = req->beginResponse(LittleFS, DAILY_FILE, "text/csv");
-    r->addHeader("Access-Control-Allow-Origin", "*");
+    addCors(r);
     req->send(r);
   });
 
-  // ---- monthly totals, drives the Monthly tab ----
   server.on("/api/monthly", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (!authOk(req)) return;
     struct tm tmv;
     int year = localNow(&tmv) ? tmv.tm_year + 1900 : 2026;
     if (req->hasParam("year")) year = req->getParam("year")->value().toInt();
     AsyncWebServerResponse* r = req->beginResponse(200, "application/json", monthlyJson(year));
-    r->addHeader("Access-Control-Allow-Origin", "*");
+    addCors(r);
     req->send(r);
   });
 
-  // ---- bulk ingest: NDJSON body, one sample object per line ----
   server.on("/api/upload", HTTP_POST,
     [](AsyncWebServerRequest* req) {
       if (!authOk(req)) return;
@@ -1217,11 +1667,10 @@ void setupWebServer() {
     nullptr,
     [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index, size_t total) {
       if (index == 0) { uploadBuf = ""; uploadBuf.reserve(total < 16384 ? total + 8 : 16384); }
-      if (uploadBuf.length() > 16384) return;          // refuse to grow without bound
+      if (uploadBuf.length() > 16384) return;
       for (size_t i = 0; i < len; i++) uploadBuf += (char)data[i];
     });
 
-  // ---- manual source selection ----
   server.on("/api/relay", HTTP_ANY, [](AsyncWebServerRequest* req) {
     if (!authOk(req)) return;
     if (req->hasParam("src")) {
@@ -1233,35 +1682,53 @@ void setupWebServer() {
     }
     if (req->hasParam("light")) {
       manualLight = req->getParam("light")->value().toInt() != 0;
-      Serial.printf("[web] light request: %d\n", manualLight);
+      Serial.printf("[web] load request: %d\n", manualLight);
     }
     req->send(200, "application/json",
       String("{\"src\":\"") + srcName(srcActual) + "\",\"manual\":" +
       (manualSrc != SRC_NONE ? "true" : "false") +
-      ",\"light\":" + (lightOn ? "true" : "false") + "}");
+      ",\"light\":" + (lightOn ? "true" : "false") +
+      ",\"cutoff\":" + (loadCutoff ? "true" : "false") + "}");
   });
 
-  // ---- thresholds, so the UI can label things correctly ----
   server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (!authOk(req)) return;
-    char buf[480];
+    char buf[560];
     snprintf(buf, sizeof(buf),
       "{\"socCritical\":%d,\"socEveningFloor\":%d,\"socTarget1600\":%d,"
       "\"socRainyFloor\":%d,\"rainyCheck\":\"%02d:%02d\",\"rainyModeTonight\":%s,"
+      "\"socBuzzerWarn\":%d,\"socLoadCutoff\":%d,"
       "\"eveningHour\":%d,\"topupHour\":%d,\"capacityAh\":%.0f,"
-      "\"travelOn\":\"%02d:%02d\",\"travelOff\":\"%02d:%02d\",\"logSec\":%lu}",
+      "\"travelOn\":\"%02d:%02d\",\"travelOff\":\"%02d:%02d\","
+      "\"logSec\":%lu,\"liveSec\":%lu}",
       SOC_CRITICAL, SOC_EVENING_FLOOR, SOC_TARGET_1600,
       SOC_RAINY_FLOOR, RAINY_CHECK_HOUR, RAINY_CHECK_MIN,
       rainyFloorActive ? "true" : "false",
+      SOC_BUZZER_WARN, SOC_LOAD_CUTOFF,
       EVENING_HOUR, TOPUP_START_HOUR, PACK_CAPACITY_AH,
       TRAVEL_ON_HOUR, TRAVEL_ON_MIN, TRAVEL_OFF_HOUR, TRAVEL_OFF_MIN,
-      (unsigned long)(OFFLINE_LOG_MS / 1000));
+      (unsigned long)(OFFLINE_LOG_MS / 1000), (unsigned long)(LIVE_PUSH_MS / 1000));
     req->send(200, "application/json", buf);
   });
 
-  // ---- static dashboard from LittleFS /www ----
-  server.serveStatic("/", LittleFS, "/www/").setDefaultFile("index.html");
+  // health endpoint for external monitoring
+  server.on("/api/health", HTTP_GET, [](AsyncWebServerRequest* req) {
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+      "{\"ok\":%s,\"ble\":\"%s\",\"reconn\":%lu,\"wifi\":%s,"
+      "\"heap\":%lu,\"minHeap\":%lu,\"up\":%lu,\"queued\":%u}",
+      bmsFresh() ? "true" : "false", bleStateName(bleState),
+      (unsigned long)bleReconnects,
+      WiFi.status() == WL_CONNECTED ? "true" : "false",
+      (unsigned long)ESP.getFreeHeap(),
+      (unsigned long)ESP.getMinFreeHeap(),
+      (unsigned long)(millis() / 1000), bufferedLines);
+    AsyncWebServerResponse* r = req->beginResponse(200, "application/json", buf);
+    addCors(r);
+    req->send(r);
+  });
 
+  server.serveStatic("/", LittleFS, "/www/").setDefaultFile("index.html");
   server.onNotFound([](AsyncWebServerRequest* req) {
     req->send(404, "text/plain", "not found");
   });
@@ -1270,25 +1737,21 @@ void setupWebServer() {
   Serial.println("[web] server on port 80");
 }
 
-// Bring the web server up only after the BMS link is established, or
-// after WEB_START_GRACE_MS if the BMS never shows up (so the LAN page
-// and the API still work while you debug a BLE problem).
-//
-// Why: AsyncTCP starts its own task and ESPAsyncWebServer holds
-// buffers, and NimBLE needs contiguous heap plus radio time to make
-// the connection and read the GATT table. Starting the server first
-// was enough to stop the BMS connecting on this board.
+// Bring the web server up only after the BMS link is established,
+// or after the grace period if the BMS never shows up. AsyncTCP's
+// task and buffers take a sizeable bite out of the heap and NimBLE
+// needs contiguous heap plus radio time to walk the GATT table.
 #ifndef WEB_START_GRACE_MS
 #define WEB_START_GRACE_MS 90000UL
 #endif
 
-void webServerTask() {
+static void webServerTask() {
   static bool started = false;
   if (started) return;
-  if (!bms.lastFrameMs && millis() < WEB_START_GRACE_MS) return;
+  if (!bmsShared.lastFrameMs && millis() < WEB_START_GRACE_MS) return;
   started = true;
   Serial.printf("[web] starting (%s), heap %lu\n",
-                bms.lastFrameMs ? "BMS link up" : "grace period expired",
+                bmsShared.lastFrameMs ? "BMS link up" : "grace period expired",
                 (unsigned long)ESP.getFreeHeap());
   setupWebServer();
   if (WiFi.status() == WL_CONNECTED && MDNS.begin(MDNS_NAME)) {
@@ -1298,52 +1761,95 @@ void webServerTask() {
 }
 
 // ============================================================
-//  WiFi + time
+//  SECTION 16 - NETWORK TASK
+//
+//  Everything that can block on the network lives here, off the
+//  control path and far away from any BLE callback.
 // ============================================================
-void wifiTask() {
-  if (WiFi.status() == WL_CONNECTED) return;
-  if (millis() - tWifi < WIFI_RETRY_MS) return;
-  tWifi = millis();
-  Serial.println("[WiFi] retrying...");
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-}
-
-void onWifiUp() {
+static void onWifiUp() {
   Serial.printf("[WiFi] up, IP %s\n", WiFi.localIP().toString().c_str());
 
   time_t before = nowEpoch();
   configTime(TZ_OFFSET_SEC, 0, NTP_1, NTP_2);
-  for (int i = 0; i < 20 && nowEpoch() < 1700000000L; i++) delay(250);
+  for (int i = 0; i < 40 && nowEpoch() < 1700000000L; i++) vTaskDelay(pdMS_TO_TICKS(250));
 
   if (nowEpoch() > 1700000000L) {
     if (!ntpSynced && before > 1000000000L) {
-      // how far the free-running clock had drifted. Records logged
-      // before this moment carry "approx":true and get shifted by
-      // this amount at upload, instead of being thrown away.
       clockAdj = (int32_t)(nowEpoch() - before);
-      if (clockAdj > 86400 || clockAdj < -86400) clockAdj = 0;   // nonsense, ignore
+      if (clockAdj > 86400 || clockAdj < -86400) clockAdj = 0;
       Serial.printf("[time] clock corrected by %ld s\n", (long)clockAdj);
     }
     ntpSynced = true;
-    rolloverCheck();
   }
+}
 
-  // mDNS is advertised by webServerTask() once the server is actually
-  // listening, so nothing announces a port that is not open yet.
+static void netTask(void*) {
+  esp_task_wdt_add(NULL);
+
+  bool wifiWasUp = false;
+  uint32_t tWifi = 0, tLive = 0, tDaily = 0, tUp = 0, tDaySync = 0;
+
+  for (;;) {
+    esp_task_wdt_reset();
+    uint32_t now = millis();
+    bool wifiUp = WiFi.status() == WL_CONNECTED;
+
+    if (wifiUp && !wifiWasUp) onWifiUp();
+    if (!wifiUp && wifiWasUp) tlsDrop("wifi lost");
+    wifiWasUp = wifiUp;
+
+    if (!wifiUp) {
+      if (now - tWifi >= WIFI_RETRY_MS) {
+        tWifi = now;
+        Serial.println("[WiFi] retrying...");
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+      }
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+
+    // Hold every TLS handshake until the BMS link is up (or the
+    // grace period expires): a handshake takes the radio for a
+    // moment, and doing that while NimBLE is still walking the
+    // GATT table is what made the BMS connect intermittently.
+    bool cloudOk = bmsShared.lastFrameMs || now >= WEB_START_GRACE_MS;
+
+    // Each of these can block for up to the 8 s HTTP timeout, so the
+    // watchdog is fed between them rather than once per iteration.
+    if (cloudOk && now - tLive >= LIVE_PUSH_MS) {
+      tLive = now; pushLive(); esp_task_wdt_reset();
+    }
+    if (cloudOk && now - tDaily >= DAILY_PUSH_MS) {
+      tDaily = now; pushDailyToday(); esp_task_wdt_reset();
+    }
+    if (cloudOk && now - tDaySync >= 30000UL) {
+      tDaySync = now; syncPendingDaily(); esp_task_wdt_reset();
+    }
+    if (cloudOk && now - tUp >= UPLOAD_TRY_MS) {
+      tUp = now; uploadTask(); esp_task_wdt_reset();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
 }
 
 // ============================================================
-//  setup / loop
+//  SECTION 17 - SETUP / CONTROL LOOP
 // ============================================================
 void setup() {
-  // Relays first, before anything can take time. Both sources open
-  // and lights off is the safe state to power up in.
+  // Safe electrical state before anything else can take time:
+  // both source relays open, load open, buzzer silent.
   pinMode(RELAY_UTILITY_PIN, OUTPUT);
   pinMode(RELAY_SOLAR_PIN, OUTPUT);
-  relaysAllOff();
+  setSourceRelays(SRC_NONE);
   if (RELAY_LOAD_PIN >= 0) { pinMode(RELAY_LOAD_PIN, OUTPUT); relayDrive(RELAY_LOAD_PIN, false); }
+  if (BUZZER_PIN >= 0) {
+    ledcSetup(BUZZER_LEDC_CH, 2000, BUZZER_LEDC_RES);
+    ledcAttachPin(BUZZER_PIN, BUZZER_LEDC_CH);
+    ledcWrite(BUZZER_LEDC_CH, 0);
+  }
 #if TRAVEL_SWITCH_ACTIVE_LOW
   pinMode(TRAVEL_SWITCH_PIN, INPUT_PULLUP);
 #else
@@ -1351,21 +1857,19 @@ void setup() {
 #endif
 
   Serial.begin(115200);
-  delay(2000);
+  delay(2000);                       // one-off, lets USB serial enumerate
   Serial.println();
-  Serial.println("=== SolarPulse v3 ===");
-  Serial.println("A: serial alive");
-  Serial.flush();
+  Serial.println("=== SolarPulse v4 ===");
 
-  fsLock = xSemaphoreCreateMutex();
+  dataMux = xSemaphoreCreateMutex();
+  fsLock  = xSemaphoreCreateMutex();
 
   if (!prefs.begin("solar", false)) Serial.println("B: NVS failed, counters not saved");
   else                              Serial.println("B: NVS open");
-  Serial.flush();
 
   loadCounters();
-  Serial.printf("C: counters loaded, today %.1f Wh in / %.1f Wh out\n", todayChgWh, todayDisWh);
-  Serial.flush();
+  Serial.printf("C: counters loaded, today %.1f Wh in / %.1f Wh out, daySynced %ld\n",
+                todayChgWh, todayDisWh, (long)daySynced);
 
   if (!LittleFS.begin(true)) {
     Serial.println("D: LittleFS failed, offline queue disabled");
@@ -1377,9 +1881,7 @@ void setup() {
     Serial.printf("D: LittleFS ok, %u samples queued from offset %lu\n",
                   bufferedLines, (unsigned long)queuePos);
   }
-  Serial.flush();
 
-  // read the travel switch once so the first schedule tick is right
   {
     int raw = digitalRead(TRAVEL_SWITCH_PIN);
 #if TRAVEL_SWITCH_ACTIVE_LOW
@@ -1387,108 +1889,77 @@ void setup() {
 #else
     travelMode = (raw == HIGH);
 #endif
-    Serial.printf("E: travel switch on GPIO %d reads %s\n",
+    Serial.printf("E: travel switch GPIO %d reads %s\n",
                   TRAVEL_SWITCH_PIN, travelMode ? "CLOSED (travel mode)" : "open (normal)");
   }
 
   NimBLEDevice::init("");                       // BLE before WiFi
-  Serial.println("F: NimBLE init ok");
-  Serial.flush();
-
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-  Serial.println("G: BLE power set");
-  Serial.flush();
+  Serial.println("F: NimBLE init ok");
 
-  // WiFi and BLE share ONE 2.4 GHz radio, time-sliced by the
-  // coexistence arbiter. Tell it Bluetooth wins: the BMS link is a
-  // connection that drops if it misses its slots, while a Firebase
-  // push can simply be retried a second later.
+  // WiFi and BLE share one 2.4 GHz radio, time-sliced by the
+  // coexistence arbiter. Bluetooth wins: the BMS link drops if it
+  // misses its slots, a Firebase push can simply be retried.
 #if __has_include("esp_coexist.h")
   esp_coex_preference_set(ESP_COEX_PREFER_BT);
-  Serial.println("G2: coexistence set to prefer BT");
+  Serial.println("G: coexistence set to prefer BT");
 #endif
 
   WiFi.mode(WIFI_STA);
-  // NOTE: do NOT call WiFi.setSleep(false) here. Disabling modem
-  // sleep makes the WiFi stack hold the radio continuously and
-  // starves BLE of airtime -- with it on, the BMS either never
-  // connects or connects and then stops delivering frames. v2 left
-  // the default (WIFI_PS_MIN_MODEM) and that is what works.
+  // Do NOT disable modem sleep. Holding the radio continuously
+  // starves BLE and the BMS stops delivering frames.
   WiFi.setSleep(true);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.println("H: WiFi started");
-  Serial.flush();
 
-  // The web server is started later, from loop(), once the BMS link
-  // is up -- see webServerTask(). AsyncTCP's task and buffers take a
-  // sizeable bite out of the heap, and NimBLE needs room to build the
-  // connection and walk the GATT table. Coming up in that order keeps
-  // the first BLE connect in the same quiet conditions as v2.
+  // Watchdog last, so a slow boot cannot trip it.
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+  esp_task_wdt_add(NULL);                       // this is loopTask
+
+  xTaskCreatePinnedToCore(bleTask, "ble", 4096, nullptr, 3, nullptr, 1);
+  xTaskCreatePinnedToCore(netTask, "net", 8192, nullptr, 1, nullptr, 1);
+
   Serial.printf("I: setup complete, heap %lu\n", (unsigned long)ESP.getFreeHeap());
 }
 
+// The control loop. Deterministic, non-blocking, and independent
+// of both the network and the BMS link: relays and the buzzer keep
+// doing the right thing even with everything else down.
 void loop() {
-  static bool wifiWasUp = false;
-  static uint32_t tStat = 0;
-
-  bool wifiUp = WiFi.status() == WL_CONNECTED;
-  if (wifiUp && !wifiWasUp) onWifiUp();
-  wifiWasUp = wifiUp;
-  if (!wifiUp) wifiTask();
-
-  bleConnectTask();
-  webServerTask();          // deferred until the BMS link is up
-
+  static uint32_t tCtl = 0, tLog = 0, tRoll = 0, tNvs = 0, tStat = 0;
   uint32_t now = millis();
 
-  // until frames arrive, resend the exact captured wake frame
-  if (bleConnected && !bms.lastFrameMs && now - tPoll >= 6000) {
-    tPoll = now;
-    Serial.println("[BLE] no frames yet, resending captured wake sequence");
-    bmsSendCaptured(CMD_DEVICE_INFO);
-    delay(200);
-    bmsSendCaptured(CMD_CELL_INFO);
-  }
+  esp_task_wdt_reset();
+  webServerTask();
 
-  // --- control loop, runs whatever the network is doing ---
-  if (now - tRelay >= 1000) {
-    tRelay = now;
-    // pvW / loadW come from BMS frames. If the link drops, report zero
-    // rather than freezing the last reading on the dashboard.
-    if (!bmsFresh()) { pvW = 0; loadW = 0; }
-    travelTask();
+  // Melody stepping runs on EVERY pass: its shortest note is 70 ms,
+  // and quantising to the 250 ms control tick would wreck the rhythm.
+  buzzerTick();
+
+  if (now - tCtl >= CONTROL_TICK_MS) {
+    tCtl = now;
+    BmsData b = bmsGet();
+    integrateEnergy(b);
+    protectionUpdate();     // sets loadCutoff / buzzMode from SoC
+    travelTask();           // applies loadCutoff to the load relay
     relayTask();
     utilityAccounting();
   }
 
-  // --- logging: flash first, always ---
-  if (now - tLog >= OFFLINE_LOG_MS) { tLog = now; logSample(); }
-
-  // --- day boundary, even if BLE is silent ---
-  if (now - tRoll >= 10000) { tRoll = now; rolloverCheck(); }
-
-  // --- cloud ---
-  // Hold off every TLS handshake until the BMS link is up (or the
-  // grace period expires). A handshake allocates tens of kB and takes
-  // the radio for a moment; doing that while NimBLE is still trying to
-  // connect and read the GATT table is what makes the BMS connect
-  // intermittently. Nothing is lost by waiting: samples are already on
-  // flash and go up from the queue afterwards.
-  bool cloudOk = wifiUp && (bms.lastFrameMs || millis() >= WEB_START_GRACE_MS);
-  if (cloudOk && now - tLive  >= LIVE_PUSH_MS)  { tLive  = now; pushLive(); }
-  if (cloudOk && now - tDaily >= DAILY_PUSH_MS) { tDaily = now; pushDaily(false); }
-  if (cloudOk && now - tUp    >= UPLOAD_TRY_MS) { tUp    = now; uploadTask(); }
-
-  if (now - tNvs >= NVS_SAVE_MS) { tNvs = now; saveCounters(); }
+  if (now - tLog  >= OFFLINE_LOG_MS) { tLog  = now; logSample(); }
+  if (now - tRoll >= 10000)          { tRoll = now; rolloverCheck(); }
+  if (now - tNvs  >= NVS_SAVE_MS)    { tNvs  = now; saveCounters(); }
 
   if (now - tStat >= 10000) {
     tStat = now;
-    Serial.printf("[stat] ble=%s wifi=%s soc=%u%% %.2fV %.2fA src=%s%s q=%u heap=%lu\n",
-                  bleConnected ? "up" : "down", wifiUp ? "up" : "down",
-                  bms.soc, bms.packV, bms.packI, srcName(srcActual),
-                  travelMode ? " travel" : "", bufferedLines,
-                  (unsigned long)ESP.getFreeHeap());
+    BmsData b = bmsGet();
+    Serial.printf("[stat] ble=%s(%lu) wifi=%s soc=%u%% %.2fV %.2fA src=%s%s%s q=%u heap=%lu\n",
+                  bleStateName(bleState), (unsigned long)bleReconnects,
+                  WiFi.status() == WL_CONNECTED ? "up" : "down",
+                  b.soc, b.packV, b.packI, srcName(srcActual),
+                  travelMode ? " travel" : "", loadCutoff ? " CUTOFF" : "",
+                  bufferedLines, (unsigned long)ESP.getFreeHeap());
   }
 
-  delay(50);                // same cadence as the known-good v2 loop
+  vTaskDelay(pdMS_TO_TICKS(20));
 }
