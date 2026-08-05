@@ -208,9 +208,87 @@ function render() {
   $("mos-t").textContent = live.mosT ?? "--";
   $("bal-state").textContent = live.bal ? `ON ${(live.balI ?? 0).toFixed(2)} A` : "idle";
 
-  const buffered = live.buffered ?? 0;
-  $("buffered-note").classList.toggle("hidden", buffered === 0);
-  $("buffered-n").textContent = buffered;
+  trackBacklog(live.buffered ?? 0);
+}
+
+/* ============================================================
+   BACKLOG / BACKFILL TRACKING
+
+   While WiFi is down the ESP keeps logging to its own flash. When
+   it reconnects it replays that backlog into history/<date>/<ts>
+   using the ORIGINAL timestamps, so the writes land in the middle
+   of the day, not at the end.
+
+   That is invisible to the day feed: it is orderByKey().limitToLast(1)
+   + child_added, a window that only ever contains the newest key.
+   Backfilled keys are older, fall outside the window, and never
+   fire. The gap therefore stayed on screen until a manual reload.
+
+   So watch the ESP's own queue depth instead. When it drains to
+   zero after having been non-zero, the backlog is now in the cloud
+   and every affected view is re-fetched from scratch.
+   ============================================================ */
+let backlogPrev = null;      // last seen depth, null = nothing seen yet
+let backlogPeak = 0;         // high-water mark for this outage
+let backfillTimer = null;
+
+function trackBacklog(n) {
+  const note = $("buffered-note");
+  const wasDraining = backlogPrev !== null && backlogPrev > 0;
+
+  if (n > backlogPeak) backlogPeak = n;
+
+  // While the "backfilled N samples" message is showing, #buffered-n
+  // does not exist. Leave the note alone until it is restored.
+  const slot = $("buffered-n");
+  if (slot) {
+    note.classList.toggle("hidden", n === 0 && !backfillTimer);
+    slot.textContent = n;
+    note.classList.toggle("syncing", n > 0 && backlogPrev !== null && n < backlogPrev);
+  }
+
+  // Drained: the ESP has handed its whole backlog to Firebase.
+  if (wasDraining && n === 0) scheduleBackfillRefresh(backlogPeak);
+
+  backlogPrev = n;
+  if (n === 0) backlogPeak = 0;
+}
+
+/* Debounced so a backlog that drains over several batches triggers
+   one refresh at the end, not one per batch. */
+function scheduleBackfillRefresh(count) {
+  if (backfillTimer) clearTimeout(backfillTimer);
+  const note = $("buffered-note");
+  note.classList.remove("hidden");
+  note.classList.add("syncing");
+  $("buffered-n").textContent = 0;
+
+  backfillTimer = setTimeout(async () => {
+    backfillTimer = null;
+    await applyBackfill(count);
+  }, 2500);
+}
+
+async function applyBackfill(count) {
+  // Day chart: full re-fetch. The incremental feed structurally
+  // cannot see backdated keys, so re-read the whole day.
+  if (currentView === "day") {
+    await loadDay($("pick-day").value || localDate());
+  }
+  // Daily totals feed the month and year views and the Monthly tab.
+  invalidateDaily();
+  if (currentView !== "day") refreshChart();
+  if (!$("tab-monthly").classList.contains("hidden")) loadMonthlyTab();
+
+  const note = $("buffered-note");
+  note.classList.remove("syncing");
+  note.classList.add("done");
+  note.innerHTML = `· backfilled ${count} sample${count === 1 ? "" : "s"} from the ESP`;
+  setTimeout(() => {
+    note.classList.add("hidden");
+    note.classList.remove("done");
+    note.innerHTML = '· <span id="buffered-n">0</span> samples waiting on the ESP';
+  }, 8000);
 }
 
 /* ---------------- chart ---------------- */
@@ -240,6 +318,13 @@ function setChartType(type, labels, datasets) {
   } else {
     chart.options.scales.y.title.text = "kWh";
   }
+  // The day view pins x to a linear 0-1440 minute axis. Month and
+  // year are label-indexed bars, so the category axis has to be put
+  // back or they inherit the fixed 24 h range and render nothing.
+  chart.options.scales.x = {
+    type: "category",
+    ticks: { maxTicksLimit: 12, maxRotation: 0 },
+  };
   chart.update();
 }
 
@@ -266,33 +351,65 @@ let currentRows = { labels: [], harvested: [], used: [] };  // for CSV export
      - bounded at RING_MAX, oldest dropped: memory cannot grow and
        the window scrolls instead of accumulating forever
    ============================================================ */
-const RING_MAX = 1200;
+/* One slot per MINUTE of the day, which is exactly the resolution the
+   ESP logs at. Two reasons this is bucketed rather than a plain
+   timestamp set:
+
+   1. The /live listener fires every LIVE_PUSH_MS (5 s). Keyed by raw
+      timestamp that is 720 new points per hour, ~17000 a day, so the
+      ring hit its cap by mid-morning and evicted the start of the day
+      — the chart could not show a full day even in principle.
+   2. Canonical history samples are ~60 s apart but NOT aligned to :00,
+      so a live point and the history point for the same minute have
+      different timestamps and would both be kept as duplicates.
+
+   Bucketing by floor(t/60) fixes both: at most 1440 points per day,
+   the whole day always fits, and history (canonical) overwrites the
+   live estimate for the same minute when it arrives. */
+const RING_MAX = 1600;                   // 1440 minutes + headroom
 
 const ring = {
   rows: [],            // ascending by .t
-  seen: new Set(),     // timestamps present, for O(1) dedupe
+  slot: new Map(),     // minute bucket -> row, for O(1) dedupe/upsert
   date: null,          // which local date this ring holds
 };
 
 function ringReset(dateStr) {
   ring.rows.length = 0;
-  ring.seen.clear();
+  ring.slot.clear();
   ring.date = dateStr;
 }
 
-function ringPush(s) {
+/* isLive: a 5 s estimate for the minute in progress. It may be
+   replaced by a later live sample, and is always superseded by the
+   canonical one-minute history sample for the same bucket. */
+function ringPush(s, isLive) {
   const ts = Number(s && s.t);
-  if (!isFinite(ts) || ts <= 0 || ring.seen.has(ts)) return false;
-  ring.seen.add(ts);
+  if (!isFinite(ts) || ts <= 0) return false;
+  const bucket = Math.floor(ts / 60);
+
+  const existing = ring.slot.get(bucket);
+  if (existing) {
+    // History always wins. A live sample only refreshes another live one.
+    if (!isLive || existing.live) {
+      Object.assign(existing, s, { live: !!isLive });
+      return true;
+    }
+    return false;
+  }
+
+  const row = Object.assign({}, s, { live: !!isLive });
+  ring.slot.set(bucket, row);
   const n = ring.rows.length;
   if (n && ts < ring.rows[n - 1].t) {
-    ring.rows.push(s);
+    ring.rows.push(row);
     ring.rows.sort((a, b) => a.t - b.t);      // rare: backlog arrived late
   } else {
-    ring.rows.push(s);
+    ring.rows.push(row);
   }
   while (ring.rows.length > RING_MAX) {
-    ring.seen.delete(ring.rows.shift().t);
+    const dropped = ring.rows.shift();
+    ring.slot.delete(Math.floor(dropped.t / 60));
   }
   return true;
 }
@@ -305,20 +422,56 @@ function queueDayDraw() {
   requestAnimationFrame(() => { drawQueued = false; drawDay(); });
 }
 
+/* Minutes since local midnight of the day being displayed. This is
+   the x coordinate for the day chart. */
+function minutesOfDay(ts, dateStr) {
+  const midnight = new Date(dateStr + "T00:00:00").getTime();   // local
+  return (ts * 1000 - midnight) / 60000;
+}
+
+function hhmm(mins) {
+  const h = Math.floor(mins / 60), m = Math.round(mins % 60);
+  return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
+}
+
 function drawDay() {
-  const labels = ring.rows.map((s) =>
-    new Date(s.t * 1000).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }));
-  const gen = ring.rows.map((s) => (s.p > 0 ? s.p : 0));
-  const use = ring.rows.map((s) => (s.p < 0 ? -s.p : 0));
+  // A CATEGORY axis takes its width from however many samples exist,
+  // so a half-empty day stretched a few morning readings across the
+  // whole canvas and the axis moved every time a sample landed.
+  // A fixed linear axis in minutes-of-day pins the chart to
+  // 00:00-24:00 always: the curve grows into a stable frame instead
+  // of the frame resizing around the curve.
+  const gen = ring.rows.map((s) => ({ x: minutesOfDay(s.t, ring.date), y: s.p > 0 ? s.p : 0 }));
+  const use = ring.rows.map((s) => ({ x: minutesOfDay(s.t, ring.date), y: s.p < 0 ? -s.p : 0 }));
 
   chart.config.type = "line";
   chart.options.scales.y.title.text = "W";
-  chart.data.labels = labels;
+  chart.options.scales.y.beginAtZero = true;
+  chart.data.labels = [];                      // linear axis: points carry x
+
+  // Must be a PLAIN literal. chart.options is a Chart.js proxy, so
+  // Object.assign({}, chart.options.scales.x, ...) copies the
+  // resolver's own internals back into itself and the scriptable
+  // resolver then recurses forever ("Recursion detected").
+  chart.options.scales.x = {
+    type: "linear",
+    min: 0,
+    max: 1440,                                 // 24 h, never rescaled
+    offset: false,
+    bounds: "ticks",
+    ticks: {
+      stepSize: 120,                           // a label every 2 hours
+      autoSkip: false,
+      maxRotation: 0,
+      callback: (v) => hhmm(v),
+    },
+  };
+
   chart.data.datasets = [
     { label: "Generation (charging)", data: gen, borderWidth: 2, pointRadius: 0,
-      fill: "origin", tension: 0.35 },
+      fill: "origin", tension: 0.35, spanGaps: false },
     { label: "Electricity use", data: use, borderWidth: 2, pointRadius: 0,
-      fill: "origin", tension: 0.35 },
+      fill: "origin", tension: 0.35, spanGaps: false },
   ];
   chart.options.plugins.legend.display = true;
   chart.update("none");                       // no animation = no flicker
@@ -366,7 +519,12 @@ async function loadDay(dateStr) {
   }
   if (gen !== loadGen) return;                 // superseded while awaiting
 
-  snap.forEach((c) => ringPush(c.val()));
+  // NOTE: Firebase's DataSnapshot.forEach ABORTS as soon as the
+  // callback returns a truthy value. ringPush returns true on a
+  // successful insert, so `forEach(c => ringPush(c.val()))` loaded
+  // exactly ONE sample and silently discarded the rest of the day.
+  // The braces matter: this callback must return undefined.
+  snap.forEach((c) => { ringPush(c.val()); });
   drawDay();
 
   // Only today keeps streaming; past days are static.
@@ -399,7 +557,11 @@ async function daysForYear(year) {
   const snap = await db.ref("daily").orderByKey()
     .startAt(key + "-01-01").endAt(key + "-12-31").once("value");
   const rows = [];
-  snap.forEach((c) => rows.push({ date: c.key, ...(c.val() || {}) }));
+  // Same trap as loadDay: Array.prototype.push returns the new LENGTH,
+  // which is >= 1 and therefore truthy, so Firebase cancelled the
+  // enumeration after the first day. Every monthly and yearly total
+  // was computed from a single day. Braces = returns undefined.
+  snap.forEach((c) => { rows.push({ date: c.key, ...(c.val() || {}) }); });
   dailyByYear.set(key, rows);
   return rows;
 }
@@ -632,7 +794,7 @@ db.ref("live").on("value", (snap) => {
   // makes the graph actually live at the ESP's 3 s cadence instead
   // of waiting for the next one-minute history write.
   if (live && currentView === "day" && ring.date === localDate()) {
-    if (ringPush({ t: live.ts, v: live.v, i: live.i, p: live.p, soc: live.soc })) {
+    if (ringPush({ t: live.ts, v: live.v, i: live.i, p: live.p, soc: live.soc }, true)) {
       queueDayDraw();
     }
   }
