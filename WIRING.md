@@ -1,7 +1,7 @@
-# Wiring guide — SolarPulse v3
+# Wiring guide — SolarPulse v4
 
-Everything new in v3 that touches hardware: two source relays, one lighting
-relay, one travel-mode switch, and an optional PV meter.
+Hardware: two source relays (LIVE only), one switched load relay, one
+travel-mode switch, one passive buzzer, and an optional PV meter.
 
 > **Mains voltage kills.** The relay contacts carry 230 V. Do the AC side with
 > the main breaker off, inside an enclosure, with a licensed electrician if you
@@ -9,7 +9,42 @@ relay, one travel-mode switch, and an optional PV meter.
 
 ---
 
-## 1. Does one GPIO have enough drive for a two-pole relay?
+## 0. READ THIS FIRST — the neutral relays are gone
+
+v4 reflects a hardware change: the two neutral-switching relays have been
+removed, so **only the LIVE conductor is switched** and the utility neutral and
+the inverter neutral are now permanently commoned at the load bus.
+
+Three consequences you must design around:
+
+1. **"Both relays open" no longer isolates the load bus.** It removes live, but
+   neutral stays connected to both sources. Treat the load bus as live at all
+   times when working on it. Kill the upstream breaker, do not trust the relays.
+
+2. **Break-before-make is now the only separation between the two sources.**
+   With neutral commoned, if both live contacts were ever closed together you
+   would tie utility live to inverter live — a dead short across two sources,
+   through whichever has the lower impedance. The firmware makes this
+   structurally impossible (`setSourceRelays()` takes one source, so "both on"
+   cannot be expressed, and every change opens both for `RELAY_DEAD_TIME_MS`),
+   but firmware is not a safety barrier. **Fit a mechanical interlock.**
+
+3. **Commoned neutrals can violate local wiring rules.** In a TN-C-S / PME
+   installation the utility neutral is bonded to earth at the origin. If your
+   inverter also bonds neutral to earth internally (many do when running
+   off-grid), commoning the neutrals creates a parallel neutral-earth path and
+   can put current on the earth conductor. Check whether your inverter bonds
+   N-E in inverter mode. If it does, you need either a 4-pole changeover that
+   switches neutral, or an inverter configured not to bond. **This is exactly
+   the situation the removed neutral relays were solving — get it confirmed by
+   a licensed electrician before energising.**
+
+The firmware is correct for live-only switching either way; item 3 is an
+installation question, not a software one.
+
+---
+
+## 1. Does one GPIO have enough drive for a relay?
 
 Yes — with the usual relay *module*, and no if you try to drive a bare relay.
 
@@ -27,11 +62,11 @@ GPIO ──220Ω──►|── opto LED ──┐            (input side, ~3 m
 The pin only has to light an optocoupler LED: **about 3 mA at 3.3 V**, well
 inside spec. The coil current comes from the 5 V rail, never from the ESP.
 
-The number of *poles* on the relay changes nothing electrically. A DPDT relay
-has one coil throwing two sets of contacts. Live and Neutral are switched by
-the same armature, so:
+The number of *poles* changes nothing on the control side — one coil, one
+signal, however many contact sets it throws. Since v4 only the LIVE pole is
+used on each source relay (§0), so a single-pole module is now sufficient:
 
-**One GPIO per relay is correct. Do not use four pins for two relays.**
+**One GPIO per relay. One pole per relay. Two pins for two sources.**
 
 Two conditions:
 
@@ -51,10 +86,11 @@ Two conditions:
 
 | Function | Default pin | Notes |
 |---|---|---|
-| Utility (CEB) relay | `GPIO 25` | `RELAY_UTILITY_PIN` |
-| Solar / inverter relay | `GPIO 26` | `RELAY_SOLAR_PIN` |
-| Lighting relay (travel mode) | `GPIO 27` | `RELAY_LOAD_PIN`, set `-1` if unused |
+| Utility (CEB) relay — LIVE only | `GPIO 25` | `RELAY_UTILITY_PIN` |
+| Solar / inverter relay — LIVE only | `GPIO 26` | `RELAY_SOLAR_PIN` |
+| Switched load relay | `GPIO 27` | `RELAY_LOAD_PIN`, set `-1` if unused |
 | Travel-mode switch | `GPIO 32` | `TRAVEL_SWITCH_PIN`, see below |
+| **Passive buzzer** | **`GPIO 33`** | **`BUZZER_PIN`, LEDC ch 0, see §5** |
 | PV voltage sense (optional) | `GPIO 34` | ADC1, input-only |
 | PV current sense (optional) | `GPIO 35` | ADC1, input-only |
 
@@ -96,44 +132,49 @@ pull-up**, so those need an external 10 kΩ resistor to 3V3.
 
 ## 3. Relay wiring, AC side
 
-Only one source may be connected to the load bus at a time. The firmware
-guarantees this in software (both relays open for `RELAY_DEAD_TIME_MS` on every
-change), but wire it so a software fault cannot cause a backfeed either:
+Only one source may be connected to the load bus at a time. **Live only** now —
+the neutrals are commoned (see §0):
 
 ```
                         ┌──────── UTILITY RELAY (GPIO 25) ────────┐
-   CEB Live  ───────────┤ COM ──────────────── NO ├───────────────┼──┐
-   CEB Neutral ─────────┤ COM ──────────────── NO ├───────────────┼─┐│
-                        └─────────────────────────────────────────┘ ││
-                                                                    ││
-                        ┌──────── SOLAR RELAY (GPIO 26) ──────────┐ ││
-   Inverter Live ───────┤ COM ──────────────── NO ├───────────────┼─┼┤
-   Inverter Neutral ────┤ COM ──────────────── NO ├───────────────┼─┤│
-                        └─────────────────────────────────────────┘ ││
-                                                                    ││
-                                        LOAD BUS  Live  ────────────┘│
-                                        LOAD BUS  Neutral ───────────┘
+   CEB Live  ───────────┤ COM ──────────────── NO ├───────────────┼───┐
+                        └─────────────────────────────────────────┘   │
+                                                                      │
+                        ┌──────── SOLAR RELAY (GPIO 26) ──────────┐   │
+   Inverter Live ───────┤ COM ──────────────── NO ├───────────────┼───┤
+                        └─────────────────────────────────────────┘   │
+                                                                      │
+                                            LOAD BUS  Live  ──────────┘
+
+   CEB Neutral ──────┬───────────────────────────── LOAD BUS Neutral
+   Inverter Neutral ─┘        (commoned, never switched — see §0.3)
 ```
 
-- Use the **NO** (normally open) contacts on both. With the ESP32 unpowered,
-  both relays are open and the load bus is dead — the safe state.
-- **Fit a mechanical interlock** (two interlocked contactors, or a changeover
-  contactor) if you can. Two independent relays rely on firmware for
-  exclusivity; interlocked contactors rely on physics.
+- Use the **NO** (normally open) contacts. With the ESP32 unpowered both relays
+  are open and the load bus has no live — but it still has neutral.
+- **Fit a mechanical interlock.** With neutral commoned, both live contacts
+  closed together is a source-to-source short, not merely a backfeed. Two
+  interlocked contactors, or a single changeover contactor, make that
+  impossible in hardware. Firmware exclusivity is a convenience, not a barrier.
 - Earth is never switched. Bond it straight through.
 - Size the contacts for the real load. The 10 A printed on a cheap blue module
   is a resistive rating at best; derate hard for motors and pumps, or use the
   module to drive a proper contactor.
 
-### Lighting relay (travel mode)
+### Switched load relay
 
 ```
-   LOAD BUS Live ───┤ COM ── NO ├─── lighting circuit Live
-   LOAD BUS Neutral ──────────────── lighting circuit Neutral
+   LOAD BUS Live ───┤ COM ── NO ├─── load circuit Live
+   LOAD BUS Neutral ──────────────── load circuit Neutral
 ```
 
-Feed it from the load bus, not from a source directly, so the lights follow
+Feed it from the load bus, not from a source directly, so the circuit follows
 whichever source is active.
+
+This relay is also the **battery protection cutoff**: the firmware opens it at
+`SOC_LOAD_CUTOFF` (35%) regardless of the travel schedule or the web toggle,
+and closes it again at 37%. Put the discretionary loads on it — lighting,
+entertainment — not the fridge or anything that must never lose power.
 
 ---
 
@@ -159,7 +200,54 @@ If you prefer switch-to-3V3 wiring, set `TRAVEL_SWITCH_ACTIVE_LOW 0` in
 
 ---
 
-## 5. Optional PV meter
+## 5. Passive buzzer (GPIO 33)
+
+**Passive**, not active. An active buzzer has its own oscillator and just needs
+DC; a passive one is a piezo element that needs a square wave. The firmware
+drives it with the ESP32 LEDC peripheral, so it can play actual notes and costs
+no CPU time. An active buzzer on this pin will squeal at one pitch or not at
+all.
+
+A small piezo (under ~20 mA) can go straight on the pin:
+
+```
+   GPIO 33 ──────────┬────── buzzer + 
+                     │
+                    ═╧═ buzzer
+                     │
+   GND ──────────────┴────── buzzer −
+```
+
+Anything louder — a magnetic transducer, or a piezo with a driver board —
+exceeds what a GPIO should source. Use a small NPN:
+
+```
+   GPIO 33 ──1kΩ──── B
+                      \
+                       NPN (2N3904 / BC547)
+                      /  C ────── buzzer − ,  buzzer + ── +5 V
+                     E
+                     └── GND                 (add a 1N4148 across the
+                                              buzzer if it is magnetic)
+```
+
+Behaviour, from `config.h` section 8b:
+
+| Pack SoC | What happens |
+|---|---|
+| above 38% | silent |
+| **38% or below** | rising three-note chime every 20 s |
+| **35% or below** | load relay **opens**, urgent triple beep every 5 s |
+| back to 37% | load reconnects |
+| back to 40% | buzzer stops |
+
+The two recovery thresholds are `SOC_ALARM_HYST` (2 points) above the trigger,
+so a pack hovering on the line cannot chatter the relay or stutter the tone.
+Set `BUZZER_PIN` to `-1` to build without a buzzer.
+
+---
+
+## 6. Optional PV meter
 
 The rig has no PV-side sensor today, so "harvested" is measured at the battery:
 loads fed straight from the array during the day never pass the BMS shunt and
@@ -185,7 +273,7 @@ Use **ADC1 pins only** (32–39). ADC2 stops working the moment WiFi is on.
 
 ---
 
-## 6. Powering the ESP32
+## 7. Powering the ESP32
 
 Power it from the **battery** through a small buck converter, not from the
 inverter's AC output. If it runs on AC, a blackout silences the monitor exactly
@@ -194,7 +282,7 @@ being able to switch to utility.
 
 ---
 
-## 7. Bring-up checklist
+## 8. Bring-up checklist
 
 1. Flash the firmware with `RELAY_ACTIVE_LOW` set for your board, **relay board
    not connected to mains**. Confirm from the serial log that both relays read
