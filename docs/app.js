@@ -159,21 +159,24 @@ function render() {
   $("pv-now").textContent    = (live.pvW ?? 0).toFixed(0);
   $("load-now").textContent  = (live.loadW ?? 0).toFixed(0);
 
-  /* ---------- tonight's plan ----------
-     Decided by the ESP at 18:15: did the pack reach its 99% target
-     today? If not it is a cloudy day, and the evening rule is allowed
-     to run the pack down to the relaxed floor before touching CEB.
-     Firmware older than this simply omits both keys, and the line
-     hides itself rather than showing a wrong number. */
+  /* ---------- CEB / weather plan ----------
+     v5 replaces the old 99%-target "rainy" rule with the CEB state
+     machine. Firmware that predates it omits live.ceb, in which case
+     the line hides itself rather than showing a wrong number. */
   const tn = $("tonight");
-  if (live.nightFloor == null) {
+  if (live.ceb == null) {
     tn.classList.add("hidden");
   } else {
     tn.classList.remove("hidden");
-    tn.classList.toggle("rainy", !!live.rainy);
-    tn.textContent = live.rainy
-      ? `tonight: 99% target missed, pack may run down to ${live.nightFloor}% before CEB`
-      : `tonight: target reached, pack held above ${live.nightFloor}%`;
+    const heavy = live.wx === "heavy";
+    tn.classList.toggle("rainy", heavy);
+    const wxTxt = live.wx === "clear" ? "clear day"
+                : heavy               ? "poor-solar day"
+                : live.wx === "half"  ? "mixed day"
+                : "forecast unavailable";
+    tn.textContent = live.ceb
+      ? `CEB carrying the house · ${wxTxt} · handing back at ${live.cebRel} if the pack allows`
+      : `on solar · ${wxTxt} · CEB engages at ${live.cebOn}%`;
   }
 
   setPill("pill-src",
@@ -476,6 +479,9 @@ function drawDay() {
   chart.options.plugins.legend.display = true;
   chart.update("none");                       // no animation = no flicker
 
+  // Same ring, same samples, second view of them.
+  drawSoc();
+
   currentRows = {
     kind: "day", date: ring.date,
     columns: ["time", "voltage", "current", "power", "soc"],
@@ -488,6 +494,98 @@ function drawDay() {
   $("chart-caption").textContent = ring.rows.length
     ? `Power in/out of the battery on ${ring.date} · ${ring.rows.length} samples${live ? " · live" : ""}`
     : `No samples stored for ${ring.date} yet`;
+}
+
+
+/* ============================================================
+   BATTERY SoC OVER TIME
+
+   Reuses the SAME ring the generation chart is built from -- the
+   ESP has always shipped `soc` inside every /history sample, so
+   this needs no new data source, no new Firebase path and no
+   firmware change to feed it.
+
+   Truthful by construction: one point per stored sample, no
+   interpolation, and spanGaps:false so a logging gap renders as a
+   gap rather than a straight line pretending the pack was there.
+   ============================================================ */
+let socChart = null;
+
+function drawSoc() {
+  const pts = ring.rows
+    .filter((s) => s.soc != null && isFinite(s.soc))
+    .map((s) => ({ x: minutesOfDay(s.t, ring.date), y: Number(s.soc) }));
+
+  const dim  = themeColor("--muted");
+  const grid = themeColor("--grid");
+  const tealC = themeColor("--teal");
+
+  const ds = [{
+    label: "Battery SoC",
+    data: pts,
+    borderColor: tealC,
+    backgroundColor: tealC + "2E",
+    borderWidth: 2,
+    pointRadius: 0,
+    fill: "origin",
+    tension: 0.3,
+    spanGaps: false,
+  }];
+
+  if (!socChart) {
+    socChart = new Chart($("chart-soc"), {
+      type: "line",
+      data: { labels: [], datasets: ds },
+      options: {
+        maintainAspectRatio: false,
+        animation: { duration: 0 },
+        interaction: { mode: "index", intersect: false },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              title: (items) => (items.length ? hhmm(items[0].parsed.x) : ""),
+              label: (it) => ` ${Math.round(it.parsed.y)} %`,
+            },
+          },
+        },
+        scales: {
+          x: {
+            type: "linear", min: 0, max: 1440, offset: false, bounds: "ticks",
+            ticks: { stepSize: 120, autoSkip: false, maxRotation: 0,
+                     callback: (v) => hhmm(v) },
+          },
+          y: {
+            min: 0, max: 100,
+            ticks: { stepSize: 20, callback: (v) => v + "%" },
+            title: { display: true, text: "SoC" },
+          },
+        },
+      },
+    });
+  } else {
+    socChart.data.datasets = ds;
+  }
+
+  const o = socChart.options;
+  o.scales.x.ticks.color = dim;
+  o.scales.y.ticks.color = dim;
+  o.scales.x.grid = { color: grid };
+  o.scales.y.grid = { color: grid };
+  o.scales.y.title.color = dim;
+  socChart.update("none");
+
+  const el = $("soc-caption");
+  if (!el) return;
+  if (!pts.length) {
+    el.textContent = `No state-of-charge samples stored for ${ring.date} yet`;
+    return;
+  }
+  let lo = pts[0].y, hi = pts[0].y;
+  for (const p of pts) { if (p.y < lo) lo = p.y; if (p.y > hi) hi = p.y; }
+  el.textContent =
+    `State of charge on ${ring.date} · now ${Math.round(pts[pts.length - 1].y)}%` +
+    ` · low ${Math.round(lo)}% · high ${Math.round(hi)}%`;
 }
 
 /* child_added listener for the day currently on screen. Detached
@@ -821,7 +919,8 @@ setInterval(() => {
   if (!$("tab-monthly").classList.contains("hidden")) loadMonthlyTab();
 }, 30 * 60 * 1000);
 
-/* redraw the monthly bars when the theme toggle flips the palette */
+/* redraw theme-coloured charts when the palette flips */
 new MutationObserver(() => {
   if (monthlyChart && !$("tab-monthly").classList.contains("hidden")) loadMonthlyTab();
+  if (socChart) drawSoc();          // SoC line/fill are theme colours
 }).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
