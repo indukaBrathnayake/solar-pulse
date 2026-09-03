@@ -661,3 +661,10 @@ body { padding-bottom: 96px; }
 @media (prefers-reduced-motion: reduce) {
   #buffered-note.syncing { animation: none; }
 }
+
+/* ---- battery SoC over time ----
+   Slightly shorter than the power chart: a 0-100% band needs less
+   vertical room than watts, and it keeps the new panel from pushing
+   "Generation & usage" too far down the page. */
+.chart-box-soc { height: 200px; }
+@media (max-width: 760px) { .chart-box-soc { height: 170px; } }
