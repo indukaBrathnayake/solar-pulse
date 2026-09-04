@@ -141,19 +141,26 @@ function render() {
   $("time-fill").style.background = color;
   $("time-label").textContent = fresh ? label : "no recent data";
 
-  /* ---------- source relays, travel mode ----------
-     Sent by firmware v3. Older firmware simply omits these keys,
-     in which case the card stays on "--" and nothing breaks. */
-  const src = live.src || "none";
-  const srcTxt = src === "solar" ? "Solar + battery"
-               : src === "utility" ? "Utility · CEB"
-               : "not switched";
-  $("src-name").textContent = fresh && live.src ? srcTxt : "--";
+  /* ---------- powering the house ----------
+     AUTHORITATIVE. live.house is computed by the firmware from the
+     committed relay state (srcActual) inside the one source state
+     machine -- it is not inferred here from SoC, PV, voltage, time
+     or the CEB threshold, and there is no second source-control
+     system in the browser.
+
+     On the v5 changeover relay the coil being energised IS "CEB";
+     everything else, including the break-before-make dead time,
+     leaves the load bus on the inverter. That is why "not switched"
+     is gone: with this hardware there is no such electrical state,
+     and showing it was the bug. */
+  const house = live.house || null;          // "CEB" | "Pack"
+  const onCeb = house === "CEB";
+  $("src-name").textContent = fresh && house ? house : "--";
   $("src-why").textContent = live.why
     ? (live.manual ? "manual · " : "automatic · ") + live.why
     : "controller not reporting";
-  chip("chip-solar", fresh && live.relayS, "on");
-  chip("chip-util",  fresh && live.relayU, "warn");
+  chip("chip-solar", fresh && house === "Pack", "on");
+  chip("chip-util",  fresh && onCeb, "warn");
   chip("chip-light", fresh && live.light,  "gold");
   $("util-min").textContent  = live.utilMin ?? 0;
   $("pv-now").textContent    = (live.pvW ?? 0).toFixed(0);
@@ -180,8 +187,8 @@ function render() {
   }
 
   setPill("pill-src",
-    !fresh || !live.src ? "" : src === "solar" ? "on" : src === "utility" ? "warn" : "",
-    src === "solar" ? "On solar" : src === "utility" ? "On CEB" : "Source --");
+    !fresh || !house ? "" : onCeb ? "warn" : "on",
+    house ? (onCeb ? "On CEB" : "On Pack") : "Source --");
   $("pill-travel").classList.toggle("hidden", !live.travel);
   if (live.travel) setPill("pill-travel", "gold", "Travel mode");
 
@@ -211,6 +218,7 @@ function render() {
   $("mos-t").textContent = live.mosT ?? "--";
   $("bal-state").textContent = live.bal ? `ON ${(live.balI ?? 0).toFixed(2)} A` : "idle";
 
+  renderWeather();
   trackBacklog(live.buffered ?? 0);
 }
 
@@ -292,6 +300,65 @@ async function applyBackfill(count) {
     note.classList.remove("done");
     note.innerHTML = '· <span id="buffered-n">0</span> samples waiting on the ESP';
   }, 8000);
+}
+
+
+
+/* ============================================================
+   TODAY'S WEATHER
+
+   Rendered from live.wxIcon / live.wxText, which the ESP32 derives
+   from the WMO weather code. The OLED renders from the same enum,
+   so the two displays cannot disagree about today's condition.
+
+   One distinct shape per condition -- not one generic cloud with
+   different labels.
+   ============================================================ */
+const WX_SVG = {
+  sunny: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4.2" fill="currentColor" stroke="none"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.6" y1="4.6" x2="6.4" y2="6.4"/><line x1="17.6" y1="17.6" x2="19.4" y2="19.4"/><line x1="4.6" y1="19.4" x2="6.4" y2="17.6"/><line x1="17.6" y1="6.4" x2="19.4" y2="4.6"/></g></svg>',
+  partly: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="8.5" cy="7.5" r="3.2" fill="currentColor" stroke="none"/><line x1="8.5" y1="1.4" x2="8.5" y2="3"/><line x1="2.4" y1="7.5" x2="4" y2="7.5"/><line x1="4.2" y1="3.2" x2="5.3" y2="4.3"/><path d="M8 19h9a3.5 3.5 0 0 0 .3-7 5 5 0 0 0-9.5 1.2A3 3 0 0 0 8 19z"/></svg>',
+  cloudy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 18h10a3.8 3.8 0 0 0 .3-7.6 5.4 5.4 0 0 0-10.3 1.3A3.2 3.2 0 0 0 7 18z"/></svg>',
+  fog: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 13h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 13z"/><line x1="4" y1="17" x2="20" y2="17"/><line x1="6" y1="20.5" x2="18" y2="20.5"/></svg>',
+  rain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 14h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 14z"/><line x1="8.5" y1="17" x2="7.5" y2="20"/><line x1="13" y1="17" x2="12" y2="20"/><line x1="17.5" y1="17" x2="16.5" y2="20"/></svg>',
+  heavyrain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 13h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 13z"/><line x1="7" y1="15.5" x2="5.6" y2="19"/><line x1="10.5" y1="15.5" x2="9.1" y2="19"/><line x1="14" y1="15.5" x2="12.6" y2="19"/><line x1="17.5" y1="15.5" x2="16.1" y2="19"/><line x1="9" y1="19.5" x2="8" y2="22"/><line x1="15" y1="19.5" x2="14" y2="22"/></svg>',
+  storm: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 12.5h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 12.5z"/><path d="M13 15l-3.2 4.2h3L11 23"/><line x1="17" y1="15.5" x2="16" y2="18.5"/></svg>',
+  unknown: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 16h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 16z"/><line x1="12" y1="19.5" x2="12" y2="19.6" stroke-width="2.4"/></svg>',
+};
+
+function renderWeather() {
+  const strip = $("wx-strip");
+  if (!strip) return;
+  // Firmware that predates the weather keys omits them: hide rather
+  // than invent a condition.
+  if (!live || !live.wxIcon) { strip.classList.add("hidden"); return; }
+  strip.classList.remove("hidden");
+
+  const key = WX_SVG[live.wxIcon] ? live.wxIcon : "unknown";
+  strip.dataset.wx = key;
+  $("wx-ico").innerHTML = WX_SVG[key];
+  $("wx-cond").textContent = live.wxText || "UNKNOWN";
+
+  const bits = [];
+  if (live.wxCloud != null)  bits.push(`${live.wxCloud}% cloud`);
+  if (live.wxPrecip != null) bits.push(`${Number(live.wxPrecip).toFixed(1)} mm rain`);
+  // What the controller is ACTING on, which may differ from the
+  // forecast once measured PV has overridden it.
+  if (live.pvVerdict === "good")      bits.push("PV confirms a good day");
+  else if (live.pvVerdict === "poor") bits.push("PV says worse than forecast");
+  $("wx-sub").textContent = bits.join(" · ");
+
+  const age = live.wxAgeDays;
+  const el = $("wx-age");
+  if (age == null || age < 0) {
+    el.textContent = "no forecast";
+    el.classList.add("stale");
+  } else if (age === 0) {
+    el.textContent = "today";
+    el.classList.remove("stale");
+  } else {
+    el.textContent = `forecast ${age}d old`;
+    el.classList.toggle("stale", age >= 2);
+  }
 }
 
 /* ---------------- chart ---------------- */
@@ -432,8 +499,14 @@ function minutesOfDay(ts, dateStr) {
   return (ts * 1000 - midnight) / 60000;
 }
 
+// Minutes-of-day -> "HH:MM". Rounding to a whole minute FIRST is
+// what keeps decimals off the axis, and it also fixes a carry bug:
+// Math.round(59.9999) is 60, so the old version could render
+// "11:60" in a tooltip for a sample landing on a minute boundary.
 function hhmm(mins) {
-  const h = Math.floor(mins / 60), m = Math.round(mins % 60);
+  let t = Math.round(mins);
+  if (!isFinite(t) || t < 0) t = 0;
+  const h = Math.floor(t / 60), m = t % 60;
   return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
 }
 
@@ -470,12 +543,27 @@ function drawDay() {
     },
   };
 
+  // Usage first, generation second: the point of this system is to
+  // understand what the house consumed, with what the array made as
+  // the supporting number. The inline theme glue in index.html now
+  // colours by LABEL, not by index, so this order is safe to change.
   chart.data.datasets = [
-    { label: "Generation (charging)", data: gen, borderWidth: 2, pointRadius: 0,
-      fill: "origin", tension: 0.35, spanGaps: false },
     { label: "Electricity use", data: use, borderWidth: 2, pointRadius: 0,
       fill: "origin", tension: 0.35, spanGaps: false },
+    { label: "Generation (charging)", data: gen, borderWidth: 2, pointRadius: 0,
+      fill: "origin", tension: 0.35, spanGaps: false },
   ];
+  // Without an explicit title callback Chart.js prints the raw linear
+  // x value for a tooltip -- e.g. "457.8166666666667". Format it.
+  // NOTE: do NOT write `plugins.tooltip = plugins.tooltip || {}` here.
+  // chart.options is a Chart.js proxy, so assigning it into itself
+  // builds a self-reference and the resolver recurses forever
+  // ("Maximum call stack size exceeded"). plugins.tooltip always
+  // exists from the defaults, so just set the callbacks on it.
+  chart.options.plugins.tooltip.callbacks = {
+    title: (items) => (items.length ? hhmm(items[0].parsed.x) : ""),
+    label: (it) => ` ${it.dataset.label}: ${Math.round(it.parsed.y)} W`,
+  };
   chart.options.plugins.legend.display = true;
   chart.update("none");                       // no animation = no flicker
 
@@ -674,17 +762,19 @@ async function loadMonth(monthStr) {           // "YYYY-MM"
   const harvested = rows.map(harvestKwh);
   const used = rows.map(usedKwh);
   setChartType("bar", labels, [
-    { label: "Harvested", data: harvested, borderRadius: 4 },
     { label: "Used", data: used, borderRadius: 4 },
+    { label: "Harvested", data: harvested, borderRadius: 4 },
   ]);
   chart.options.plugins.legend.display = true;
   chart.update();
   currentRows = { kind: "month", date: monthStr,
-    columns: ["date", "harvested_kWh", "used_kWh"],
+    columns: ["date", "used_kWh", "harvested_kWh"],
     rows: rows.map((r) => ({ date: r.date,
-      harvested_kWh: harvestKwh(r).toFixed(3), used_kWh: usedKwh(r).toFixed(3) })) };
+      used_kWh: usedKwh(r).toFixed(3), harvested_kWh: harvestKwh(r).toFixed(3) })) };
+  const totUsed = used.reduce((a, b) => a + b, 0);
   const total = harvested.reduce((a, b) => a + b, 0);
-  $("chart-caption").textContent = `Daily harvest for ${monthStr} · ${total.toFixed(1)} kWh total`;
+  $("chart-caption").textContent =
+    `${monthStr} · drawn ${totUsed.toFixed(1)} kWh · harvested ${total.toFixed(1)} kWh`;
 }
 
 async function loadYear(yearStr) {              // "YYYY"
@@ -707,12 +797,14 @@ async function loadYear(yearStr) {              // "YYYY"
   chart.options.plugins.legend.display = true;
   chart.update();
   currentRows = { kind: "year", date: yearStr,
-    columns: ["month", "harvested_kWh", "used_kWh"],
+    columns: ["month", "used_kWh", "harvested_kWh"],
     rows: labels.map((name, i) => ({
       month: `${yearStr}-${String(i + 1).padStart(2, "0")}`,
-      harvested_kWh: chg[i].toFixed(3), used_kWh: dis[i].toFixed(3) })) };
+      used_kWh: dis[i].toFixed(3), harvested_kWh: chg[i].toFixed(3) })) };
+  const totUsedY = dis.reduce((a, b) => a + b, 0);
   const total = chg.reduce((a, b) => a + b, 0);
-  $("chart-caption").textContent = `Monthly harvest for ${yearStr} · ${total.toFixed(1)} kWh total`;
+  $("chart-caption").textContent =
+    `${yearStr} · drawn ${totUsedY.toFixed(1)} kWh · harvested ${total.toFixed(1)} kWh`;
 }
 
 function refreshChart() {
@@ -794,14 +886,16 @@ async function loadMonthlyTab() {
   const total = kwh.reduce((a, b) => a + b, 0);
   const totalUsed = used.reduce((a, b) => a + b, 0);
   const totalDays = days.reduce((a, b) => a + b, 0);
+  // Busiest month is the biggest DRAW, not the biggest harvest:
+  // usage is the headline number on this dashboard now.
   let bestIdx = 0;
-  kwh.forEach((v, i) => { if (v > kwh[bestIdx]) bestIdx = i; });
+  used.forEach((v, i) => { if (v > used[bestIdx]) bestIdx = i; });
 
   /* ---- summary cards ---- */
   $("yr-kwh").textContent      = total.toFixed(1);
   $("yr-days").textContent     = totalDays;
-  $("yr-best").textContent     = total > 0 ? MONTH_NAMES[bestIdx].slice(0, 3) : "--";
-  $("yr-best-kwh").textContent = kwh[bestIdx].toFixed(1);
+  $("yr-best").textContent     = totalUsed > 0 ? MONTH_NAMES[bestIdx].slice(0, 3) : "--";
+  $("yr-best-kwh").textContent = used[bestIdx].toFixed(1);
   $("yr-used").textContent     = totalUsed.toFixed(1);
   $("yr-days2").textContent    = totalDays;
 
@@ -810,8 +904,9 @@ async function loadMonthlyTab() {
   const solar = themeColor("--amber"), blue = themeColor("--use"), dim = themeColor("--muted");
   const grid = themeColor("--grid");
   const datasets = [
-    { label: "Harvested", data: kwh,  backgroundColor: solar, borderRadius: 6 },
+    // Used first so it draws and legends first.
     { label: "Used",      data: used, backgroundColor: blue,  borderRadius: 6 },
+    { label: "Harvested", data: kwh,  backgroundColor: solar, borderRadius: 6 },
   ];
 
   if (!monthlyChart) {
@@ -838,24 +933,24 @@ async function loadMonthlyTab() {
   o.plugins.legend.labels.color = dim;
   monthlyChart.update();
 
-  /* ---- table ---- */
+  /* ---- table: used first, harvested second ---- */
   $("mtbody").innerHTML =
-    kwh.map((v, i) =>
-      `<tr><td>${MONTH_NAMES[i]}</td><td>${v.toFixed(2)}</td>` +
-      `<td>${used[i].toFixed(2)}</td><td>${days[i]}</td></tr>`).join("") +
-    `<tr class="mtotal"><td>Total ${year}</td><td>${total.toFixed(2)}</td>` +
-    `<td>${totalUsed.toFixed(2)}</td><td>${totalDays}</td></tr>`;
+    used.map((u, i) =>
+      `<tr><td>${MONTH_NAMES[i]}</td><td>${u.toFixed(2)}</td>` +
+      `<td>${kwh[i].toFixed(2)}</td><td>${days[i]}</td></tr>`).join("") +
+    `<tr class="mtotal"><td>Total ${year}</td><td>${totalUsed.toFixed(2)}</td>` +
+    `<td>${total.toFixed(2)}</td><td>${totalDays}</td></tr>`;
 
   $("monthly-caption").textContent =
-    `Total kWh harvested each month of ${year} · ${total.toFixed(1)} kWh so far`;
+    `${year} · drawn ${totalUsed.toFixed(1)} kWh · harvested ${total.toFixed(1)} kWh`;
 
   monthlyRows = {
     kind: "monthly", date: year,
-    columns: ["month", "harvested_kWh", "used_kWh", "days_logged"],
-    rows: kwh.map((v, i) => ({
+    columns: ["month", "used_kWh", "harvested_kWh", "days_logged"],
+    rows: used.map((u, i) => ({
       month: `${year}-${String(i + 1).padStart(2, "0")}`,
-      harvested_kWh: v.toFixed(3),
-      used_kWh: used[i].toFixed(3),
+      used_kWh: u.toFixed(3),
+      harvested_kWh: kwh[i].toFixed(3),
       days_logged: days[i],
     })),
   };
