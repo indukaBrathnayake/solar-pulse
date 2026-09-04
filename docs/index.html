@@ -50,6 +50,19 @@
 <!-- ======================= TAB: LIVE ======================= -->
 <main class="tab-panel" id="tab-live">
 
+<!-- ==================== TODAY'S WEATHER ====================
+     Icon + condition come from live.wxIcon / live.wxText, which the
+     ESP derives from the WMO code. The OLED reads the same mapping,
+     so the two can never disagree about today's weather. -->
+<section class="wx-strip hidden" id="wx-strip">
+  <span class="wx-ico" id="wx-ico"></span>
+  <div class="wx-txt">
+    <p class="wx-cond" id="wx-cond">--</p>
+    <p class="wx-sub" id="wx-sub"></p>
+  </div>
+  <span class="wx-age" id="wx-age"></span>
+</section>
+
 <!-- ======================= ENERGY FLOW ======================= -->
 <section class="flow-card" id="river">
   <div class="flow-row">
@@ -120,6 +133,14 @@
 
 <!-- ======================= STAT CARDS ======================= -->
 <section class="cards">
+  <!-- Usage first: this system is read to understand consumption,
+       with generation as the supporting number. -->
+  <article class="card accent-use">
+    <p class="card-eyebrow ice">Drawn by home today</p>
+    <p class="card-num"><span id="today-dis">0.00</span><span class="unit">kWh</span></p>
+    <p class="card-sub">lifetime <span id="life-dis">0</span> kWh</p>
+  </article>
+
   <article class="card accent-solar">
     <p class="card-eyebrow amber">Harvested today</p>
     <p class="card-num"><span id="today-chg">0.00</span><span class="unit">kWh</span></p>
@@ -134,12 +155,6 @@
       <div class="time-track"><div class="time-fill" id="time-fill"></div></div>
       <p class="time-label" id="time-label">estimating…</p>
     </div>
-  </article>
-
-  <article class="card accent-use">
-    <p class="card-eyebrow ice">Drawn by home today</p>
-    <p class="card-num"><span id="today-dis">0.00</span><span class="unit">kWh</span></p>
-    <p class="card-sub">lifetime <span id="life-dis">0</span> kWh</p>
   </article>
 
   <!-- which relay is carrying the house right now -->
@@ -232,20 +247,21 @@
 <!-- ======================= TAB: MONTHLY ======================= -->
 <main class="tab-panel hidden" id="tab-monthly">
   <section class="cards">
-    <article class="card accent-solar">
-      <p class="card-eyebrow amber">Harvested this year</p>
-      <p class="card-num"><span id="yr-kwh">0.0</span><span class="unit">kWh</span></p>
-      <p class="card-sub">across <span id="yr-days">0</span> logged days</p>
-    </article>
-    <article class="card accent-gen">
-      <p class="card-eyebrow teal">Best month</p>
-      <p class="card-num"><span id="yr-best">--</span></p>
-      <p class="card-sub"><span id="yr-best-kwh">0.0</span> kWh harvested</p>
-    </article>
+    <!-- Usage first here too. -->
     <article class="card accent-use">
       <p class="card-eyebrow ice">Drawn by home this year</p>
       <p class="card-num"><span id="yr-used">0.0</span><span class="unit">kWh</span></p>
-      <p class="card-sub">across the same <span id="yr-days2">0</span> logged days</p>
+      <p class="card-sub">across <span id="yr-days2">0</span> logged days</p>
+    </article>
+    <article class="card accent-solar">
+      <p class="card-eyebrow amber">Harvested this year</p>
+      <p class="card-num"><span id="yr-kwh">0.0</span><span class="unit">kWh</span></p>
+      <p class="card-sub">across the same <span id="yr-days">0</span> logged days</p>
+    </article>
+    <article class="card accent-gen">
+      <p class="card-eyebrow teal">Busiest month</p>
+      <p class="card-num"><span id="yr-best">--</span></p>
+      <p class="card-sub"><span id="yr-best-kwh">0.0</span> kWh drawn</p>
     </article>
   </section>
 
@@ -257,12 +273,12 @@
         <button class="btn-export" id="btn-export-month">Export CSV</button>
       </div>
     </div>
-    <p class="panel-sub" id="monthly-caption">Total kWh harvested each month</p>
+    <p class="panel-sub" id="monthly-caption">Energy drawn and harvested each month</p>
     <div class="chart-box"><canvas id="chart-monthly"></canvas></div>
 
     <table class="mtable" id="mtable">
       <thead>
-        <tr><th>Month</th><th>Harvested kWh</th><th>Used kWh</th><th>Days logged</th></tr>
+        <tr><th>Month</th><th>Used kWh</th><th>Harvested kWh</th><th>Days logged</th></tr>
       </thead>
       <tbody id="mtbody"></tbody>
     </table>
@@ -345,8 +361,14 @@
             tension: 0.35, pointRadius: 0, borderWidth: 2 },
         ];
       } else {
-        ds[0].borderColor = c.gen; ds[0].backgroundColor = c.gen + "2E";
-        if (ds[1]) { ds[1].borderColor = c.use; ds[1].backgroundColor = c.use + "2E"; }
+      // Colour by LABEL, never by index: the day chart now lists
+      // usage first and generation second, and an index-based rule
+      // would silently paint them the wrong colours.
+      ds.forEach((d) => {
+        const isGen = /generation/i.test(d.label || "");
+        d.borderColor = isGen ? c.gen : c.use;
+        d.backgroundColor = (isGen ? c.gen : c.use) + "2E";
+      });
       }
       chart.options.plugins.legend.display = true;
       chart.options.interaction = { mode: "index", intersect: false };
