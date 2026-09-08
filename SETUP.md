@@ -102,9 +102,10 @@ Do this before flashing so the board has a permanent home.
 6. The web server needs two libraries that are **not** in Library Manager. Download both as ZIPs from GitHub and add each with **Sketch > Include Library > Add .ZIP Library**:
    - `me-no-dev/ESPAsyncWebServer`
    - `me-no-dev/AsyncTCP` (required by the above; install it too or nothing compiles)
-7. To upload the on-device dashboard you also need the filesystem plugin: **arduino-esp32 LittleFS Data Upload**. Follow its README to drop the `.vsix`/jar into your Arduino tools folder, then restart the IDE. This is optional — skip it and everything works except the local web page.
+7. **Tools > Manage Libraries**, search `U8g2` and install **U8g2 by oliver**. This drives the 0.96" OLED. It replaced Adafruit_GFX + Adafruit_SSD1306 in v8: the full-buffer mode is what lets the arrow lane animate without tearing, and the display fonts come from it. If you have no OLED fitted you can set `OLED_ENABLE 0` in `config.h`, but the library still has to be installed for the sketch to compile.
+8. To upload the on-device dashboard you also need the filesystem plugin: **arduino-esp32 LittleFS Data Upload**. Follow its README to drop the `.vsix`/jar into your Arduino tools folder, then restart the IDE. This is optional — skip it and everything works except the local web page.
 
-**Check:** under **Tools > Board > esp32**, an entry like `ESP32 Dev Module` is selectable, and **Sketch > Include Library** lists both `ESPAsyncWebServer` and `AsyncTCP`.
+**Check:** under **Tools > Board > esp32**, an entry like `ESP32 Dev Module` is selectable, and **Sketch > Include Library** lists `ESPAsyncWebServer`, `AsyncTCP` and `U8g2`.
 
 ---
 

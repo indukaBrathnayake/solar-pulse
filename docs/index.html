@@ -7,15 +7,32 @@
 <title>Nipuna's Solar - Atabage, Udagama</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Outfit:wght@400;500;600&family=JetBrains+Mono:wght@400;600;800&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=20260909-5aa47a">
 </head>
-<body>
+<body data-build="20260909-5aa47a">
 
 <header class="top">
+  <!-- Two lines only. The old third line (site, array size, pack
+       chemistry) is gone: it never changed, so it was banner space
+       spent on something a glance never needed. -->
   <div class="wordmark">
-    <span class="mark-dot" id="heartbeat"></span>
-    <h1>NIPUNA's&nbsp;PV</h1>
-    <span class="rig">Atabage, Udagama · 580 W · LiFePO<sub>4</sub> 4S 100 Ah</span>
+    <div class="brand-row">
+      <span class="mark-dot" id="heartbeat"></span>
+      <h1 class="brand"><span class="brand-mark">SOLARPULSE</span> HYBRID ENERGY CONTROLLER</h1>
+    </div>
+    <p class="statstrip" id="statstrip">
+      <span id="st-sys" class="st-sys">SYS OK</span>
+      <span class="st-sep">·</span>
+      <span class="st-item"><i id="st-wifi-dot"></i>WIFI</span>
+      <span class="st-sep">·</span>
+      <span class="st-item"><i id="st-ble-dot"></i>BLE</span>
+      <span class="st-sep">·</span>
+      <span class="st-item"><i id="st-fb-dot"></i>FB</span>
+      <span class="st-sep">·</span>
+      <span class="st-item">UP <span id="st-up">--</span></span>
+      <span class="st-sep st-wide">·</span>
+      <span class="st-item st-wide">LAST SYNC <span id="st-sync">--</span></span>
+    </p>
   </div>
 
   <div class="top-right">
@@ -49,6 +66,19 @@
 
 <!-- ======================= TAB: LIVE ======================= -->
 <main class="tab-panel" id="tab-live">
+
+<!-- ==================== TODAY'S WEATHER ====================
+     Icon + condition come from live.wxIcon / live.wxText, which the
+     ESP derives from the WMO code. The OLED reads the same mapping,
+     so the two can never disagree about today's weather. -->
+<section class="wx-strip hidden" id="wx-strip">
+  <span class="wx-ico" id="wx-ico"></span>
+  <div class="wx-txt">
+    <p class="wx-cond" id="wx-cond">--</p>
+    <p class="wx-sub" id="wx-sub"></p>
+  </div>
+  <span class="wx-age" id="wx-age"></span>
+</section>
 
 <!-- ======================= ENERGY FLOW ======================= -->
 <section class="flow-card" id="river">
@@ -120,6 +150,14 @@
 
 <!-- ======================= STAT CARDS ======================= -->
 <section class="cards">
+  <!-- Usage first: this system is read to understand consumption,
+       with generation as the supporting number. -->
+  <article class="card accent-use">
+    <p class="card-eyebrow ice">Drawn by home today</p>
+    <p class="card-num"><span id="today-dis">0.00</span><span class="unit">kWh</span></p>
+    <p class="card-sub">lifetime <span id="life-dis">0</span> kWh</p>
+  </article>
+
   <article class="card accent-solar">
     <p class="card-eyebrow amber">Harvested today</p>
     <p class="card-num"><span id="today-chg">0.00</span><span class="unit">kWh</span></p>
@@ -136,12 +174,6 @@
     </div>
   </article>
 
-  <article class="card accent-use">
-    <p class="card-eyebrow ice">Drawn by home today</p>
-    <p class="card-num"><span id="today-dis">0.00</span><span class="unit">kWh</span></p>
-    <p class="card-sub">lifetime <span id="life-dis">0</span> kWh</p>
-  </article>
-
   <!-- which relay is carrying the house right now -->
   <article class="card accent-src">
     <p class="card-eyebrow violet">Powering the house</p>
@@ -152,7 +184,11 @@
       <span class="relay-chip" id="chip-util"><i></i>Utility</span>
       <span class="relay-chip" id="chip-light"><i></i>Lights</span>
     </div>
-    <p class="card-sub"><span id="util-min">0</span> min on CEB today · solar <span id="pv-now">0</span> W · load <span id="load-now">0</span> W</p>
+    <!-- Lights state. This page reads Firebase and has no route to
+         the ESP, so the ON/OFF/AUTO control lives on the on-device
+         dashboard; here the mode and its reason are reported. -->
+    <p class="card-sub" id="lights-line">lights --</p>
+    <p class="card-sub"><span id="util-min">0</span> min on CEB today · <span id="light-min">0</span> min of lights · solar <span id="pv-now">0</span> W · load <span id="load-now">0</span> W</p>
     <p class="card-sub tonight" id="tonight">tonight's floor --</p>
   </article>
 </section>
@@ -198,6 +234,15 @@
   </div>
 </section>
 
+<!-- ==================== BATTERY SOC OVER TIME ==================== -->
+<section class="panel">
+  <div class="panel-head">
+    <h2>Battery percentage over time</h2>
+  </div>
+  <p class="panel-sub" id="soc-caption">State of charge across the day</p>
+  <div class="chart-box chart-box-soc"><canvas id="chart-soc"></canvas></div>
+</section>
+
 <!-- ======================= CHART ======================= -->
 <section class="panel">
   <div class="panel-head chart-head">
@@ -216,6 +261,39 @@
   </div>
   <p class="panel-sub" id="chart-caption">Today's power, watts in and out of the battery</p>
   <div class="chart-box"><canvas id="chart-main"></canvas></div>
+  <!-- CEB runtime, read from the `src` field the ESP has always
+       shipped inside every history sample. Never inferred. -->
+  <p class="panel-sub run-sum" id="ceb-caption"></p>
+</section>
+
+<!-- ================= PREDICTION ACCURACY =================
+     Expected PV (the historical hourly profile this site has
+     actually produced) against what the array did today. The
+     expected curve is computed in the browser from history days
+     already in Firebase -- it needs no new firmware field and no
+     new upload path. -->
+<section class="panel">
+  <div class="panel-head">
+    <h2>Prediction accuracy</h2>
+  </div>
+  <p class="panel-sub">Expected PV vs actual PV</p>
+  <div class="chart-box chart-box-soc"><canvas id="chart-pred"></canvas></div>
+  <p class="panel-sub" id="pred-caption">Building the historical profile…</p>
+</section>
+
+<!-- ================= RESET HISTORY =================
+     The last RESET_LOG_N boots, straight from the ESP's NVS ring.
+     This is the evidence for WHY the box restarted; without it a
+     reset is just an unexplained gap in the graph. -->
+<section class="panel">
+  <div class="panel-head">
+    <h2>Reset history</h2>
+  </div>
+  <p class="panel-sub" id="reset-sub">Waiting for the controller…</p>
+  <table class="mtable" id="reset-table">
+    <thead><tr><th>Boot</th><th>Reason</th><th>Previous uptime</th></tr></thead>
+    <tbody id="reset-rows"></tbody>
+  </table>
 </section>
 
 </main><!-- /tab-live -->
@@ -223,20 +301,21 @@
 <!-- ======================= TAB: MONTHLY ======================= -->
 <main class="tab-panel hidden" id="tab-monthly">
   <section class="cards">
-    <article class="card accent-solar">
-      <p class="card-eyebrow amber">Harvested this year</p>
-      <p class="card-num"><span id="yr-kwh">0.0</span><span class="unit">kWh</span></p>
-      <p class="card-sub">across <span id="yr-days">0</span> logged days</p>
-    </article>
-    <article class="card accent-gen">
-      <p class="card-eyebrow teal">Best month</p>
-      <p class="card-num"><span id="yr-best">--</span></p>
-      <p class="card-sub"><span id="yr-best-kwh">0.0</span> kWh harvested</p>
-    </article>
+    <!-- Usage first here too. -->
     <article class="card accent-use">
       <p class="card-eyebrow ice">Drawn by home this year</p>
       <p class="card-num"><span id="yr-used">0.0</span><span class="unit">kWh</span></p>
-      <p class="card-sub">across the same <span id="yr-days2">0</span> logged days</p>
+      <p class="card-sub">across <span id="yr-days2">0</span> logged days</p>
+    </article>
+    <article class="card accent-solar">
+      <p class="card-eyebrow amber">Harvested this year</p>
+      <p class="card-num"><span id="yr-kwh">0.0</span><span class="unit">kWh</span></p>
+      <p class="card-sub">across the same <span id="yr-days">0</span> logged days</p>
+    </article>
+    <article class="card accent-gen">
+      <p class="card-eyebrow teal">Busiest month</p>
+      <p class="card-num"><span id="yr-best">--</span></p>
+      <p class="card-sub"><span id="yr-best-kwh">0.0</span> kWh drawn</p>
     </article>
   </section>
 
@@ -248,12 +327,12 @@
         <button class="btn-export" id="btn-export-month">Export CSV</button>
       </div>
     </div>
-    <p class="panel-sub" id="monthly-caption">Total kWh harvested each month</p>
+    <p class="panel-sub" id="monthly-caption">Energy drawn and harvested each month</p>
     <div class="chart-box"><canvas id="chart-monthly"></canvas></div>
 
     <table class="mtable" id="mtable">
       <thead>
-        <tr><th>Month</th><th>Harvested kWh</th><th>Used kWh</th><th>Days logged</th></tr>
+        <tr><th>Month</th><th>Used kWh</th><th>Harvested kWh</th><th>Days logged</th></tr>
       </thead>
       <tbody id="mtbody"></tbody>
     </table>
@@ -280,7 +359,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-<script src="app.js"></script>
+<script src="app.js?v=20260909-5aa47a"></script>
 
 <!-- ============================================================
      UI glue · lives here so app.js stays 100% untouched
@@ -309,15 +388,21 @@
     if (typeof chart === "undefined") return;
     const c = colors();
 
-    /* axes + legend */
+    /* axes + legend.
+       COLOURS ONLY. Sizes, families, weights and padding all come
+       from valueAxis()/timeAxis() in app.js, which is the single
+       place they are defined; setting a bare {size: 11} here used
+       to drop the family and weight and was half the reason the
+       usage chart looked different from the SoC chart. */
     const sc = chart.options.scales;
     sc.x.ticks = Object.assign(sc.x.ticks || {}, { color: c.dim });
     sc.y.ticks = Object.assign(sc.y.ticks || {}, { color: c.dim });
     sc.x.grid = Object.assign(sc.x.grid || {}, { color: c.grid });
     sc.y.grid = Object.assign(sc.y.grid || {}, { color: c.grid });
     if (sc.y.title) sc.y.title.color = c.dim;
+    if (sc.x.title) sc.x.title.color = c.dim;
     chart.options.plugins.legend.labels =
-      { color: c.dim, boxWidth: 14, boxHeight: 3, font: { size: 11 } };
+      { color: c.dim, boxWidth: 14, boxHeight: 3, font: legendFont() };
 
     if (chart.config.type === "line") {
       /* day view: split the single ± power series into
@@ -336,8 +421,21 @@
             tension: 0.35, pointRadius: 0, borderWidth: 2 },
         ];
       } else {
-        ds[0].borderColor = c.gen; ds[0].backgroundColor = c.gen + "2E";
-        if (ds[1]) { ds[1].borderColor = c.use; ds[1].backgroundColor = c.use + "2E"; }
+      // Colour by LABEL, never by index: the day chart now lists
+      // usage first and generation second, and an index-based rule
+      // would silently paint them the wrong colours.
+      //
+      // d.ownColor opts a dataset out entirely. The "On CEB" legend
+      // swatch carries the amber of the runtime shading, and without
+      // this it was being repainted the electricity-use blue -- a
+      // legend key that named one thing and showed the colour of
+      // another.
+      ds.forEach((d) => {
+        if (d.ownColor) return;
+        const isGen = /generation/i.test(d.label || "");
+        d.borderColor = isGen ? c.gen : c.use;
+        d.backgroundColor = (isGen ? c.gen : c.use) + "2E";
+      });
       }
       chart.options.plugins.legend.display = true;
       chart.options.interaction = { mode: "index", intersect: false };
@@ -353,7 +451,7 @@
   if (typeof chart !== "undefined") {
     const rawUpdate = chart.update.bind(chart);
     chart.update = function (mode) { styleChart(); rawUpdate(mode); };
-    Chart.defaults.font.family = "'JetBrains Mono', monospace";
+    Chart.defaults.font.family = FONT_MONO;   /* defined once, in app.js */
     styleChart(); rawUpdate("none");
   }
 

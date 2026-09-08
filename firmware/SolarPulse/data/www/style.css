@@ -2,7 +2,7 @@
    this page has to work when the internet is the thing that is down. */
 :root{
   --bg:#0B0E17; --paper:#131826; --line:#232B3E; --ink:#E9EEF8; --muted:#8A94AC;
-  --amber:#FFB020; --gen:#73BF69; --use:#57A6F2; --teal:#3DD6C3; --coral:#F2495C;
+  --amber:#FACC15; --gen:#A3E635; --use:#57A6F2; --teal:#3DD6C3; --coral:#F2495C;
 }
 *{margin:0;padding:0;box-sizing:border-box}
 body{
@@ -95,14 +95,14 @@ h1{font-size:1rem;letter-spacing:.18em;font-weight:700}
   content: ""; width: 7px; height: 7px; border-radius: 50%;
   background: var(--gen); flex: none;
 }
-.tonight.rainy { color: #FFC55C; }
+.tonight.rainy { color: #FACC15; }
 .tonight.rainy::before { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
 
 /* battery protection banner: warning amber, cutoff red */
 .protect {
   border-radius: 12px; padding: 11px 13px; margin-bottom: 12px;
   font-size: .82rem; line-height: 1.4;
-  border: 1px solid var(--amber); background: rgba(255,176,32,.10); color: #FFC55C;
+  border: 1px solid var(--amber); background: rgba(250,204,21,.10); color: #FACC15;
 }
 .protect b { color: var(--amber); }
 .protect.cut {

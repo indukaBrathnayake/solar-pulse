@@ -1,7 +1,8 @@
-# Wiring guide — SolarPulse v4
+# Wiring guide — SolarPulse v5
 
-Hardware: two source relays (LIVE only), one switched load relay, one
-travel-mode switch, one passive buzzer, and an optional PV meter.
+Hardware: **two** 30 A relay modules (source changeover + switched load),
+one travel-mode switch, one passive buzzer, one 0.96" I2C OLED, and an
+optional PV meter.
 
 > **Mains voltage kills.** The relay contacts carry 230 V. Do the AC side with
 > the main breaker off, inside an enclosure, with a licensed electrician if you
@@ -9,40 +10,46 @@ travel-mode switch, one passive buzzer, and an optional PV meter.
 
 ---
 
-## 0. READ THIS FIRST — the neutral relays are gone
+## 0. READ THIS FIRST — v5 uses ONE changeover relay for the source
 
-v4 reflects a hardware change: the two neutral-switching relays have been
-removed, so **only the LIVE conductor is switched** and the utility neutral and
-the inverter neutral are now permanently commoned at the load bus.
+v4 had two independent normally-open source relays (utility + solar) and
+relied on firmware never to close both. **v5 replaces them with a single
+SPDT changeover relay**, wired so the de-energised position feeds the
+inverter:
 
-Three consequences you must design around:
+```
+   COM -> load bus LIVE
+   NC  -> inverter / solar LIVE      (relay NOT triggered)
+   NO  -> CEB / utility LIVE         (relay triggered)
+```
 
-1. **"Both relays open" no longer isolates the load bus.** It removes live, but
-   neutral stays connected to both sources. Treat the load bus as live at all
-   times when working on it. Kill the upstream breaker, do not trust the relays.
+**This is a safety improvement, not just a simplification.** A changeover
+relay physically cannot bridge NC and NO — the armature must leave one
+contact before it reaches the other. Break-before-make is now enforced by
+the mechanism instead of by software.
 
-2. **Break-before-make is now the only separation between the two sources.**
-   With neutral commoned, if both live contacts were ever closed together you
-   would tie utility live to inverter live — a dead short across two sources,
-   through whichever has the lower impedance. The firmware makes this
-   structurally impossible (`setSourceRelays()` takes one source, so "both on"
-   cannot be expressed, and every change opens both for `RELAY_DEAD_TIME_MS`),
-   but firmware is not a safety barrier. **Fit a mechanical interlock.**
+Three consequences to design around:
 
-3. **Commoned neutrals can violate local wiring rules.** In a TN-C-S / PME
+1. **De-energised = solar, not isolated.** With the ESP unpowered or reset,
+   the load bus sits on the inverter. That is the correct failsafe (a reset
+   can never silently connect the grid), but the relay alone NEVER isolates
+   the load bus. **Kill the upstream breaker before working on it.**
+
+2. **`RELAY_DEAD_TIME_MS` is now a settle time, not an interlock.** It stops
+   the source flapping and gives the inverter a moment to take the load. It
+   is no longer what keeps the two sources apart.
+
+3. **The neutrals stay commoned** (unchanged from v4). In a TN-C-S / PME
    installation the utility neutral is bonded to earth at the origin. If your
-   inverter also bonds neutral to earth internally (many do when running
-   off-grid), commoning the neutrals creates a parallel neutral-earth path and
-   can put current on the earth conductor. Check whether your inverter bonds
-   N-E in inverter mode. If it does, you need either a 4-pole changeover that
-   switches neutral, or an inverter configured not to bond. **This is exactly
-   the situation the removed neutral relays were solving — get it confirmed by
-   a licensed electrician before energising.**
+   inverter also bonds N-E internally in off-grid mode, commoning creates a
+   parallel neutral-earth path. Check whether your inverter bonds N-E; if it
+   does you need a 4-pole changeover that switches neutral too. **Get this
+   confirmed by a licensed electrician before energising.**
 
-The firmware is correct for live-only switching either way; item 3 is an
-installation question, not a software one.
-
----
+`RELAY_SOLAR_PIN` is therefore `-1` in `config.h`. If you ever go back to two
+independent NO relays, set it to a real pin and the old two-relay interlock
+returns unchanged — `setSourceRelays()` still takes one source and cannot
+express "both on".
 
 ## 1. Does one GPIO have enough drive for a relay?
 
@@ -63,10 +70,11 @@ The pin only has to light an optocoupler LED: **about 3 mA at 3.3 V**, well
 inside spec. The coil current comes from the 5 V rail, never from the ESP.
 
 The number of *poles* changes nothing on the control side — one coil, one
-signal, however many contact sets it throws. Since v4 only the LIVE pole is
-used on each source relay (§0), so a single-pole module is now sufficient:
+signal, however many contact sets it throws. v5 uses a changeover (SPDT)
+contact set on LIVE for the source, and a plain NO contact for the switched
+load:
 
-**One GPIO per relay. One pole per relay. Two pins for two sources.**
+**One GPIO per relay. Two relays total: source changeover + switched load.**
 
 Two conditions:
 
@@ -86,13 +94,17 @@ Two conditions:
 
 | Function | Default pin | Notes |
 |---|---|---|
-| Utility (CEB) relay — LIVE only | `GPIO 25` | `RELAY_UTILITY_PIN` |
-| Solar / inverter relay — LIVE only | `GPIO 26` | `RELAY_SOLAR_PIN` |
+| **Source changeover relay** | **`GPIO 25`** | `RELAY_UTILITY_PIN`. Coil OFF = solar (NC), ON = CEB (NO) |
+| Separate solar relay | *(none)* | `RELAY_SOLAR_PIN = -1` — see §0 |
 | Switched load relay | `GPIO 27` | `RELAY_LOAD_PIN`, set `-1` if unused |
 | Travel-mode switch | `GPIO 32` | `TRAVEL_SWITCH_PIN`, see below |
-| **Passive buzzer** | **`GPIO 33`** | **`BUZZER_PIN`, LEDC ch 0, see §5** |
+| Passive buzzer | `GPIO 33` | `BUZZER_PIN`, LEDC ch 0, see §5 |
+| **OLED SDA** | **`GPIO 21`** | `OLED_SDA_PIN`, I2C, see §5b |
+| **OLED SCL** | **`GPIO 22`** | `OLED_SCL_PIN`, I2C, see §5b |
 | PV voltage sense (optional) | `GPIO 34` | ADC1, input-only |
 | PV current sense (optional) | `GPIO 35` | ADC1, input-only |
+
+GPIO 26 is now free (it was the old solar relay).
 
 Nothing on the BLE/BMS side changed. The BMS is Bluetooth only — no wires.
 
@@ -132,34 +144,35 @@ pull-up**, so those need an external 10 kΩ resistor to 3V3.
 
 ## 3. Relay wiring, AC side
 
-Only one source may be connected to the load bus at a time. **Live only** now —
-the neutrals are commoned (see §0):
+One SPDT changeover on the LIVE conductor. The neutrals are commoned
+(see §0):
 
 ```
-                        ┌──────── UTILITY RELAY (GPIO 25) ────────┐
-   CEB Live  ───────────┤ COM ──────────────── NO ├───────────────┼───┐
-                        └─────────────────────────────────────────┘   │
-                                                                      │
-                        ┌──────── SOLAR RELAY (GPIO 26) ──────────┐   │
-   Inverter Live ───────┤ COM ──────────────── NO ├───────────────┼───┤
-                        └─────────────────────────────────────────┘   │
-                                                                      │
-                                            LOAD BUS  Live  ──────────┘
+                 ┌─────── SOURCE CHANGEOVER RELAY (GPIO 25) ───────┐
+   Inverter L ───┤ NC                                              │
+                 │        COM ├──────────────► LOAD BUS  Live      │
+   CEB / grid L ─┤ NO                                              │
+                 └─────────────────────────────────────────────────┘
+                    coil OFF → COM-NC → SOLAR      (failsafe / reset)
+                    coil ON  → COM-NO → CEB
 
    CEB Neutral ──────┬───────────────────────────── LOAD BUS Neutral
    Inverter Neutral ─┘        (commoned, never switched — see §0.3)
 ```
 
-- Use the **NO** (normally open) contacts. With the ESP32 unpowered both relays
-  are open and the load bus has no live — but it still has neutral.
-- **Fit a mechanical interlock.** With neutral commoned, both live contacts
-  closed together is a source-to-source short, not merely a backfeed. Two
-  interlocked contactors, or a single changeover contactor, make that
-  impossible in hardware. Firmware exclusivity is a convenience, not a barrier.
+- **Inverter on NC, grid on NO.** Getting these the wrong way round means a
+  reset or a power cut connects the grid instead of the inverter. Verify with
+  a meter, coil unpowered, before energising anything.
+- With the ESP32 unpowered the load bus is on the **inverter** and still has
+  neutral. It is never isolated by this relay. Kill the breaker.
+- A changeover cannot bridge NC and NO, so utility and inverter can never be
+  paralleled by a firmware fault. This is why v5 is safer than v4's two
+  independent relays. A mechanically interlocked contactor pair is an equally
+  good choice if you prefer separate devices.
 - Earth is never switched. Bond it straight through.
-- Size the contacts for the real load. The 10 A printed on a cheap blue module
-  is a resistive rating at best; derate hard for motors and pumps, or use the
-  module to drive a proper contactor.
+- Size the contacts for the real load. The 30 A on the module is a resistive
+  rating at best; derate hard for motors and pumps, or use the module to
+  drive a proper contactor.
 
 ### Switched load relay
 
@@ -247,6 +260,146 @@ Set `BUZZER_PIN` to `-1` to build without a buzzer.
 
 ---
 
+## 5b. 0.96" OLED (SSD1306, I2C)
+
+### What it shows (v8, layout v2)
+
+Driven by **U8g2 in full-buffer mode**. Layout v2 removed the chrome:
+there is **no outer border, no box around the power row and no
+vertical divider** beside the arrow lane. What is left is one short
+44 px rule.
+
+```
+  +--------------------------------------+
+  |                            |         |  y 0
+  |                            |         |
+  |          8 8 %             |  ARROW  |  TOP AREA
+  |                            |  LANE   |  x 0..109
+  |                            |         |  y 0..49
+  |____________                |         |  rule y=51, 44 px wide
+  |   124 W                    |         |  POWER ROW y 52..63
+  +--------------------------------------+  y 63
+```
+
+The lane (x 112..127) is **reserved, not drawn** — nothing is ever
+written into it and no line marks its edge. Top-area content is
+centred inside 110 px, not inside the full 128, so it does not sit
+visibly right of centre under the arrows.
+
+| Screen | Time | Top-area content |
+|---|---|---|
+| Battery | 10 s | the percentage, `logisoso38_tn` + `profont17_mr` `%`, both on baseline 44 |
+| Source | 2 s | one word, `fub20_tf`: `CEB` or `Pack` |
+| Weather | 4 s | 28×28 icon + condition, **06:00–13:59** |
+| ETA | 3 s | time to empty, or clock time of full |
+| Tomorrow | 4 s | 24×24 icon + outlook, **18:00–23:59** |
+
+Rotation and all five timings are unchanged from v8. SoC appears
+twice per cycle in every window.
+
+### The SoC screen
+
+Digits and the percent sign are measured at runtime and centred as
+**one block**, both on baseline 44. At 38 px ascent that puts the
+glyph top at row 6 and leaves 7 px above the rule.
+
+`100` at `logisoso38_tn` measures 72 + 3 + 9 = **84 px inside a
+110 px area**, so it fits comfortably; the `logisoso32_tn` fallback
+is a guard that triggers only if the area is ever narrowed, not a
+routine path. A stale BMS shows `-- %`, never a number.
+
+### The power row
+
+**Wattage only** — no `LOAD`, no `PV`, no `IDLE`, no label of any
+kind. The arrow already carries the direction, so the word was the
+same fact twice and it cost the number its room. Left aligned at
+x = 2, baseline 62, `profont12_tf`, whole numbers, **rounded not
+truncated** (184.73 W reads `185 W`). Under `OLED_IDLE_W` it reads
+`0 W`; a stale BMS reads `-- W`.
+
+### The arrow lane — unchanged
+
+Two arrows 32 px apart, 3 px per frame every 50 ms, wrapping modulo
+64, travelling the full 64 px. **Up** while drawing from the pack,
+**down** while harvesting. Reversal resets the phase once and flips
+the glyph.
+
+### Fonts
+
+| Use | Font |
+|---|---|
+| SoC digits | `u8g2_font_logisoso38_tn` (fallback `logisoso32_tn`) |
+| Percent | `u8g2_font_profont17_mr` |
+| Source / ETA line 1 | `u8g2_font_fub20_tf` |
+| Weather, ETA line 2, power row | `u8g2_font_profont12_tf` |
+| `TOMORROW` label, long outlook words | `u8g2_font_profont10_tf` |
+
+---
+
+## 5c. Lighting circuit modes
+
+The lights are the **switched load relay** (`RELAY_LOAD_PIN`), and
+`travelTask()` remains its only writer — the modes below are inputs
+to that one function, not a second controller for the same GPIO.
+
+Precedence, highest first:
+
+| # | Rule | Source |
+|---|---|---|
+| 1 | `loadCutoff` — battery protection at `SOC_LOAD_CUTOFF` (35%) | existing |
+| 2 | lights low-battery lockout at `LIGHTS_CUTOFF_SOC` (25%), latched, re-arms +5% | new |
+| 3 | travel mode switch and its schedule | existing |
+| 4 | `ON` / `OFF` from the dashboard | new |
+| 5 | `AUTO` — sunset to `LIGHTS_OFF_HOUR` (23:00) | new |
+
+**AUTO** takes sunset from the daily forecast section 8k already
+fetches — one extra field on a response that was being parsed
+anyway, no new request and no new service. With no cached sunset it
+falls back to `LIGHTS_FALLBACK_ON_HOUR` (18:30), so the lights still
+work with the internet down.
+
+> **Note.** On this build the lights share the protected load relay,
+> and that relay already opens at 35%. So the 25% lights cutoff is a
+> **backstop** — it only becomes the operative rule if
+> `SOC_LOAD_CUTOFF` is lowered below it, or if the lights are moved
+> to their own relay. Raise `LIGHTS_CUTOFF_SOC` above 35% to shed
+> lighting *before* the rest of the load circuit.
+
+The ON/OFF/AUTO buttons live on the **on-device** dashboard, which is
+the only page with a route to the relay. The cloud dashboard reads
+Firebase and cannot reach the ESP, so it reports the mode, the
+reason and the daily runtime instead.
+
+```
+   ESP32 3V3 ──── VCC
+   ESP32 GND ──── GND
+   GPIO 21   ──── SDA
+   GPIO 22   ──── SCL
+```
+
+- **Address:** `0x3C` (most 0.96" panels). A few are `0x3D` — change
+  `OLED_ADDR` in `config.h` if `begin()` reports "not found" at boot.
+- **Pull-ups:** nearly every SSD1306 breakout has 4.7 kΩ pull-ups on board,
+  so you do not need to add any. If you daisy-chain several I2C devices,
+  remove the duplicates.
+- **Why 21/22:** they are the ESP32's default I2C pair and the only fully
+  unencumbered pins left here — not strapping pins, not bonded to the SPI
+  flash, not ADC2 (which WiFi disables), and nothing else in this project
+  uses them.
+- **3.3 V only.** Do not feed the module 5 V; the SSD1306 logic is 3.3 V.
+- Keep the wires short (< 20 cm) at the 400 kHz default, or drop
+  `OLED_I2C_HZ` to 100000.
+
+**It is entirely optional.** If the panel is missing, unplugged, or fails to
+initialise, the firmware logs it once, sets `oledOk = false`, and every later
+display call becomes a no-op. The controller, relays, BLE link and watchdog
+are unaffected. Set `OLED_ENABLE 0` to compile it out completely.
+
+The display also never shows a stale number: if the BMS link goes quiet it
+prints `--%` and "BMS link lost" rather than a value that is no longer true.
+
+---
+
 ## 6. Optional PV meter
 
 The rig has no PV-side sensor today, so "harvested" is measured at the battery:
@@ -284,14 +437,25 @@ being able to switch to utility.
 
 ## 8. Bring-up checklist
 
-1. Flash the firmware with `RELAY_ACTIVE_LOW` set for your board, **relay board
-   not connected to mains**. Confirm from the serial log that both relays read
-   as open at boot.
-2. Connect only the relay board's logic and 5 V. Watch it click through a
-   changeover — you should hear one relay drop, a pause, then the other pull in.
-   Never both at once.
-3. Measure continuity across both sets of contacts to confirm the dead time is
-   real before anything is energised.
-4. Only then wire the AC side.
-5. Toggle the travel switch and check the serial log prints
-   `[travel] ON` / `[travel] OFF`.
+Do these in order, **with the AC side disconnected** until step 6.
+
+1. Flash the firmware with `RELAY_ACTIVE_LOW` set for your board. Confirm the
+   serial log reaches `I: setup complete` with no `#error`.
+2. **Verify the changeover direction with a meter, coil unpowered.** COM must
+   read continuous to NC (inverter side). If it reads continuous to NO, your
+   NC/NO are swapped and a reset would connect the grid — rewire before going
+   further. This is the single most important check in this document.
+3. Connect only the relay board's logic and its separate 5 V. Force a source
+   change from the local UI (Force CEB / Force solar) and listen: one clean
+   click per change, with the `RELAY_DEAD_TIME_MS` pause between states.
+4. Check the OLED shows a live SoC. Unplug it while running — the controller
+   must carry on unaffected and the serial log must not report a watchdog.
+5. Toggle the travel switch and confirm `[travel] ON` / `[travel] OFF`.
+6. Only now wire the AC side, per §3.
+7. With mains live, watch one real handover in the serial log:
+   `[ceb] ON  soc=..` then later `[ceb] OFF soc=.. ...`. Confirm the house
+   does not lose power for longer than the dead time.
+
+To exercise the CEB logic without waiting for a flat battery, temporarily
+raise `SOC_CEB_ON` in `config.h` to just under the current SoC, reflash, and
+watch it engage — then put it back to 18.

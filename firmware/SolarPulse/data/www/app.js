@@ -39,7 +39,9 @@ async function poll() {
   $("socBar").style.width = Math.max(0, Math.min(100, d.soc || 0)) + "%";
   $("packVI").textContent = `${n(d.v, 2)} V · ${n(d.i, 2)} A`;
   $("pvSub").textContent  = d.pvW > 5 ? "array producing" : "no production";
-  $("loadSub").textContent = d.src === "utility" ? "fed from the grid" : "fed from the pack";
+  // Authoritative committed relay state, same key the OLED uses.
+  $("loadSub").textContent = d.house === "CEB" ? "fed from the grid"
+                           : d.house === "Pack" ? "fed from the pack" : "source unknown";
   $("utilMin").textContent = d.utilMin ?? 0;
 
   $("today").textContent = n((d.harvestWh || 0) / 1000, 2);
@@ -51,24 +53,47 @@ async function poll() {
   setRelay("relay-light", d.light,  false);
   $("why").textContent = (d.manual ? "manual · " : "automatic · ") + (d.why || "");
   $("travel").textContent = d.travel ? "CLOSED — travel mode" : "open — normal";
-
-  // Tonight's plan, decided by the 18:15 target check. Firmware that
-  // predates these keys omits them, so hide the line rather than lie.
+  // CEB handover plan. Firmware that predates these keys omits
+  // them, so hide the line rather than lie.
   const tn = $("tonight");
-  if (d.nightFloor == null) {
+  if (d.ceb == null) {
     tn.classList.add("hidden");
   } else {
     tn.classList.remove("hidden");
-    tn.classList.toggle("rainy", !!d.rainy);
-    tn.innerHTML = d.rainy
-      ? `Tonight: 99% target <b>missed</b> — pack may run down to <b>${d.nightFloor}%</b> before CEB.`
-      : `Tonight: target reached — pack held above <b>${d.nightFloor}%</b>.`;
+    const heavy = d.wx === "heavy";
+    tn.classList.toggle("rainy", heavy);
+    // Two signals, in the order the firmware ranks them: the online
+    // forecast while it still carries confidence (fcConf > 0), then
+    // the measured expected-solar label, then the coarse class. The
+    // OLED renders the same fields in the same order, so the two
+    // displays cannot disagree.
+    const fcOk = (d.fcConf || 0) > 0 && d.fcText && d.fcText !== "UNKNOWN";
+    const wxTxt = fcOk
+                ? "forecast " + d.fcText.toLowerCase()
+                : d.wxText && d.wxText !== "UNKNOWN"
+                ? "expecting " + d.wxText.toLowerCase()
+                : (d.wx === "clear" ? "expecting a good solar day"
+                :  heavy            ? "expecting a low-solar day"
+                :  d.wx === "half"  ? "expecting a mixed solar day"
+                :  "not enough evidence to expect anything yet");
+    const pv = d.pvVerdict === "good" ? " · measured PV confirms it"
+             : d.pvVerdict === "poor" ? " · measured PV says worse"
+             : "";
+    // d.house is the authoritative committed relay state.
+    tn.innerHTML = (d.house === "CEB")
+      ? `<b>CEB</b> carrying the house · ${wxTxt}${pv} · hands back at <b>${d.cebRel}</b> if the pack allows.`
+      : `On <b>Pack</b> · ${wxTxt}${pv} · CEB engages at <b>${d.cebOn}%</b>.`;
   }
 
   // Battery protection banner. Load cutoff is the loudest thing the
   // controller can do, so it gets its own always-visible strip.
   const prot = $("protect");
-  if (d.cutoff) {
+  if (d.emerg) {
+    prot.classList.remove("hidden");
+    prot.classList.add("cut");
+    prot.innerHTML = `<b>EMERGENCY</b> — pack at ${n(d.soc)}% and still supplying the ` +
+                     `house. Turn the inverter off.`;
+  } else if (d.cutoff) {
     prot.classList.remove("hidden");
     prot.classList.add("cut");
     prot.innerHTML = `<b>Load disconnected</b> — pack at ${n(d.soc)}%, ` +
@@ -93,8 +118,27 @@ async function poll() {
     const want = d.manual ? d.src : "auto";
     b.classList.toggle("sel", b.dataset.src === want);
   });
+  // The mode, not the output state: with AUTO selected the lamp may
+  // be off simply because it is daytime, and highlighting "Lights
+  // off" then would misreport what the controller was told.
+  const lm = d.lightMode || (d.light ? "on" : "off");
   document.querySelectorAll("[data-light]").forEach((b) =>
-    b.classList.toggle("sel", (b.dataset.light === "1") === !!d.light));
+    b.classList.toggle("sel", b.dataset.light === lm));
+
+  const lw = $("lightWhy");
+  if (lw) {
+    if (d.lightsLow) {
+      lw.textContent = "lights off · low battery";
+    } else if (lm === "auto") {
+      lw.textContent = `lights auto · on at ${d.lightOn ?? "--:--"}` +
+        `${d.lightSunset === false ? " (no sunset cached)" : ""}` +
+        ` · off at ${d.lightOff ?? "--:--"}` +
+        (d.lightMin != null ? ` · ${d.lightMin} min today` : "");
+    } else {
+      lw.textContent = `lights forced ${lm}` +
+        (d.lightMin != null ? ` · ${d.lightMin} min today` : "");
+    }
+  }
 }
 
 function setRelay(id, on, warn) {

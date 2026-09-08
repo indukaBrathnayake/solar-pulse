@@ -28,6 +28,213 @@
  * ---------------------------------------------------------- */
 enum Source : uint8_t { SRC_NONE = 0, SRC_SOLAR = 1, SRC_UTILITY = 2 };
 
+/* Weather classification for the CEB recovery strategy (section 8d).
+ * Lives here, not in the .ino, for the same prototype reason as Source. */
+enum WeatherClass : uint8_t {
+  WX_UNKNOWN = 0,   /* no usable forecast -> conservative fallback     */
+  WX_CLEAR,         /* low cloud, little rain: expect a good solar day */
+  WX_HALF,          /* mixed: expect a usable but reduced solar day    */
+  WX_HEAVY          /* wet / heavily overcast: expect poor generation  */
+};
+
+/* EXPECTED-SOLAR icon for the OLED and the dashboard.
+ *
+ * v7: these are NOT meteorological observations. The online
+ * forecast has been removed (it called clear days "rainy"), and
+ * every one of these labels now comes from the ESP32's own
+ * measured PV history -- see section 8f. Both the OLED and the
+ * web UI read this same enum from the same firmware field, so
+ * they cannot disagree.
+ *
+ * Deliberately only four states. There is no honest way to tell
+ * fog from drizzle from a thunderstorm using a battery ammeter,
+ * so the old WMO icons (FOG/RAIN/HEAVY_RAIN/STORM) are gone
+ * rather than being faked from generation data. */
+enum WxIcon : uint8_t {
+  WI_UNKNOWN = 0,   /* not enough history yet                     */
+  WI_SUNNY,         /* strong generation expected                 */
+  WI_PARTLY,        /* good but reduced generation expected       */
+  WI_CLOUDY,        /* weak generation expected                   */
+  WI_LOWSUN         /* very poor generation expected              */
+};
+
+/* One finished day of measured PV evidence. PV_HIST_DAYS of these
+ * live in NVS (6 bytes each) and are the ONLY input to tomorrow's
+ * expectation. Replaces the deleted forecast cache. */
+struct PvDay {
+  int32_t stamp;        /* YYYYMMDD, 0 = empty slot                */
+  uint8_t mins;         /* minutes >= PV_GOOD_W in the window      */
+  uint8_t score;        /* 0..100 derived strength, see 8f         */
+  uint16_t wh;          /* harvestWhToday() at rollover, see 8m    */
+};
+
+/* One learned forecast-bias entry, one per WxCond. See section 8m.
+ * f1000 is the correction factor x1000, so 1000 means "the label's
+ * nominal factor was exactly right". */
+struct WxBias {
+  uint16_t f1000;
+  uint8_t  n;           /* observations folded in so far           */
+};
+
+/* METEOROLOGICAL condition from the online forecast (section 8k).
+ *
+ * Distinct from WxIcon on purpose. WxIcon is what the ESP32's own
+ * ammeter EXPECTS the array to do; WxCond is what a weather service
+ * SAYS the sky will do. They are different claims from different
+ * evidence, they are stored separately, and the dashboard reports
+ * whether they agree -- which is the whole point of section 8k.
+ *
+ * Lives here, not in the .ino, for the same prototype reason as
+ * Source: the Arduino builder inserts prototypes after the last
+ * #include, so any type named in a top-level signature must already
+ * be visible from config.h. */
+enum WxCond : uint8_t {
+  WC_UNKNOWN = 0,
+  WC_SUNNY,             /* clear / mainly clear                    */
+  WC_PARTLY,            /* partly cloudy                           */
+  WC_CLOUDY,            /* overcast                                */
+  WC_FOG,
+  WC_RAIN,
+  WC_HEAVYRAIN,
+  WC_STORM
+};
+
+/* One cached forecast day. 7 of these is the whole cache: 56 bytes,
+ * one NVS blob, indexed BY DATE so a reboot or a missed refresh
+ * cannot silently apply Tuesday's forecast to Thursday. */
+struct WxDay {
+  int32_t stamp;        /* YYYYMMDD, 0 = empty slot                */
+  uint8_t cond;         /* WxCond                                  */
+  uint8_t cloud;        /* mean cloud cover, %                     */
+  int16_t precip10;     /* precipitation, tenths of a mm           */
+  uint16_t sunsetMin;   /* local sunset, minutes past midnight,
+                           0 = not supplied. Section 8n.           */
+};
+
+/* Lights control mode (section 8n). AUTO is the default and the
+ * only mode that looks at the clock. Lives here for the prototype
+ * reason described above Source. */
+enum LightMode : uint8_t {
+  LIGHT_AUTO = 0,
+  LIGHT_ON,
+  LIGHT_OFF
+};
+
+/* Debounce / persistence helper for the source state machine.
+ *
+ * Nothing in section 12 may act on an instantaneous reading. Every
+ * engage and release condition is fed through one of these, and
+ * hold() only returns true once the condition has been continuously
+ * true for the requested time. A single stray sample resets it.
+ *
+ * Lives here rather than the .ino for the same prototype reason as
+ * Source above. */
+struct Persist {
+  bool     armed = false;
+  uint32_t since = 0;
+
+  /* now must be a millis() value supplied by the caller so the whole
+   * control tick judges every condition against one timestamp. */
+  bool hold(bool cond, uint32_t ms, uint32_t now) {
+    if (!cond) { armed = false; return false; }
+    if (!armed) { armed = true; since = now; return false; }
+    return (uint32_t)(now - since) >= ms;
+  }
+  uint32_t heldMs(uint32_t now) const { return armed ? (uint32_t)(now - since) : 0; }
+  void reset() { armed = false; }
+};
+
+/* Result of the tomorrow-outlook model (section 11d) and of the
+ * battery ETA (section 11e). Both are named in top-level function
+ * signatures, so like Source and OledScreen they have to be visible
+ * from config.h -- the Arduino builder emits its prototypes right
+ * after the last #include, before anything declared in the .ino. */
+struct PredOut {
+  bool    ok;        /* is there anything worth showing at all   */
+  bool    learning;  /* history too thin for a confidence verdict */
+  bool    starred;   /* label ignored (stale/offline)             */
+  uint8_t cond;      /* WxCond                                    */
+  float   baseWh;    /* historical median daily harvest           */
+  float   predWh;    /* corrected estimate for tomorrow           */
+  int     pct;       /* predWh / baseWh, percent                  */
+};
+
+enum EtaKind : uint8_t {
+  ETA_NONE = 0,      /* no usable flow or no validated SoC        */
+  ETA_EMPTY,         /* discharging: time to the CEB floor        */
+  ETA_FULL,          /* charging: clock time of full              */
+  ETA_FULL_NOW       /* charging and already at ETA_FULL_SOC      */
+};
+
+struct EtaOut {
+  EtaKind kind;
+  float   hours;
+  int     hh, mm;    /* clock time of full, when kind == ETA_FULL */
+};
+
+/* OLED top-content screens. Lives here, not in the .ino, for the
+ * same prototype reason as Source: the Arduino builder inserts its
+ * generated prototypes immediately after the last #include, so any
+ * type named in a top-level function signature has to be visible
+ * from config.h or the prototype will not compile. */
+enum OledScreen : uint8_t {
+  OS_SOC = 0,       /* battery percentage, the dominant screen */
+  OS_SRC,           /* CEB / Pack                              */
+  OS_WX,            /* weather, 06:00-14:00 only               */
+  OS_ETA,           /* time to empty / time to full            */
+  OS_TOM,           /* tomorrow's outlook, 18:00-23:59 only    */
+  OS__COUNT
+};
+
+/* Startup phase of the source controller. See section 8j. */
+enum SrcPhase : uint8_t {
+  SRCP_WAIT = 0,    /* booting: relays safe, no command issued yet  */
+  SRCP_RUN          /* data good enough to decide, machine live     */
+};
+
+/* BLE link lifecycle. Used by bleTask() and reported to the UI. */
+enum BleState : uint8_t {
+  BLE_OFF = 0,      /* stack not started yet                        */
+  BLE_IDLE,         /* waiting out the reconnect backoff            */
+  BLE_CONNECTING,   /* ACL connect in progress                      */
+  BLE_DISCOVER,     /* connected, walking the GATT table            */
+  BLE_WAIT_DATA,    /* subscribed, wake frames sent, no data yet    */
+  BLE_STREAMING     /* frames arriving within BMS_FRAME_TIMEOUT_MS  */
+};
+
+/* Audible battery alarm. Used by buzzerSet() / buzzerTask(). */
+enum BuzzTone : uint8_t {
+  BUZZ_SILENT = 0,  /* SoC healthy                                  */
+  BUZZ_WARN,        /* SoC <= SOC_BUZZER_WARN, shutdown approaching */
+  BUZZ_ALARM,       /* SoC <= SOC_LOAD_CUTOFF, load disconnected    */
+  BUZZ_EMERG        /* SoC <= SOC_EMERGENCY while ON PACK: the
+                     * inverter is draining a nearly flat pack,
+                     * e.g. a CEB cut at midnight. Distinct pattern. */
+};
+
+/* One BMS telemetry snapshot. Written only by the NimBLE notify
+ * callback, read everywhere else through bmsGet(). */
+struct BmsData {
+  float cell[4]       = {0};
+  float packV         = 0;
+  float packI         = 0;       /* + charging, - discharging      */
+  float packW         = 0;
+  float t1 = 0, t2 = 0, mosT = 0;
+  float balI          = 0;
+  uint8_t soc         = 0;
+  float remainAh      = 0;
+  float fullAh        = 0;
+  uint32_t cycles     = 0;
+  uint8_t soh         = 0;
+  uint32_t errBits    = 0;
+  bool chgMos = false, disMos = false, balancing = false;
+  uint32_t lastFrameMs = 0;      /* millis() of the last good frame */
+  uint32_t frameCount  = 0;      /* good frames since boot          */
+};
+
+/* One step of a buzzer melody. freq 0 = rest, ms 0 = end of melody. */
+struct Note { uint16_t freq; uint16_t ms; };
+
 /* ------------------------------------------------------------
  *  1. NETWORK / CLOUD
  * ---------------------------------------------------------- */
@@ -60,14 +267,84 @@ enum Source : uint8_t { SRC_NONE = 0, SRC_SOLAR = 1, SRC_UTILITY = 2 };
 
 /* ------------------------------------------------------------
  *  3. TIMERS (all milliseconds, all non-blocking)
+ *
+ *  LIVE_PUSH_MS is the end-to-end dashboard cadence. Sub-10 s is
+ *  only affordable because netTask holds ONE TLS session open and
+ *  reuses it (see fbRequest): a fresh handshake per push costs
+ *  ~1.5 s and ~40 kB of heap, which is what made the old 15 s
+ *  interval the practical floor.
+ *
+ *  5 s rather than 3 s: 3 s bought no visible responsiveness (the
+ *  BMS itself only notifies about once a second and the dashboard
+ *  tweens between samples anyway) while costing 67% more Firebase
+ *  writes and more TLS airtime. 5 s is the better trade.
  * ---------------------------------------------------------- */
-#define LIVE_PUSH_MS      15000UL    /* /live snapshot to Firebase      */
-#define HISTORY_PUSH_MS   60000UL    /* one history sample per minute   */
-#define DAILY_PUSH_MS    300000UL    /* /daily row refresh              */
+#define LIVE_PUSH_MS       5000UL    /* /live snapshot to Firebase      */
+#define CONTROL_TICK_MS     250UL    /* relay + buzzer + energy tick    */
+#define DAILY_PUSH_MS     60000UL    /* /daily row refresh              */
 #define OFFLINE_LOG_MS    60000UL    /* flash log interval (see below)  */
 #define NVS_SAVE_MS      300000UL    /* counter save to NVS             */
-#define WIFI_RETRY_MS     20000UL    /* WiFi reconnect attempt spacing  */
+/* WiFi recovery. A brief blip should heal in seconds, but a real
+ * outage (router down, power cut at the ISP) must not spin the
+ * radio every 20 s for hours: that wastes power, floods the log
+ * and steals 2.4 GHz airtime from the BMS link.
+ *
+ * So the retry interval BACKS OFF from WIFI_RETRY_MS to
+ * WIFI_RETRY_MAX_MS (15 min, the requested recovery cadence) and
+ * stays there until the link returns. Nothing blocks: netTask
+ * keeps looping, and the controller never waits on WiFi at all. */
+#define WIFI_RETRY_MS     20000UL    /* first retry after a drop        */
+#define WIFI_RETRY_MAX_MS 900000UL   /* 15 min ceiling, sustained outage */
 #define UPLOAD_TRY_MS     10000UL    /* backlog upload attempt spacing  */
+
+/* Reopen the TLS session if it has been idle this long; Firebase
+ * closes idle keep-alive sockets and a stale one wastes a push. */
+#define TLS_IDLE_MAX_MS   45000UL
+/* Below this free heap the persistent TLS session is torn down. */
+#define HEAP_TLS_FLOOR    50000UL
+
+/* ------------------------------------------------------------
+ *  3b. BLE LINK SUPERVISION
+ *
+ *  The failure this fixes: the ACL link can stay up while the BMS
+ *  stops sending notifications. The old firmware only reconnected
+ *  when the stack reported a disconnect, so a silent BMS meant a
+ *  live-but-dead link that never recovered without a power cycle.
+ *  bleTask() now treats "no frame for BMS_FRAME_TIMEOUT_MS" as a
+ *  link failure and tears the connection down itself.
+ *
+ *  WHY THE BMS BUZZER USED TO CHIRP (v4.0 regression, fixed in v4.1)
+ *
+ *  The JK BMS chirps its own buzzer every time it accepts a command
+ *  write on 0xFFE1. v4.0 "kept the stream flowing" by re-sending
+ *  CMD_CELL_INFO on a blind timer, so a perfectly healthy link
+ *  produced a chirp on every single tick, forever.
+ *
+ *  That request was never needed. Once you subscribe to notifications
+ *  on 0xFFE1 the BMS pushes cell-info frames on its own (~1/s). The
+ *  request is a one-shot primer at connect time, not a heartbeat.
+ *
+ *  So: send nothing while frames are arriving. Only if the stream
+ *  actually goes quiet for BMS_NUDGE_AFTER_MS do we re-prime it, at
+ *  most once per that interval. Healthy link = zero writes = silence.
+ * ---------------------------------------------------------- */
+#define BMS_FRAME_TIMEOUT_MS  20000UL /* no frame this long = link dead */
+#define BMS_NUDGE_AFTER_MS     6000UL /* stream quiet this long -> one re-prime */
+#define BMS_HANDSHAKE_MS      12000UL /* subscribe -> first frame limit */
+#define BLE_BACKOFF_MIN_MS     3000UL /* first reconnect delay          */
+#define BLE_BACKOFF_MAX_MS    60000UL /* backoff ceiling                */
+#define BLE_CONNECT_TIMEOUT_S      8  /* NimBLE ACL connect timeout     */
+
+/* A session must stream cleanly for this long before its reconnect
+ * backoff is forgiven. Without this a link that connects, delivers
+ * one frame and drops resets the backoff every cycle and thrashes
+ * at BLE_BACKOFF_MIN_MS forever -- which is a connect (and a chirp)
+ * every 3 s. See bleTask()/BLE_STREAMING. */
+#define BLE_STABLE_AFTER_MS   60000UL
+
+/* Watchdog: any task that stops feeding for this long reboots the
+ * board. Last-resort recovery only; nothing should ever trip it. */
+#define WDT_TIMEOUT_S             30
 
 /* ------------------------------------------------------------
  *  4. FLASH LOGGING / OFFLINE QUEUE
@@ -89,9 +366,6 @@ enum Source : uint8_t { SRC_NONE = 0, SRC_SOLAR = 1, SRC_UTILITY = 2 };
 
 #define LOCAL_HISTORY_DAYS   3       /* per-minute CSVs kept on flash   */
 #define DAILY_LOG_DAYS     400       /* daily totals kept (>12 months)  */
-
-/* Legacy cap kept for compatibility with the old buffer code. */
-#define BUFFER_MAX_LINES  3000
 
 /* ------------------------------------------------------------
  *  5. ENERGY ACCOUNTING
@@ -117,85 +391,817 @@ enum Source : uint8_t { SRC_NONE = 0, SRC_SOLAR = 1, SRC_UTILITY = 2 };
 #define PV_VOLT_DIVIDER    11.0f     /* (R1+R2)/R2 of the divider       */
 #define PV_CURR_MV_PER_A   66.0f     /* ACS712-30A = 66 mV/A            */
 #define PV_CURR_ZERO_MV    1650.0f   /* sensor output at 0 A            */
-#define PV_ADC_REF_MV      3300.0f
+/* No ADC reference constant is needed: analogReadMilliVolts() already
+ * applies the per-chip eFuse calibration and returns millivolts. */
 
 /* ------------------------------------------------------------
- *  7. RELAY OUTPUTS
+ *  7. RELAY OUTPUTS  -- SPDT CHANGEOVER, LIVE ONLY
  *
- *  Two source relays, one GPIO each. Each relay carries both
- *  Live and Neutral on its own two poles; a relay module input
- *  draws well under 5 mA from the GPIO, so one pin per relay is
- *  correct and safe. See WIRING.md.
+ *  HARDWARE (v5): two 30 A relay modules, not three.
+ *
+ *    Relay 1  SOURCE changeover   -> RELAY_UTILITY_PIN
+ *    Relay 2  switched load       -> RELAY_LOAD_PIN
+ *
+ *  The source relay is wired as a CHANGEOVER on the LIVE
+ *  conductor, with the load on the normally-off (de-energised)
+ *  side going to the inverter:
+ *
+ *      COM -> load bus LIVE
+ *      NC  -> inverter / solar LIVE     (relay NOT triggered)
+ *      NO  -> CEB / utility  LIVE       (relay triggered)
+ *
+ *  So: coil off = solar feeds the house, coil on = CEB feeds it.
+ *
+ *  WHY THIS IS SAFER THAN THE OLD TWO-RELAY ARRANGEMENT
+ *
+ *  v4 used two independent NO relays and relied on firmware to
+ *  never close both. A single changeover cannot physically
+ *  connect NC and NO at the same time: the armature has to leave
+ *  one contact before it reaches the other. Break-before-make is
+ *  now enforced by the mechanism, not by software.
+ *
+ *  Consequences:
+ *   - There is no separate solar relay any more, so
+ *     RELAY_SOLAR_PIN is -1 (disabled). setSourceRelays() still
+ *     takes ONE source and relayDrive() ignores a negative pin,
+ *     so the interlock code is unchanged and still correct: with
+ *     the solar pin disabled, "utility off" IS "solar on".
+ *   - SRC_NONE is no longer an isolated state. De-energised means
+ *     the load bus is on the inverter. That is the right failsafe
+ *     for a power cut or a reset (never the grid by accident),
+ *     but it means the relays alone NEVER isolate the load bus.
+ *     Kill the upstream breaker before working on it.
+ *   - RELAY_DEAD_TIME_MS is now a SETTLE time, not an interlock:
+ *     it stops the source flapping and gives the inverter a
+ *     moment, but it is no longer what keeps the sources apart.
+ *
+ *  If you ever go back to two independent NO relays, set
+ *  RELAY_SOLAR_PIN to a real pin and the old interlock behaviour
+ *  returns unchanged.
  *
  *  Pin choice matters on the classic ESP32:
  *    GPIO 6-11  wired to the SPI flash, board will not boot
  *    GPIO 0,2,12,15  strapping pins, wrong level blocks boot
  *    GPIO 5     strapping pin, floats high during reset
- *  25/26/27 are clean outputs with no boot-time behaviour, so
- *  they are the defaults here even though the spec suggested
- *  4 and 5.
+ *  25/26/27 are clean outputs with no boot-time behaviour.
  * ---------------------------------------------------------- */
-#define RELAY_UTILITY_PIN   25       /* CEB mains -> loads              */
-#define RELAY_SOLAR_PIN     26       /* inverter (solar/battery) -> loads */
-#define RELAY_LOAD_PIN      27       /* lighting circuit, -1 to disable */
+#define RELAY_UTILITY_PIN   25       /* SOURCE changeover coil          */
+#define RELAY_SOLAR_PIN     -1       /* no separate solar relay in v5   */
+#define RELAY_LOAD_PIN      27       /* switched load circuit, -1 = none */
 
 /* Most blue relay boards are ACTIVE LOW: the coil pulls in when
- * the input is driven to 0 V. Set to 0 for active-high boards. */
+ * the input is driven to 0 V. Set to 0 for active-high boards.
+ * Getting this wrong inverts solar and CEB. */
 #define RELAY_ACTIVE_LOW    1
 
-/* Both source relays are held open for this long during every
- * changeover, so utility and inverter can never touch. */
+/* Settle time between leaving one source and taking the next.
+ * See the note above: with a changeover relay this is anti-flap
+ * and inverter settling, not the electrical interlock. */
 #define RELAY_DEAD_TIME_MS  800UL
 
 /* Minimum time in one source before another switch is allowed. */
-#define SOURCE_MIN_DWELL_MS 60000UL
+#define SOURCE_MIN_DWELL_MS 180000UL
 
 /* A manual choice made in the web UI expires after this and the
  * state machine takes over again. 0 = never expires. */
 #define MANUAL_OVERRIDE_MS  1800000UL
 
 /* ------------------------------------------------------------
- *  8. BATTERY THRESHOLDS (percent state of charge, from the BMS)
+ *  8. SOURCE STRATEGY  --  CEB (utility) THRESHOLDS
+ *
+ *  Principle: the house runs on solar/inverter. CEB is a rescue,
+ *  not a schedule. It engages only to stop the pack going flat,
+ *  and it is released as early as it is safe to do so.
+ *
+ *  DERIVED FROM MEASURED DATA (12 usable days, 2026-08-20..09-02,
+ *  ~1430 one-minute samples/day). See the analysis in the change
+ *  report; the numbers below are not guesses.
+ *
+ *   - Overnight the pack loses 62..90 SoC points (mean 71) between
+ *     18:15 and the pre-dawn minimum, measured across 9 nights.
+ *     Mean draw 18:15..06:30 is 78 W (112 W in the evening, less
+ *     after midnight), so a night costs ~0.95 kWh against ~1.05 kWh
+ *     of pack between 100% and the 18% floor. The night is right at
+ *     the edge of what the battery holds: from a genuinely full pack
+ *     it usually just makes it, from anything less it does not. A
+ *     short pre-dawn CEB period is therefore expected and normal,
+ *     not a fault.
+ *   - The daily SoC minimum lands at 06:12..08:00 local on every
+ *     observed day.
+ *   - Net pack power turns POSITIVE by 08:00 on 100% of observed
+ *     days (measured WITH the house still connected), and is
+ *     +53..+152 W by 08:30. So 08:30 is a genuinely safe release
+ *     time on a normal day: the pack gains, it does not drain.
+ *   - SoC at 08:30 was 9..61% (median ~28%) with no CEB at all.
+ *     Releasing needs a floor above the trigger or the pack drops
+ *     straight back through it -- hence SOC_CEB_OFF.
  * ---------------------------------------------------------- */
-#define SOC_CRITICAL        20   /* daytime: fall back to utility below */
-#define SOC_EVENING_FLOOR   60   /* after 16:00, on a day that DID reach
-                                   * target: protect the pack below this */
-#define SOC_RECOVER_HYST     5   /* SoC must rise this much to go back  */
-#define SOC_TARGET_1600     99   /* wanted charge level at 16:00        */
 
-/* Top-up window: between these hours, if SoC is still short of
- * SOC_TARGET_1600, loads are moved to utility so the whole array
- * output goes into the battery instead of into the house. */
-#define TOPUP_START_HOUR    14
-#define EVENING_HOUR        16   /* start of the "preserve charge" mode */
+/* Engage CEB at or below this SoC. The single most important
+ * number in the file: below it the pack is being damaged. */
+#define SOC_CEB_ON          18
 
-/* Rainy-day fallback.
+/* Release needs SoC at least this high. 7 points of hysteresis
+ * above SOC_CEB_ON, which the measured morning charge clears in
+ * well under an hour, so it does not delay the 08:30 handover. */
+#define SOC_CEB_OFF         25
+
+/* SoC at which the pack is healthy enough to take the house back
+ * WITHOUT needing live charge current -- this is what allows the
+ * evening (18:15) handover on a poor-solar day, when there is no
+ * sun left to prove anything with. 55% is ~0.47 kWh above the
+ * trigger, about 3.5 h of measured house load. */
+#define SOC_CEB_SAFE        55
+
+/* Charge power that counts as "the array is really working" when
+ * deciding a daytime release. Same threshold as SOLAR_OK_W. */
+#define CEB_RELEASE_CHARGE_W  40.0f
+
+/* Once CEB engages it stays for at least this long, whatever the
+ * SoC does. Anti-chatter backstop on top of SOURCE_MIN_DWELL_MS. */
+#define CEB_MIN_ON_MS       600000UL   /* 10 minutes */
+
+/* Release times by weather class (local time).
+ *  CLEAR / HALF / UNKNOWN -> morning handover, solar takes over
+ *  HEAVY                  -> hold CEB through a poor-solar day and
+ *                            hand back in the evening, so the pack
+ *                            is not drained for nothing */
+#define CEB_CLEAR_RELEASE_HOUR    8
+#define CEB_CLEAR_RELEASE_MINUTE 30
+#define CEB_HEAVY_RELEASE_HOUR   18
+#define CEB_HEAVY_RELEASE_MINUTE 15
+
+/* Data-driven early-out. On a HEAVY day, holding CEB to 18:15 when
+ * the pack has already recovered well past the danger zone just
+ * burns grid for no benefit -- 2026-08-27 and 08-28 both sat at
+ * 53..63% through the morning. If the pack is this healthy AND
+ * charging, hand back early regardless of the weather class. */
+#define CEB_EARLY_RELEASE_SOC    70
+
+/* Deep-discharge backstop, kept from v4. If SoC is at or below
+ * this and the array is not producing, CEB engages no matter what
+ * the release schedule says. */
+#define SOC_CRITICAL        12
+
+
+/* ------------------------------------------------------------
+ *  8b. LOAD PROTECTION + AUDIBLE WARNING
  *
- * On a cloudy day the array may never get the pack to
- * SOC_TARGET_1600 (99%) no matter how long loads are parked on
- * utility, so forcing SOC_EVENING_FLOOR (60%) at nightfall would
- * just mean falling back to the grid every single evening it
- * rains -- exactly the outcome solar+battery is meant to avoid.
+ *  Two thresholds, deliberately 3 points apart so the buzzer is a
+ *  warning and not just an accompaniment to the shutdown:
  *
- * At RAINY_CHECK time (18:15) the firmware checks once: did the
- * pack reach 99% today?
- *   - yes  -> plenty of charge, keep the normal 60% floor
- *   - no   -> today under-produced. Stop treating that as an
- *             emergency: run the house from the battery as deep
- *             as SOC_RAINY_FLOOR (35%) before touching utility at
- *             all. CEB only steps in once the pack actually hits
- *             that lower floor, protecting the cells without
- *             using the grid on every overcast evening.
- */
-#define RAINY_CHECK_HOUR    18   /* 18:15 -- give the array until dusk  */
-#define RAINY_CHECK_MIN     15   /* (PV_HOUR_END is 19:00) before giving up on today's target */
-#define SOC_RAINY_FLOOR     35   /* deeper floor allowed on a day that fell short */
+ *    SoC >  38   silent
+ *    SoC <= 38   warning melody every BUZZER_WARN_PERIOD_MS
+ *    SoC <= 35   load relay OPENS, urgent alarm continues
+ *
+ *  Recovery uses SOC_ALARM_HYST so a pack hovering on a threshold
+ *  cannot chatter the relay or stutter the buzzer.
+ * ---------------------------------------------------------- */
+#define SOC_BUZZER_WARN     38   /* start warning the user here        */
+#define SOC_LOAD_CUTOFF     35   /* disconnect the load relay here     */
+#define SOC_ALARM_HYST       2   /* SoC must rise this much to clear   */
+
+/* ------------------------------------------------------------
+ *  8c. PASSIVE BUZZER
+ *
+ *  Passive buzzer = it needs a square wave, not DC. Driven by the
+ *  ESP32 LEDC peripheral, so tone generation is free in hardware
+ *  and buzzerTask() only ever changes frequency -- no delay(), no
+ *  blocking, no interference with relay or BLE timing.
+ *
+ *  Wire through a transistor if the buzzer draws more than ~20 mA.
+ *  See WIRING.md.
+ * ---------------------------------------------------------- */
+#define BUZZER_PIN          33   /* passive buzzer signal pin, -1 = none */
+#define BUZZER_LEDC_CH       0   /* LEDC channel reserved for the buzzer */
+#define BUZZER_LEDC_RES      8   /* duty resolution in bits              */
+#define BUZZER_DUTY        128   /* 50% of 8-bit -> loudest square wave  */
+
+#define BUZZER_WARN_PERIOD_MS   20000UL /* gap between warning melodies */
+#define BUZZER_ALARM_PERIOD_MS   5000UL /* gap between alarm melodies   */
+
+
+/* ------------------------------------------------------------
+ *  8f. REAL-TIME PV EVIDENCE  (weather reality check)
+ *
+ *  A forecast is a guess; the array is the measurement. These
+ *  thresholds let today's ACTUAL generation override the forecast
+ *  in both directions, which is what stops a wrong forecast from
+ *  either wasting grid or flattening the pack.
+ *
+ *  WHY A MINUTE COUNT AND NOT A POWER LEVEL
+ *
+ *  The obvious rule -- "PV above 200-250 W between 09:00 and
+ *  10:00 means a good day" -- does NOT hold in the measured data.
+ *  Mean net power in that window across the 12 August/September
+ *  days was 78..231 W, and the three BEST days by cloud cover
+ *  (08-31, 09-01, 09-02 at 64/36/47% cloud) were at the BOTTOM of
+ *  that range: 78, 112 and 147 W. Their real strength arrived in
+ *  the 10:00-11:00 hour (334, 254, 313 W). A single hour is simply
+ *  the wrong window -- the morning ramp moves around by an hour or
+ *  more from day to day.
+ *
+ *  What DOES separate the days cleanly is how many minutes the
+ *  array spends above a moderate level. Cumulative minutes with
+ *  net pack power >= 150 W, 07:00-12:00, measured:
+ *
+ *      08-27  19    (pack started at 63%, charge tapered)
+ *      08-24  42    <- the genuinely wet day, 6.3 mm rain
+ *      08-20  69        99% cloud
+ *      08-23  70        5.7 mm rain
+ *      ----------------------------- 90 min cut
+ *      09-01  94     08-28 107    08-21 109
+ *      08-31 119     08-29 122    09-02 126
+ *      08-30 141     08-22 160
+ *
+ *  90 minutes splits "real solar happened today" from "it did
+ *  not", with a wide margin either side and no day sitting on the
+ *  fence. It is also inherently chatter-proof: the counter only
+ *  ever increases within a day, so the verdict cannot oscillate.
+ *
+ *  Note these are NET watts measured with the house connected. On
+ *  CEB the house is off the pack, so the same sun produces a
+ *  larger number -- the test gets easier to pass exactly when we
+ *  are looking for an excuse to hand back to solar. That bias is
+ *  deliberate and in the safe direction.
+ * ---------------------------------------------------------- */
+#define PV_GOOD_W             150.0f  /* net W that counts as "working"   */
+#define PV_GOOD_MINUTES        90     /* cumulative min -> today is good  */
+#define PV_POOR_MINUTES        45     /* below this by the verdict hour   */
+#define PV_VERDICT_HOUR        11     /* earliest hour to call a day poor */
+#define PV_WINDOW_START_HOUR    7     /* counting window                  */
+#define PV_WINDOW_END_HOUR     12
+
+/* ---- v7: the same minute count, turned into a PREDICTION -------
+ *
+ *  The online forecast is gone. This is now the only expected-
+ *  solar signal in the system, and it is built entirely from the
+ *  ESP32's own measurements.
+ *
+ *  SCORE.  A day's strength is its minute count scaled against a
+ *  full-strength day:
+ *
+ *      score = clamp(mins * 100 / PV_SCORE_FULL_MIN, 0, 100)
+ *
+ *  PV_SCORE_FULL_MIN is 150 because the strongest day in the
+ *  supplied August/September data (08-22) reached 160 minutes and
+ *  the second (08-30) 141. Scoring the measured days gives:
+ *
+ *      08-22 160 -> 100      08-23  70 -> 47
+ *      08-30 141 ->  94      08-20  69 -> 46
+ *      09-02 126 ->  84      08-24  42 -> 28   (6.3 mm, the wet day)
+ *      08-29 122 ->  81      08-27  19 -> 13
+ *      08-31 119 ->  79
+ *      08-21 109 ->  73
+ *      08-28 107 ->  71
+ *      09-01  94 ->  63
+ *
+ *  The cut points below fall in the gaps of that list, not through
+ *  a cluster: SUNNY 80 (between 79 and 81 is tight, but 84/94/100
+ *  are unambiguous), PARTLY 60, CLOUDY 40. The two genuinely bad
+ *  days (08-24, 08-27) are the only ones that land in LOW SOLAR,
+ *  which is exactly the set that previously earned the 18:15
+ *  evening deadline. The strategy is therefore unchanged; only
+ *  where the classification comes from has changed.
+ *
+ *  PREDICTION.  Solar conditions are strongly autocorrelated day
+ *  to day (a monsoon spell is a spell, not a coin flip), so before
+ *  the array has produced anything the expectation is yesterday
+ *  weighted against the recent baseline:
+ *
+ *      base = (PV_PRED_YEST_PCT * yesterday
+ *              + (100 - PV_PRED_YEST_PCT) * mean(history)) / 100
+ *
+ *  As the day develops, measurement replaces the guess in
+ *  proportion to how much of the counting window has elapsed, so
+ *  by PV_WINDOW_END_HOUR the number reported is pure measurement.
+ *  There is no discontinuity and no second SoC/PV calculation.
+ * ---------------------------------------------------------- */
+#define PV_SCORE_FULL_MIN     150     /* minutes that score 100           */
+#define PV_SCORE_SUNNY         80     /* >= this -> SUNNY                 */
+#define PV_SCORE_PARTLY        60     /* >= this -> PARTLY CLOUDY         */
+#define PV_SCORE_CLOUDY        40     /* >= this -> CLOUDY, else LOW SOLAR*/
+#define PV_PRED_YEST_PCT       50     /* weight of yesterday in the base  */
+#define PV_PRED_MIN_DAYS        2     /* fewer logged days -> UNKNOWN     */
+
+/* ------------------------------------------------------------
+ *  8g. PV HISTORY STORE
+ *
+ *  Replaces the v6 online-forecast cache, which is deleted.
+ *
+ *  PV_HIST_DAYS finished days are kept in the SAME NVS namespace
+ *  the energy counters already use -- one blob, one key, no new
+ *  storage subsystem. 14 days x 6 bytes = 84 bytes.
+ *
+ *  Each entry is written once, at the daily rollover, from the
+ *  minute counter the control loop was already maintaining. Days
+ *  are stored against their own date, so a reboot or a missed day
+ *  cannot shift the alignment.
+ *
+ *  Trust still decays: an entry older than PV_HIST_TRUST_DAYS is
+ *  ignored when forming the baseline, because a fortnight-old
+ *  monsoon is not evidence about this morning.
+ * ---------------------------------------------------------- */
+#define PV_HIST_DAYS           14     /* finished days retained           */
+#define PV_HIST_NVS_KEY      "pvh"    /* Preferences blob key             */
+#define PV_HIST_TRUST_DAYS     10     /* older entries ignored            */
+
+/* ------------------------------------------------------------
+ *  8k. ONLINE FORECAST CACHE + THE TWO-CONFIDENCE MODEL
+ *
+ *  THE SOURCES.  Two independent opinions about how much sun a day
+ *  will bring, on the same 0..100 scale so they can be compared:
+ *
+ *    PV MODEL   (8f/8g) the ESP32's own measured generation history
+ *                       -- yesterday weighted against the recent
+ *                       mean, then replaced by today's measurement
+ *                       as the counting window elapses.
+ *    FORECAST   (8d)    Open-Meteo daily cloud cover + precipitation
+ *                       + WMO code, cached 7 days in NVS.
+ *
+ *  THE ARBITRATION.  Deterministic, explainable, no learning rate
+ *  and no hidden state:
+ *
+ *    1. Today's MEASURED generation wins outright once it has
+ *       something to say (pvVerdictGood / pvVerdictPoor, 8f).
+ *       Requirement 16: real PV beats a wrong label, both ways.
+ *    2. Otherwise the opinion with the higher confidence wins.
+ *    3. If neither has any confidence the class is UNKNOWN, which
+ *       selects the solar-first 08:30 deadline -- the same
+ *       conservative fallback the system has always had.
+ *
+ *  FORECAST CONFIDENCE decays linearly with the age of the cached
+ *  day and reaches zero at WEATHER_TRUST_DAYS. It STARTS at
+ *  WX_CONF_FRESH, deliberately set BELOW the confidence a mature PV
+ *  model reaches, because the forecast has been observed to be
+ *  wrong here and the PV model has been observed to work.
+ *
+ *      fcConf = WX_CONF_FRESH * (TRUST_DAYS - age) / TRUST_DAYS
+ *
+ *      age 0 -> 60    age 2 -> 36    age 4 -> 12
+ *      age 1 -> 48    age 3 -> 24    age 5+ -> 0   (requirement 19)
+ *
+ *  PV CONFIDENCE grows with the evidence behind it: how many
+ *  trusted days the history holds, plus how much of today's
+ *  counting window has actually been measured.
+ *
+ *      pvConf = PV_CONF_BASE
+ *             + PV_CONF_PER_DAY * (trusted days, capped)
+ *             + PV_CONF_WINDOW  * windowPct / 100
+ *
+ *      2 days at dawn  -> 40 + 10 +  0 =  50
+ *      7 days at dawn  -> 40 + 25 +  0 =  65
+ *      7 days at 10:00 -> 40 + 25 + 15 =  80
+ *      no usable history            ->   0
+ *
+ *  WHAT THAT ACTUALLY DOES -- the point of choosing the numbers
+ *  rather than inventing them:
+ *
+ *    - fresh install, 2 days of history, fresh forecast:
+ *      50 vs 60 -> the forecast leads. It is all there is.
+ *    - a week in, fresh forecast:
+ *      65 vs 60 -> the PV model leads, which is what the field
+ *      evidence asks for.
+ *    - a week in, forecast one day stale:
+ *      65 vs 48 -> PV model, comfortably.
+ *    - WiFi down five days (requirement 19):
+ *      65 vs 0  -> PV model alone. The stale forecast is not
+ *      merely outvoted, it is discarded.
+ *    - either way, once today's own generation reaches a verdict
+ *      it overrules both.
+ *
+ *  AGREEMENT is reported, not acted on: when the two opinions land
+ *  on the same class the dashboard says so, which is how a human
+ *  tells "both agree it is a poor day" from "they disagreed and the
+ *  measurement broke the tie".
+ * ---------------------------------------------------------- */
+#define WEATHER_ENABLE          1     /* 0 = no HTTP weather at all       */
+#define WEATHER_HOST      "api.open-meteo.com"
+#define WEATHER_LAT       "6.9497"    /* Gampola, Sri Lanka               */
+#define WEATHER_LON       "80.5750"
+#define WEATHER_TZ        "Asia%2FColombo"   /* URL-encoded               */
+#define WEATHER_DAYS            7     /* forecast days cached             */
+#define WEATHER_NVS_KEY   "wxc"       /* Preferences blob key             */
+#define WEATHER_TRUST_DAYS      5     /* confidence reaches 0 here        */
+#define WEATHER_REFRESH_MS 10800000UL /* 3 h between successful fetches   */
+#define WEATHER_RETRY_MS    900000UL  /* 15 min after a failure           */
+#define WEATHER_MORNING_HOUR    5     /* guaranteed refresh from this hour*/
+#define WEATHER_HTTP_TIMEOUT_MS 8000
+
+/* Forecast -> WeatherClass. The same thresholds v6 used, kept so
+ * the release-deadline policy is unchanged; only its standing is. */
+#define WX_HEAVY_PRECIP_MM    4.0f    /* >= this -> poor solar day        */
+#define WX_HEAVY_CLOUD_PCT      85
+#define WX_CLEAR_CLOUD_PCT      55    /* <= this and dry -> clear day     */
+
+/* The two confidences. See the worked examples above. */
+#define WX_CONF_FRESH          60     /* forecast confidence at age 0     */
+#define PV_CONF_BASE           40     /* PV model floor once usable       */
+#define PV_CONF_PER_DAY         5     /* per trusted history day          */
+#define PV_CONF_DAY_CAP         5     /* ... counted up to this many      */
+#define PV_CONF_WINDOW         15     /* added across the counting window */
+
+/* ------------------------------------------------------------
+ *  8l. BATTERY ETA  (display only)
+ *
+ *  Time to empty while discharging, clock time to full while
+ *  charging. Neither number can reach the source state machine:
+ *  the ETA module is read by the OLED and the dashboard and by
+ *  nothing else.
+ *
+ *  ENERGY. PACK_USABLE_WH is the ONE constant this arithmetic
+ *  rests on. 4S LiFePO4 at 12.8 V nominal x PACK_CAPACITY_AH:
+ *
+ *      12.8 V x 100 Ah = 1280 Wh
+ *
+ *  Change PACK_CAPACITY_AH and this follows; it is expressed as a
+ *  product rather than a literal so the two cannot drift apart.
+ *
+ *  RESERVE. Discharge runs down to SOC_CEB_ON, not to zero,
+ *  because that is the SoC at which the controller actually hands
+ *  the house to CEB. "Time left" that counted past the handover
+ *  would be time the pack never gets to spend. The existing 18%
+ *  threshold is reused deliberately -- there is no second reserve
+ *  constant to keep in step.
+ *
+ *  SMOOTHING. pvFilt and loadFilt already low-pass the raw watts
+ *  over PV_FILTER_TC_S, and the ETA takes a further ETA_AVG_MINUTES
+ *  rolling mean of THOSE values. A kettle must not make the
+ *  remaining-time figure leap about; five minutes of memory is
+ *  enough that it moves at reading speed. This is smoothing of an
+ *  existing signal, not a second power measurement.
+ * ---------------------------------------------------------- */
+#define PACK_NOMINAL_V      12.8f     /* 4S LiFePO4                       */
+#define PACK_USABLE_WH   (PACK_NOMINAL_V * PACK_CAPACITY_AH)
+#define ETA_RESERVE_SOC   SOC_CEB_ON  /* reuse the CEB floor, do not add  */
+#define ETA_AVG_MINUTES        5      /* rolling mean window              */
+#define ETA_MIN_W            5.0f     /* below this the ETA is unknowable */
+#define ETA_MAX_HOURS         24      /* above this, show ">24h"          */
+#define ETA_FULL_SOC          99      /* at or above, charging reads FULL */
+
+/* ------------------------------------------------------------
+ *  8m. TOMORROW'S OUTLOOK  (display only, and only display)
+ *
+ *  ###############################################################
+ *  #  THIS MODEL MUST NEVER REACH THE SOURCE STATE MACHINE.      #
+ *  #  decideSource() reads wxEffectiveClass() and nothing else.  #
+ *  #  Nothing in section 11d is called from section 12, and the  #
+ *  #  CEB policy is bit-for-bit what it was before this existed. #
+ *  ###############################################################
+ *
+ *  WHY IT EXISTS. The raw online label has been wrong here often
+ *  enough to be useless on its own, but it is not NOISE -- it is
+ *  BIASED. "RAIN" over this valley has repeatedly still produced a
+ *  large fraction of a clear day. A bias can be measured and
+ *  removed; that is all this does.
+ *
+ *  THE MODEL, in three numbers:
+ *
+ *    baseline   median daily harvest Wh over the trusted history
+ *    factor     the label's nominal share of a clear day
+ *    bias       what that label has ACTUALLY delivered here,
+ *               learned one observation per night
+ *
+ *      predicted_Wh = baseline x factor x bias[label]
+ *
+ *  THE NIGHTLY UPDATE. At each rollover the day that just finished
+ *  is scored against the label that was issued for it:
+ *
+ *      expected = baseline x factor[label]
+ *      ratio    = actual / expected          (clamped)
+ *      bias[label] <- running mean of ratio
+ *
+ *  So a site where "RAIN" delivers 80% of a clear day converges on
+ *  bias[RAIN] ~ 2.0 against a nominal factor of 0.40, and the
+ *  product lands back at the 0.8 the array actually produces.
+ *
+ *  STORAGE. One WxBias per WxCond: 8 x 3 = 24 bytes, in the NVS
+ *  namespace the counters already use. The observation count is
+ *  capped at PRED_BIAS_MAX so the mean stays responsive to a
+ *  changing season instead of freezing after a month.
+ *
+ *  DEGRADING. The label's weight is the EXISTING fcConfidence()
+ *  from section 8k -- full at age 0, zero at WEATHER_TRUST_DAYS.
+ *  A stale forecast therefore blends its factor back toward 1.0
+ *  automatically, and after five days offline the label is ignored
+ *  outright and the display shows the historical median with a "*".
+ *  No second staleness rule, no second timer.
+ * ---------------------------------------------------------- */
+#define PRED_MIN_DAYS           7     /* fewer -> show LEARNING           */
+#define PRED_BIAS_NVS_KEY  "wxb"
+#define PRED_BIAS_MAX          20     /* cap on the running-mean count    */
+#define PRED_RATIO_MIN       200      /* clamp, x1000                     */
+#define PRED_RATIO_MAX      2500
+
+/* Nominal share of a clear day, x1000. Starting values only: the
+ * learned bias above is what makes them fit this site. */
+#define PRED_F_SUNNY         1000
+#define PRED_F_PARTLY         850
+#define PRED_F_CLOUDY         600
+#define PRED_F_FOG            600
+#define PRED_F_RAIN           400
+#define PRED_F_HEAVYRAIN      250
+#define PRED_F_STORM          200
+
+/* predicted / baseline -> confidence word, x1000. */
+#define PRED_STRONG           850
+#define PRED_GOOD             650
+#define PRED_WEAK             400
+
+/* ------------------------------------------------------------
+ *  8n. LIGHTS  (switched load circuit)
+ *
+ *  ###############################################################
+ *  #  THIS IS LOAD CONTROL ONLY. It drives RELAY_LOAD_PIN and    #
+ *  #  nothing else. It cannot reach the source state machine,    #
+ *  #  the CEB relay, or any decision in section 12.              #
+ *  ###############################################################
+ *
+ *  ONE OWNER. travelTask() already owned RELAY_LOAD_PIN, so the
+ *  modes below are inputs to that function rather than a second
+ *  controller for the same GPIO. The precedence there, highest
+ *  first, is unchanged at the top and extended at the bottom:
+ *
+ *    1. loadCutoff        battery protection, SOC_LOAD_CUTOFF
+ *    2. lights low-batt   LIGHTS_CUTOFF_SOC, this section
+ *    3. travel mode       the physical switch and its schedule
+ *    4. LIGHT_ON / OFF    the web override
+ *    5. LIGHT_AUTO        sunset -> LIGHTS_OFF_*
+ *
+ *  AUTO uses the sunset time that comes back with the forecast
+ *  that section 8k already fetches -- no new request, no new
+ *  service, one extra field on a response we were parsing anyway.
+ *  With no cached sunset it falls back to a fixed clock time, so
+ *  the lights still work with the internet down.
+ *
+ *  THE LOW-BATTERY GUARD is latched with hysteresis. Lighting is
+ *  the one load a person notices flicking on and off, and an
+ *  unlatched threshold at a SoC hovering on the boundary would do
+ *  exactly that. It re-arms LIGHTS_CUTOFF_HYST points higher.
+ *  It reads socStableVal -- the validated SoC, same as everything
+ *  else -- and writes only the lights.
+ * ---------------------------------------------------------- */
+#define LIGHTS_CUTOFF_SOC      25     /* below this, lights forced off   */
+#define LIGHTS_CUTOFF_HYST      5     /* ... and back on at 30%          */
+#define LIGHTS_OFF_HOUR        23     /* AUTO switch-off time            */
+#define LIGHTS_OFF_MIN          0
+#define LIGHTS_FALLBACK_ON_HOUR 18    /* used when no sunset is cached   */
+#define LIGHTS_FALLBACK_ON_MIN 30
+
+/* ------------------------------------------------------------
+ *  8h. EMERGENCY BATTERY ALARM  (new in v6)
+ *
+ *  Scenario this exists for: the grid fails at midnight while the
+ *  controller believes CEB is carrying the house. The changeover
+ *  is on the CEB side but there is no power behind it, so the
+ *  inverter keeps running and the pack keeps draining. Nobody
+ *  notices until the battery is damaged.
+ *
+ *  So: alarm at SOC_EMERGENCY, but ONLY while the house is
+ *  actually on the pack. Alarming while CEB genuinely has the
+ *  house would be a false alarm and would train people to ignore
+ *  it. The pattern is deliberately unlike the warning chime.
+ * ---------------------------------------------------------- */
+#define SOC_EMERGENCY          10     /* critical SoC while on the pack   */
+#define BUZZER_EMERG_PERIOD_MS 3000UL /* gap between emergency bursts     */
+
+/* ------------------------------------------------------------
+ *  8i. OLED LAYOUT v2 + SCREEN SCHEDULE
+ *
+ *  THE PANEL IS DIVIDED ONCE, AT COMPILE TIME.
+ *
+ *    +--------------------------------------+
+ *    |                            |         |  y 0
+ *    |                            |         |
+ *    |          8 8 %             |  ARROW  |  TOP AREA
+ *    |                            |  LANE   |  x 0..109
+ *    |                            |         |  y 0..49
+ *    |____________                |         |  rule y=51, 44 px
+ *    |   124 W                    |         |  POWER ROW y 52..63
+ *    +--------------------------------------+  y 63
+ *
+ *  v2 removed the chrome. There is NO outer border, NO boxed
+ *  rectangle around the power row and NO vertical divider beside
+ *  the arrow lane -- the earlier version drew all three, and the
+ *  frame took roughly a fifth of the glass away from the number
+ *  people actually read across a room. What is left is a short
+ *  44 px rule under the top area and nothing else.
+ *
+ *  The lane is RESERVED, not drawn: nothing is ever written into
+ *  x >= OLED_C_X0, and no line marks its edge.
+ *
+ *  Top-area content centres inside OLED_A_W (110 px), NOT inside
+ *  the full 128 -- centring on the panel would push every number
+ *  visibly right of centre under the arrows.
+ *
+ *  REDRAW RATE. OLED_FRAME_MS is 50 ms (20 fps) because the arrow
+ *  has to look like it is moving. The full 1 kB buffer at
+ *  OLED_I2C_HZ takes about 23 ms on the wire -- but that is I2C
+ *  TRANSFER time, not CPU time: the ESP-IDF driver is interrupt
+ *  driven and the calling task blocks on a queue, so the scheduler
+ *  runs bleTask (priority 3) and netTask throughout.
+ * ---------------------------------------------------------- */
+
+/* Top area */
+#define OLED_A_X0               0
+#define OLED_A_X1             109
+#define OLED_A_W              110     /* OLED_A_X1 - OLED_A_X0 + 1  */
+#define OLED_A_Y0               0
+#define OLED_A_Y1              49
+
+/* The one remaining rule: short, under the top area only. */
+#define OLED_RULE_Y            51
+#define OLED_RULE_W            44
+
+/* Power row. Wattage only -- no label. The arrow already says
+ * which way the energy is going, so "LOAD"/"PV" was repeating in
+ * words what the lane says in pictures. */
+#define OLED_B_Y0              52
+#define OLED_B_Y1              63
+#define OLED_B_BASELINE        62
+#define OLED_B_X                2     /* left aligned               */
+#define OLED_IDLE_W           5.0f    /* |W| below this reads as 0   */
+
+/* Arrow lane. Reserved x 112..127, full height, no divider drawn.
+ * Animation is unchanged from v1: two arrows half a period apart,
+ * 3 px per frame, wrapping modulo 64, so one is always fully in
+ * view and the flow never appears to stop. */
+#define OLED_C_X0             112
+#define OLED_C_X1             127
+#define OLED_ARROW_CX         119     /* centre of 112..127          */
+#define OLED_ARROW_HEAD_W      11
+#define OLED_ARROW_HEAD_H       7
+#define OLED_ARROW_TAIL_H       6
+#define OLED_ARROW_H     (OLED_ARROW_HEAD_H + OLED_ARROW_TAIL_H)
+#define OLED_ARROW_GAP         32     /* spacing of the two arrows  */
+#define OLED_ARROW_STEP         3     /* px per frame               */
+#define OLED_ARROW_WRAP        64     /* position modulo            */
+#define OLED_FRAME_MS        50UL     /* 20 fps redraw              */
+
+/* SoC screen. Both faces sit on the SAME baseline so the digits and
+ * the percent read as one block rather than as a number with a
+ * floating suffix. logisoso38 is digits-only (no letters needed) and
+ * costs well under a kilobyte.
+ *
+ * OLED_SOC_BASELINE 44 with a 38 px ascent puts the glyph top at
+ * row 6 and the bottom on the baseline -- these digits have no
+ * descender -- leaving 7 px between the number and the rule. */
+#define OLED_SOC_BASELINE      44
+#define OLED_SOC_GAP            3     /* digits -> percent sign      */
+
+/* Screen schedule. UNCHANGED from v6/v7: SoC dominates, the source
+ * word is a glance, the weather screen only runs in the morning. */
+#define OLED_SOC_MS         10000UL
+#define OLED_SRC_MS          2000UL
+#define OLED_WX_MS           4000UL
+#define OLED_WX_START_HOUR      6     /* weather screen active from */
+#define OLED_WX_END_HOUR       14     /* ... until (exclusive)      */
+#define OLED_ETA_MS          3000UL   /* battery ETA                */
+#define OLED_TOM_MS          4000UL   /* tomorrow's outlook         */
+#define OLED_TOM_START_HOUR    18     /* outlook screen active from */
+#define OLED_TOM_END_HOUR      24     /* ... until midnight         */
+
+/* THE ROTATION (patch 2 part D). SoC appears TWICE in every cycle
+ * and remains the dominant screen; the new screens are inserted,
+ * nothing existing was retimed.
+ *
+ *   06:00-13:59   SOC 10  SRC 2  WX 4   SOC 10  ETA 3   = 29 s
+ *   14:00-17:59   SOC 10  SRC 2         SOC 10  ETA 3   = 25 s
+ *   18:00-23:59   SOC 10  SRC 2  TOM 4  SOC 10  ETA 3   = 29 s
+ *   00:00-05:59   SOC 10  SRC 2         SOC 10  ETA 3   = 25 s
+ *
+ * A screen with nothing to say is skipped rather than shown empty,
+ * so the two plain windows are what the day and evening ones
+ * degrade to on their own when no forecast is cached. */
+
+/* ------------------------------------------------------------
+ *  8j. SOURCE STABILITY  (v7 -- the Pack/CEB oscillation fix)
+ *
+ *  THE DEFECT
+ *
+ *  decideSource() acted on one raw sample. parseCellInfo() writes
+ *  bmsShared.soc straight from frame byte 173 with no validity
+ *  check, so a single corrupt or transient frame reading, say, 0%
+ *  satisfied "soc <= SOC_CEB_ON" instantly, latched cebOn, and
+ *  CEB_MIN_ON_MS then held the house on mains for ten minutes
+ *  before releasing it again. That is precisely the reported
+ *  symptom: a full pack, a load step, an immediate switch, and a
+ *  switch back. solarProducing() had the same weakness -- it read
+ *  the instantaneous pack watts, which cross zero every time an
+ *  appliance starts.
+ *
+ *  THE FIX, in three independent layers:
+ *
+ *  1. VALIDATION (root cause). A sample more than SOC_MAX_JUMP
+ *     points from the established value is rejected outright
+ *     unless it repeats SOC_OUTLIER_CONFIRM times, so a genuine
+ *     BMS recalibration is still honoured but a one-frame glitch
+ *     never reaches the decision at all.
+ *
+ *  2. PERSISTENCE. Every engage/release condition must hold
+ *     continuously for the times below before it is acted on.
+ *     A condition that flickers never accumulates.
+ *
+ *  3. DWELL. After any completed transition no further transition
+ *     is allowed for SOURCE_MIN_DWELL_MS.
+ *
+ *  Only a validated, persisted critical-SoC condition may bypass
+ *  the dwell, so battery safety still wins (requirement 1.3) but
+ *  a stray sample cannot claim to be an emergency.
+ *
+ *  A SCHMITT BAND ON THE FLOOR ITSELF. A pack sitting at the CEB
+ *  floor reads 17/18/19/18 as the BMS quantises. A plain
+ *  "soc <= 18" test resets the persistence gate on every 19, so
+ *  the gate would never fill and the pack would never be rescued
+ *  -- the opposite failure to chattering, and just as bad. The
+ *  low-SoC condition therefore arms at SOC_CEB_ON and disarms
+ *  only at SOC_CEB_ON + SOC_ENGAGE_HYST. It stays well clear of
+ *  SOC_CEB_OFF, so the two hysteresis bands cannot interact.
+ *
+ *  ANTI-OSCILLATION ARITHMETIC. Engaging costs SRC_ENGAGE_HOLD_MS.
+ *  Releasing needs CEB_MIN_ON_MS measured from the moment the
+ *  relay actually closed, and only then does SRC_RELEASE_HOLD_MS
+ *  begin, and SOC_CEB_OFF sits 7 points above SOC_CEB_ON. The
+ *  fastest possible Pack->CEB->Pack cycle is therefore
+ *  600 s + 60 s = 11 minutes AND requires the SoC to genuinely
+ *  climb 7 points in between. Measurement noise cannot produce it.
+ * ---------------------------------------------------------- */
+#define SOC_ENGAGE_HYST         2     /* Schmitt band on the CEB floor    */
+#define SOC_VALID_MIN           1     /* 0 is never a real JK reading     */
+#define SOC_VALID_MAX         100
+#define SOC_MAX_JUMP           10     /* pts/step before a sample is odd  */
+#define SOC_OUTLIER_CONFIRM     3     /* repeats that make an outlier real*/
+
+#define SRC_ENGAGE_HOLD_MS   30000UL  /* low SoC must persist this long   */
+#define SRC_RELEASE_HOLD_MS  60000UL  /* recovery must persist this long  */
+#define SRC_CRITICAL_HOLD_MS  5000UL  /* even the emergency is debounced  */
+
+#define SRC_STARTUP_MIN_MS   10000UL  /* no source command before this    */
+#define SRC_STARTUP_MAX_MS  120000UL  /* ... and no waiting past this     */
+
+#define PV_FILTER_TC_S        30.0f   /* PV/load low-pass time constant   */
+#define SOC_TREND_PERIOD_MS  60000UL  /* trend sample interval            */
+#define SOC_TREND_SPAN          5     /* samples kept -> 5 min of trend   */
+#define SRC_LOG_THROTTLE_MS  30000UL  /* rejected-transition log rate     */
 
 /* Array counted as producing above this many watts into the pack. */
 #define SOLAR_OK_W          40.0f
 /* Daylight window used to tell PV charging from grid charging.  */
 #define PV_HOUR_START        6
 #define PV_HOUR_END         19
+
+/* ------------------------------------------------------------
+ *  8d. ONLINE WEATHER -- DEMOTED, NOT REMOVED
+ *
+ *  v6 made the Open-Meteo daily forecast the PRIMARY input to the
+ *  CEB release deadline. That was wrong and the field evidence says
+ *  so: it reported rain on days that turned out mostly sunny. The
+ *  reanalysis grid cell is ~25 km at 778 m and does not resolve
+ *  this valley, and with n=11 the best correlation available was
+ *  precipitation at r=-0.60 (p~0.05) -- enough to bias a release
+ *  time, nowhere near enough to be trusted with a battery.
+ *
+ *  A working draft of v7 deleted the forecast client outright. That
+ *  went too far the other way, because a fresh forecast is still
+ *  the only signal that exists at 06:00 on the third day of a fresh
+ *  install, before the PV history has anything to say.
+ *
+ *  So the forecast STAYS, as a clearly subordinate second opinion:
+ *
+ *    - fetched and cached exactly as before (7 days, NVS)
+ *    - it never touches the source state machine directly
+ *    - it is weighed against the ESP32's own PV history and the
+ *      more confident of the two wins (section 8k)
+ *    - measured generation today overrides BOTH (section 8f)
+ *
+ *  The settings live in 8k with the confidence model that governs
+ *  them, so there is one place to read.
+ * ---------------------------------------------------------- */
+
+/* ------------------------------------------------------------
+ *  8e. 0.96" OLED  (SSD1306, I2C)
+ *
+ *  Shows real-time SoC from the same bmsGet() snapshot the
+ *  controller uses -- there is no second SoC calculation.
+ *
+ *  Pins: GPIO 21/22 are the ESP32 default I2C pair and are the
+ *  only completely unencumbered pins left on this build. They are
+ *  not strapping pins, not bonded to the SPI flash, not ADC2
+ *  (which WiFi disables), and nothing else in this project uses
+ *  them. Relays are on 25/27, buzzer 33, travel switch 32,
+ *  optional PV sense 34/35.
+ *
+ *  The display is strictly optional: a missing or failed panel
+ *  sets oledOk=false and every later call becomes a no-op. It can
+ *  never stall the control loop, the relays or the BLE link.
+ * ---------------------------------------------------------- */
+#define OLED_ENABLE         1
+#define OLED_SDA_PIN        21
+#define OLED_SCL_PIN        22
+#define OLED_ADDR           0x3C     /* 0x3D on some panels          */
+#define OLED_WIDTH          128
+#define OLED_HEIGHT         64
+#define OLED_I2C_HZ         400000UL /* fast mode; short wires only  */
 
 /* ------------------------------------------------------------
  *  9. TRAVEL MODE
@@ -238,7 +1244,179 @@ enum Source : uint8_t { SRC_NONE = 0, SRC_SOLAR = 1, SRC_UTILITY = 2 };
   #if (RELAY_UTILITY_PIN >= 34) || (RELAY_SOLAR_PIN >= 34)
     #error "GPIO 34-39 are input-only on the classic ESP32 and cannot drive a relay."
   #endif
+  #if (BUZZER_PIN >= 6) && (BUZZER_PIN <= 11)
+    #error "BUZZER_PIN 6-11 is wired to the SPI flash on the classic ESP32."
+  #endif
+  #if (BUZZER_PIN >= 34)
+    #error "GPIO 34-39 are input-only on the classic ESP32 and cannot drive a buzzer."
+  #endif
 #endif
 #if (RELAY_UTILITY_PIN == RELAY_SOLAR_PIN)
   #error "The two source relays must be on different pins."
+#endif
+#if (BUZZER_PIN >= 0) && ((BUZZER_PIN == RELAY_UTILITY_PIN) || (BUZZER_PIN == RELAY_SOLAR_PIN) || (BUZZER_PIN == RELAY_LOAD_PIN) || (BUZZER_PIN == TRAVEL_SWITCH_PIN))
+  #error "BUZZER_PIN collides with a relay or the travel switch."
+#endif
+#if (RELAY_LOAD_PIN >= 0) && ((RELAY_LOAD_PIN == RELAY_UTILITY_PIN) || (RELAY_LOAD_PIN == RELAY_SOLAR_PIN))
+  #error "RELAY_LOAD_PIN collides with a source relay."
+#endif
+#if SOC_LOAD_CUTOFF >= SOC_BUZZER_WARN
+  #error "SOC_BUZZER_WARN must be above SOC_LOAD_CUTOFF or the buzzer never warns before shutdown."
+#endif
+
+/* ---- v5 additions ---- */
+
+/* CEB threshold ordering. If these invert, the source machine can
+ * engage and release at the same SoC and chatter the mains relay. */
+#if SOC_CEB_OFF <= SOC_CEB_ON
+  #error "SOC_CEB_OFF must be ABOVE SOC_CEB_ON or CEB will chatter at the trigger point."
+#endif
+#if SOC_CEB_SAFE < SOC_CEB_OFF
+  #error "SOC_CEB_SAFE must be at or above SOC_CEB_OFF."
+#endif
+#if SOC_CRITICAL > SOC_CEB_ON
+  #error "SOC_CRITICAL is the last-resort backstop and must be at or below SOC_CEB_ON."
+#endif
+/* SOC_LOAD_CUTOFF (35%) and SOC_CEB_ON (18%) are NOT in conflict --
+ * they are two stages of the same escalation, on two different
+ * relays, and both were specified deliberately:
+ *
+ *   38%  buzzer warns
+ *   35%  RELAY_LOAD_PIN opens -> the discretionary circuit is shed,
+ *        which slows the drain without touching the rest of the house
+ *   18%  SOURCE relay -> CEB, the whole house moves to mains
+ *
+ * So the pack is defended twice before mains is ever used, which is
+ * exactly the solar-first behaviour this system is for. The only
+ * orderings that would actually be unsafe are guarded above
+ * (SOC_CEB_OFF > SOC_CEB_ON > SOC_CRITICAL). */
+
+#if OLED_ENABLE
+  #if defined(CONFIG_IDF_TARGET_ESP32)
+    #if (OLED_SDA_PIN >= 6) && (OLED_SDA_PIN <= 11)
+      #error "OLED_SDA_PIN 6-11 is wired to the SPI flash on the classic ESP32."
+    #endif
+    #if (OLED_SCL_PIN >= 6) && (OLED_SCL_PIN <= 11)
+      #error "OLED_SCL_PIN 6-11 is wired to the SPI flash on the classic ESP32."
+    #endif
+    #if (OLED_SDA_PIN >= 34) || (OLED_SCL_PIN >= 34)
+      #error "GPIO 34-39 are input-only and cannot drive an I2C bus."
+    #endif
+  #endif
+  #if (OLED_SDA_PIN == OLED_SCL_PIN)
+    #error "OLED_SDA_PIN and OLED_SCL_PIN must differ."
+  #endif
+  #if (OLED_SDA_PIN == RELAY_UTILITY_PIN) || (OLED_SCL_PIN == RELAY_UTILITY_PIN) || \
+      (OLED_SDA_PIN == RELAY_LOAD_PIN)    || (OLED_SCL_PIN == RELAY_LOAD_PIN)    || \
+      (OLED_SDA_PIN == BUZZER_PIN)        || (OLED_SCL_PIN == BUZZER_PIN)        || \
+      (OLED_SDA_PIN == TRAVEL_SWITCH_PIN) || (OLED_SCL_PIN == TRAVEL_SWITCH_PIN)
+    #error "An OLED I2C pin collides with a relay, the buzzer or the travel switch."
+  #endif
+#endif
+
+/* ---- v6 guards ---- */
+#if SOC_EMERGENCY > SOC_LOAD_CUTOFF
+  #error "SOC_EMERGENCY must be at or below SOC_LOAD_CUTOFF: the load is shed first, the emergency alarm is the last-resort shout."
+#endif
+#if PV_POOR_MINUTES >= PV_GOOD_MINUTES
+  #error "PV_POOR_MINUTES must be below PV_GOOD_MINUTES or the PV verdict is ambiguous."
+#endif
+#if OLED_WX_START_HOUR >= OLED_WX_END_HOUR
+  #error "OLED weather window must start before it ends."
+#endif
+#if PV_HIST_DAYS < 3 || PV_HIST_DAYS > 31
+  #error "PV_HIST_DAYS out of range; the NVS blob is sized for a few weeks of daily records."
+#endif
+
+/* ---- v7 guards ---- */
+#if PV_SCORE_SUNNY <= PV_SCORE_PARTLY || PV_SCORE_PARTLY <= PV_SCORE_CLOUDY
+  #error "Expected-solar score cut points must be strictly descending: SUNNY > PARTLY > CLOUDY."
+#endif
+#if PV_SCORE_FULL_MIN < PV_GOOD_MINUTES
+  #error "PV_SCORE_FULL_MIN must be at least PV_GOOD_MINUTES or a merely good day already scores 100."
+#endif
+#if SOC_CEB_OFF - SOC_CEB_ON < 3
+  #error "SoC hysteresis band is too narrow to survive BMS quantisation; widen SOC_CEB_OFF."
+#endif
+#if SOURCE_MIN_DWELL_MS >= CEB_MIN_ON_MS
+  #error "SOURCE_MIN_DWELL_MS must be shorter than CEB_MIN_ON_MS or the dwell, not the CEB policy, becomes the binding constraint on a legitimate release."
+#endif
+#if SRC_STARTUP_MIN_MS >= SRC_STARTUP_MAX_MS
+  #error "SRC_STARTUP_MIN_MS must be below SRC_STARTUP_MAX_MS."
+#endif
+#if SOC_MAX_JUMP < 2 || SOC_MAX_JUMP > 50
+  #error "SOC_MAX_JUMP out of sane range."
+#endif
+#if SOC_CEB_ON + SOC_ENGAGE_HYST >= SOC_CEB_OFF
+  #error "The engage Schmitt band overlaps SOC_CEB_OFF; engage and release hysteresis would interact."
+#endif
+/* The region map must tile the panel without overlapping. */
+#if OLED_A_X1 >= OLED_C_X0
+  #error "The top area overlaps the reserved arrow lane."
+#endif
+#if OLED_C_X1 >= OLED_WIDTH || OLED_B_Y1 >= OLED_HEIGHT
+  #error "The region map runs off the panel."
+#endif
+#if OLED_A_Y1 >= OLED_RULE_Y || OLED_RULE_Y >= OLED_B_Y0
+  #error "The top area, the rule and the power row must not overlap."
+#endif
+#if OLED_RULE_W > OLED_A_W
+  #error "The rule is wider than the area it sits under."
+#endif
+#if OLED_A_W != (OLED_A_X1 - OLED_A_X0 + 1)
+  #error "OLED_A_W does not match OLED_A_X0..OLED_A_X1."
+#endif
+#if OLED_SOC_BASELINE > OLED_A_Y1
+  #error "The SoC baseline sits below the top area."
+#endif
+/* NOTE, not an error. On this build the lights share
+ * RELAY_LOAD_PIN with the protected load circuit, and loadCutoff
+ * already opens that relay at SOC_LOAD_CUTOFF (35%). So with
+ * LIGHTS_CUTOFF_SOC at the requested 25% the lights are ALREADY
+ * off by the time this guard would fire -- it is a backstop, and
+ * it only becomes the operative rule if SOC_LOAD_CUTOFF is ever
+ * lowered below it, or if the lights are moved to their own relay.
+ * Raise LIGHTS_CUTOFF_SOC above SOC_LOAD_CUTOFF to shed lighting
+ * BEFORE the rest of the load circuit. Flagged in the report. */
+#if LIGHTS_CUTOFF_SOC + LIGHTS_CUTOFF_HYST > 100
+  #error "The lights cutoff can never re-arm."
+#endif
+#if LIGHTS_OFF_HOUR > 23 || LIGHTS_FALLBACK_ON_HOUR > 23
+  #error "Lights schedule hours must be 0-23."
+#endif
+#if OLED_ARROW_CX - OLED_ARROW_HEAD_W / 2 < OLED_C_X0 || \
+    OLED_ARROW_CX + OLED_ARROW_HEAD_W / 2 > OLED_C_X1
+  #error "The arrow head is wider than the lane it is drawn in."
+#endif
+#if OLED_ARROW_GAP * 2 != OLED_ARROW_WRAP
+  #error "Two arrows only space evenly when the gap is half the wrap."
+#endif
+#if OLED_FRAME_MS < 40
+  #error "Under 40 ms the 1 kB I2C frame cannot complete before the next one is due."
+#endif
+#if OLED_TOM_START_HOUR >= OLED_TOM_END_HOUR || OLED_TOM_END_HOUR > 24
+  #error "The outlook window must be a non-empty range ending at or before midnight."
+#endif
+#if ETA_RESERVE_SOC != SOC_CEB_ON
+  #error "The ETA reserve must BE the CEB floor, not a copy of it that can drift."
+#endif
+#if ETA_AVG_MINUTES < 1 || ETA_AVG_MINUTES > 30
+  #error "ETA_AVG_MINUTES outside a sane smoothing window."
+#endif
+#if PRED_F_SUNNY <= PRED_F_PARTLY || PRED_F_PARTLY <= PRED_F_CLOUDY || \
+    PRED_F_CLOUDY <= PRED_F_RAIN  || PRED_F_RAIN   <= PRED_F_HEAVYRAIN || \
+    PRED_F_HEAVYRAIN <= PRED_F_STORM
+  #error "Label factors must decrease monotonically from SUNNY to STORM."
+#endif
+#if PRED_STRONG <= PRED_GOOD || PRED_GOOD <= PRED_WEAK
+  #error "Confidence thresholds must decrease from STRONG to WEAK."
+#endif
+#if WEATHER_ENABLE && (WEATHER_TRUST_DAYS < 1 || WEATHER_TRUST_DAYS > WEATHER_DAYS)
+  #error "WEATHER_TRUST_DAYS must be between 1 and WEATHER_DAYS."
+#endif
+#if WEATHER_ENABLE && (WX_CLEAR_CLOUD_PCT >= WX_HEAVY_CLOUD_PCT)
+  #error "WX_CLEAR_CLOUD_PCT must sit below WX_HEAVY_CLOUD_PCT."
+#endif
+#if PV_CONF_BASE + PV_CONF_PER_DAY * PV_CONF_DAY_CAP <= WX_CONF_FRESH
+  #error "A mature PV model must be able to outrank a fresh forecast, or section 8k has no effect."
 #endif

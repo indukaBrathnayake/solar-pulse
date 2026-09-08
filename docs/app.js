@@ -65,11 +65,107 @@ function fmtHM(hours) {
 }
 
 /* ---------------- main render ---------------- */
+/* ============================================================
+   HEADER STATUS STRIP  (patch 4 part F)
+
+   Every field is a value the ESP already publishes -- nothing here
+   is derived, guessed or timed in the browser except the age of the
+   last write, which is the one thing only the browser can know.
+
+     SYS      live.sysFault   (PANIC / BROWNOUT / any watchdog boot)
+     WIFI     freshness of /live -- a stale feed means the ESP is
+              not reaching Firebase, which is what WIFI means here
+     BLE      live.bmsLink
+     FB       the same freshness, from the write side
+     UP       live.up, seconds since boot
+     LAST SYNC  now - live.ts
+   ============================================================ */
+function fmtUp(sec) {
+  if (sec == null || !isFinite(sec)) return "--";
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (d) return `${d}d ${String(h).padStart(2, "0")}h`;
+  if (h) return `${h}h ${String(m).padStart(2, "0")}m`;
+  return `${m}m`;
+}
+
+function fmtAge(ms) {
+  if (!isFinite(ms) || ms < 0) return "--";
+  const sec = Math.round(ms / 1000);
+  if (sec < 90) return sec + "s";
+  const m = Math.round(sec / 60);
+  if (m < 90) return m + "m";
+  return Math.round(m / 60) + "h";
+}
+
+function renderStatusStrip(fresh, ageMs) {
+  const dot = (id, on) => { const e = $(id); if (e) e.classList.toggle("on", !!on); };
+  dot("st-wifi-dot", fresh);
+  dot("st-ble-dot", fresh && live.bmsLink);
+  dot("st-fb-dot", fresh);
+
+  const sys = $("st-sys");
+  if (sys) {
+    // Sticky by design: a fault reset stays on the header until the
+    // box boots cleanly again, so an overnight watchdog is still
+    // visible in the morning.
+    const fault = !!live.sysFault;
+    sys.textContent = fault ? "SYS FAULT" : "SYS OK";
+    sys.classList.toggle("fault", fault);
+    sys.title = live.boot ? `last reset: ${live.boot}` : "";
+  }
+  const up = $("st-up");   if (up) up.textContent = fmtUp(live.up);
+  const sy = $("st-sync"); if (sy) sy.textContent = fmtAge(ageMs);
+}
+
+/* The boot ring, straight from the ESP's NVS. */
+const RESET_BLURB = {
+  POWERON: "power applied", EXT: "external reset pin", SW: "software restart",
+  PANIC: "firmware crash", INT_WDT: "interrupt watchdog",
+  TASK_WDT: "task watchdog", WDT: "watchdog", BROWNOUT: "supply voltage collapsed",
+  DEEPSLEEP: "woke from deep sleep", UNKNOWN: "not recorded",
+};
+const RESET_FAULT = ["PANIC", "BROWNOUT", "INT_WDT", "TASK_WDT", "WDT"];
+
+function renderResets() {
+  const body = $("reset-rows"), sub = $("reset-sub");
+  if (!body) return;
+  const rows = Array.isArray(live.resets) ? live.resets : null;
+  if (!rows) {
+    body.innerHTML = "";
+    if (sub) sub.textContent = "This firmware does not record reset history yet";
+    return;
+  }
+  if (!rows.length) {
+    body.innerHTML = "";
+    if (sub) sub.textContent = "No resets recorded yet";
+    return;
+  }
+  const faults = rows.filter((r) => RESET_FAULT.includes(r[0])).length;
+  if (sub) {
+    sub.textContent = `Last ${rows.length} boot${rows.length === 1 ? "" : "s"}` +
+      ` · ${faults} fault${faults === 1 ? "" : "s"}` +
+      (live.relayOps != null ? ` · ${live.relayOps} lifetime relay transfers` : "");
+  }
+  body.innerHTML = rows.map((r) => {
+    const [reason, stamp, upMin] = r;
+    const fault = RESET_FAULT.includes(reason);
+    const when = stamp && stamp > 19700101
+      ? `${String(stamp).slice(0, 4)}-${String(stamp).slice(4, 6)}-${String(stamp).slice(6, 8)}`
+      : "clock unset";
+    const prev = upMin ? fmtUp(upMin * 60) : "--";
+    return `<tr class="${fault ? "fault" : ""}"><td>${when}</td>` +
+           `<td>${reason} · ${RESET_BLURB[reason] || ""}</td><td>${prev}</td></tr>`;
+  }).join("");
+}
+
 function render() {
   if (!live) return;
   const now = Date.now();
   const ageMs = now - live.ts * 1000;
   const fresh = ageMs < STALE_MS;
+  renderStatusStrip(fresh, ageMs);
+  renderResets();
   const hour = new Date().getHours();
 
   document.body.classList.toggle("live", fresh);
@@ -141,44 +237,76 @@ function render() {
   $("time-fill").style.background = color;
   $("time-label").textContent = fresh ? label : "no recent data";
 
-  /* ---------- source relays, travel mode ----------
-     Sent by firmware v3. Older firmware simply omits these keys,
-     in which case the card stays on "--" and nothing breaks. */
-  const src = live.src || "none";
-  const srcTxt = src === "solar" ? "Solar + battery"
-               : src === "utility" ? "Utility · CEB"
-               : "not switched";
-  $("src-name").textContent = fresh && live.src ? srcTxt : "--";
+  /* ---------- powering the house ----------
+     AUTHORITATIVE. live.house is computed by the firmware from the
+     committed relay state (srcActual) inside the one source state
+     machine -- it is not inferred here from SoC, PV, voltage, time
+     or the CEB threshold, and there is no second source-control
+     system in the browser.
+
+     On the v5 changeover relay the coil being energised IS "CEB";
+     everything else, including the break-before-make dead time,
+     leaves the load bus on the inverter. That is why "not switched"
+     is gone: with this hardware there is no such electrical state,
+     and showing it was the bug. */
+  const house = live.house || null;          // "CEB" | "Pack"
+  const onCeb = house === "CEB";
+  $("src-name").textContent = fresh && house ? house : "--";
   $("src-why").textContent = live.why
     ? (live.manual ? "manual · " : "automatic · ") + live.why
     : "controller not reporting";
-  chip("chip-solar", fresh && live.relayS, "on");
-  chip("chip-util",  fresh && live.relayU, "warn");
+  chip("chip-solar", fresh && house === "Pack", "on");
+  chip("chip-util",  fresh && onCeb, "warn");
   chip("chip-light", fresh && live.light,  "gold");
+
+  /* Lights. The chip shows the OUTPUT; this line shows the MODE and
+     why it is where it is, which are different facts -- in AUTO at
+     noon the lamp is off and nothing is wrong. Firmware that
+     predates these keys omits them, so the line hides rather than
+     inventing a schedule. */
+  const ll = $("lights-line");
+  if (ll) {
+    const lm = live.lightMode;
+    if (!fresh || !lm) {
+      ll.textContent = "lights --";
+    } else if (live.lightsLow) {
+      ll.textContent = "lights off · low battery";
+    } else if (lm === "auto") {
+      ll.textContent = `lights auto · on at ${live.lightOn || "--:--"}` +
+        (live.lightSunset === false ? " (fallback, no sunset cached)" : " (sunset)") +
+        ` · off at ${live.lightOff || "--:--"}`;
+    } else {
+      ll.textContent = `lights forced ${lm}`;
+    }
+  }
+  if ($("light-min")) $("light-min").textContent = live.lightMin ?? 0;
   $("util-min").textContent  = live.utilMin ?? 0;
   $("pv-now").textContent    = (live.pvW ?? 0).toFixed(0);
   $("load-now").textContent  = (live.loadW ?? 0).toFixed(0);
 
-  /* ---------- tonight's plan ----------
-     Decided by the ESP at 18:15: did the pack reach its 99% target
-     today? If not it is a cloudy day, and the evening rule is allowed
-     to run the pack down to the relaxed floor before touching CEB.
-     Firmware older than this simply omits both keys, and the line
-     hides itself rather than showing a wrong number. */
+  /* ---------- CEB / weather plan ----------
+     v5 replaces the old 99%-target "rainy" rule with the CEB state
+     machine. Firmware that predates it omits live.ceb, in which case
+     the line hides itself rather than showing a wrong number. */
   const tn = $("tonight");
-  if (live.nightFloor == null) {
+  if (live.ceb == null) {
     tn.classList.add("hidden");
   } else {
     tn.classList.remove("hidden");
-    tn.classList.toggle("rainy", !!live.rainy);
-    tn.textContent = live.rainy
-      ? `tonight: 99% target missed, pack may run down to ${live.nightFloor}% before CEB`
-      : `tonight: target reached, pack held above ${live.nightFloor}%`;
+    const heavy = live.wx === "heavy";
+    tn.classList.toggle("rainy", heavy);
+    const wxTxt = live.wx === "clear" ? "clear day"
+                : heavy               ? "poor-solar day"
+                : live.wx === "half"  ? "mixed day"
+                : "forecast unavailable";
+    tn.textContent = live.ceb
+      ? `CEB carrying the house · ${wxTxt} · handing back at ${live.cebRel} if the pack allows`
+      : `on solar · ${wxTxt} · CEB engages at ${live.cebOn}%`;
   }
 
   setPill("pill-src",
-    !fresh || !live.src ? "" : src === "solar" ? "on" : src === "utility" ? "warn" : "",
-    src === "solar" ? "On solar" : src === "utility" ? "On CEB" : "Source --");
+    !fresh || !house ? "" : onCeb ? "warn" : "on",
+    house ? (onCeb ? "On CEB" : "On Pack") : "Source --");
   $("pill-travel").classList.toggle("hidden", !live.travel);
   if (live.travel) setPill("pill-travel", "gold", "Travel mode");
 
@@ -208,6 +336,7 @@ function render() {
   $("mos-t").textContent = live.mosT ?? "--";
   $("bal-state").textContent = live.bal ? `ON ${(live.balI ?? 0).toFixed(2)} A` : "idle";
 
+  renderWeather();
   trackBacklog(live.buffered ?? 0);
 }
 
@@ -291,16 +420,113 @@ async function applyBackfill(count) {
   }, 8000);
 }
 
+
+
+/* ============================================================
+   TODAY'S WEATHER
+
+   Rendered from live.wxIcon / live.wxText, which the ESP32 derives
+   from the WMO weather code. The OLED renders from the same enum,
+   so the two displays cannot disagree about today's condition.
+
+   One distinct shape per condition -- not one generic cloud with
+   different labels.
+   ============================================================ */
+const WX_SVG = {
+  sunny: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4.2" fill="currentColor" stroke="none"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.6" y1="4.6" x2="6.4" y2="6.4"/><line x1="17.6" y1="17.6" x2="19.4" y2="19.4"/><line x1="4.6" y1="19.4" x2="6.4" y2="17.6"/><line x1="17.6" y1="6.4" x2="19.4" y2="4.6"/></g></svg>',
+  partly: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="8.5" cy="7.5" r="3.2" fill="currentColor" stroke="none"/><line x1="8.5" y1="1.4" x2="8.5" y2="3"/><line x1="2.4" y1="7.5" x2="4" y2="7.5"/><line x1="4.2" y1="3.2" x2="5.3" y2="4.3"/><path d="M8 19h9a3.5 3.5 0 0 0 .3-7 5 5 0 0 0-9.5 1.2A3 3 0 0 0 8 19z"/></svg>',
+  cloudy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 18h10a3.8 3.8 0 0 0 .3-7.6 5.4 5.4 0 0 0-10.3 1.3A3.2 3.2 0 0 0 7 18z"/></svg>',
+  fog: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 13h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 13z"/><line x1="4" y1="17" x2="20" y2="17"/><line x1="6" y1="20.5" x2="18" y2="20.5"/></svg>',
+  rain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 14h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 14z"/><line x1="8.5" y1="17" x2="7.5" y2="20"/><line x1="13" y1="17" x2="12" y2="20"/><line x1="17.5" y1="17" x2="16.5" y2="20"/></svg>',
+  heavyrain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 13h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 13z"/><line x1="7" y1="15.5" x2="5.6" y2="19"/><line x1="10.5" y1="15.5" x2="9.1" y2="19"/><line x1="14" y1="15.5" x2="12.6" y2="19"/><line x1="17.5" y1="15.5" x2="16.1" y2="19"/><line x1="9" y1="19.5" x2="8" y2="22"/><line x1="15" y1="19.5" x2="14" y2="22"/></svg>',
+  storm: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 12.5h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 12.5z"/><path d="M13 15l-3.2 4.2h3L11 23"/><line x1="17" y1="15.5" x2="16" y2="18.5"/></svg>',
+  unknown: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 16h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 16z"/><line x1="12" y1="19.5" x2="12" y2="19.6" stroke-width="2.4"/></svg>',
+};
+
+function renderWeather() {
+  const strip = $("wx-strip");
+  if (!strip) return;
+  // Firmware that predates the weather keys omits them: hide rather
+  // than invent a condition.
+  if (!live || !live.wxIcon) { strip.classList.add("hidden"); return; }
+  strip.classList.remove("hidden");
+
+  const key = WX_SVG[live.wxIcon] ? live.wxIcon : "unknown";
+  strip.dataset.wx = key;
+  $("wx-ico").innerHTML = WX_SVG[key];
+  $("wx-cond").textContent = live.wxText || "UNKNOWN";
+
+  const bits = [];
+  if (live.wxCloud != null)  bits.push(`${live.wxCloud}% cloud`);
+  if (live.wxPrecip != null) bits.push(`${Number(live.wxPrecip).toFixed(1)} mm rain`);
+  // What the controller is ACTING on, which may differ from the
+  // forecast once measured PV has overridden it.
+  if (live.pvVerdict === "good")      bits.push("PV confirms a good day");
+  else if (live.pvVerdict === "poor") bits.push("PV says worse than forecast");
+  $("wx-sub").textContent = bits.join(" · ");
+
+  const age = live.wxAgeDays;
+  const el = $("wx-age");
+  if (age == null || age < 0) {
+    el.textContent = "no forecast";
+    el.classList.add("stale");
+  } else if (age === 0) {
+    el.textContent = "today";
+    el.classList.remove("stale");
+  } else {
+    el.textContent = `forecast ${age}d old`;
+    el.classList.toggle("stale", age >= 2);
+  }
+}
+
 /* ---------------- chart ---------------- */
+/* ============================================================
+   ONE AXIS CONFIGURATION, SHARED BY EVERY CHART
+
+   The Generation & Usage chart used to build its own axes: no
+   explicit tick font, so it fell through to Chart.defaults at
+   12 px while its x ticks were 10 px, and no maxTicksLimit, so the
+   y axis labelled every 50 W. Two different sizes on one chart is
+   what read as "shaky and oversized".
+
+   'IBM Plex Mono' was also never loaded -- index.html requests
+   Chakra Petch, Outfit and JetBrains Mono -- so this default
+   silently resolved to the generic monospace face, and the inline
+   theme script then overrode it with JetBrains Mono anyway. Naming
+   the family that is actually fetched removes a difference that
+   depended on script order.
+
+   Everything below is defined ONCE and handed to every chart, so
+   the axes cannot drift apart again.
+   ============================================================ */
+const FONT_MONO = "'JetBrains Mono', monospace";
+const FONT_UI   = "Outfit, system-ui, sans-serif";
+
+// Tick text. 10 px desktop / 9 px mobile, regular weight -- the
+// heavy look came from an unset weight resolving against a face
+// loaded at 400/600/800.
+const axisTickFont  = () => ({ family: FONT_MONO, size: isNarrow() ? 9 : 10, weight: 400 });
+const axisTitleFont = () => ({ family: FONT_UI,   size: isNarrow() ? 10 : 11, weight: 500 });
+const legendFont    = () => ({ family: FONT_UI,   size: 11, weight: 500 });
+
+// A fixed y-scale width so every plot area starts at the same x and
+// the charts line up vertically down the page. Chart.js sizes the
+// y scale to its widest label, so "500" and "100%" would otherwise
+// give two different left edges.
+const Y_SCALE_W = 46;
+
 Chart.defaults.color = "#8B8175";
 Chart.defaults.borderColor = "#ECE3D6";
-Chart.defaults.font.family = "'IBM Plex Mono', monospace";
+Chart.defaults.font.family = FONT_MONO;
 
 const chart = new Chart($("chart-main"), {
   type: "line",
   data: { labels: [], datasets: [{
-    data: [], borderColor: "#F2A20C", borderWidth: 2, pointRadius: 0,
-    fill: { target: "origin", above: "rgba(242,162,12,0.10)", below: "rgba(30,140,125,0.10)" },
+    // Seed colours only -- styleChart() repaints from the tokens on
+    // the first update. They still matter for the frame before that,
+    // so they carry the current palette rather than the old orange.
+    data: [], borderColor: "#FACC15", borderWidth: 2, pointRadius: 0,
+    fill: { target: "origin", above: "rgba(250,204,21,0.10)", below: "rgba(87,166,242,0.10)" },
     tension: 0.3,
   }]},
   options: {
@@ -313,11 +539,8 @@ function setChartType(type, labels, datasets) {
   chart.config.type = type;
   chart.data.labels = labels;
   chart.data.datasets = datasets;
-  if (type === "line") {
-    chart.options.scales.y.title.text = "W";
-  } else {
-    chart.options.scales.y.title.text = "kWh";
-  }
+  chart.options.scales.y =
+    valueAxis(type === "line" ? "W" : "kWh", themeColor("--muted"), themeColor("--grid"));
   // The day view pins x to a linear 0-1440 minute axis. Month and
   // year are label-indexed bars, so the category axis has to be put
   // back or they inherit the fixed 24 h range and render nothing.
@@ -429,10 +652,203 @@ function minutesOfDay(ts, dateStr) {
   return (ts * 1000 - midnight) / 60000;
 }
 
+/* ============================================================
+   PART E - THE SHARED TIME AXIS
+
+   Both day charts previously drew a label every 2 hours as
+   "00:00", "02:00", ... Twelve five-character labels do not fit
+   across 360 px, so they collided into an unreadable block; on
+   desktop they were merely crowded.
+
+   Three changes fix it, and BOTH charts take the axis from this
+   one function so they cannot drift apart or misalign vertically:
+
+     1. Hours only. "06" instead of "06:00" is 60% narrower and
+        loses nothing -- the unit is named once, in the axis title.
+     2. A breakpoint. 3-hourly on desktop, 6-hourly under 600 px.
+     3. autoSkip with maxTicksLimit, so if a container is narrower
+        than the breakpoint assumed, Chart.js drops labels itself
+        rather than overprinting them.
+
+   Labels stay horizontal (maxRotation 0): rotated ticks are
+   harder to read and cost vertical space that the chart needs.
+   ============================================================ */
+const NARROW_PX = 600;
+function isNarrow() {
+  return (window.innerWidth || document.documentElement.clientWidth) < NARROW_PX;
+}
+
+// Minutes-of-day -> "00".."24". Whole hours only; ticks always land
+// on an exact hour because stepSize is a multiple of 60.
+function hourTick(mins) {
+  const h = Math.round(mins / 60);
+  return String(h).padStart(2, "0");
+}
+
+/* MUST return a fresh plain object every call. chart.options is a
+   Chart.js proxy; handing back a shared object that has already been
+   assigned into one chart's options and assigning it into another
+   builds a self-reference and the scriptable resolver recurses
+   forever. Same trap documented on the tooltip callbacks below. */
+function timeAxis(dim, grid) {
+  const narrow = isNarrow();
+  return {
+    type: "linear",
+    min: 0,
+    max: 1440,
+    offset: false,
+    bounds: "ticks",
+    grid: { color: grid },
+    ticks: {
+      stepSize: narrow ? 360 : 180,          // 6 h on mobile, 3 h on desktop
+      autoSkip: true,
+      maxTicksLimit: narrow ? 5 : 9,
+      maxRotation: 0,
+      minRotation: 0,
+      padding: 4,
+      color: dim,
+      font: axisTickFont(),
+      callback: (v) => hourTick(v),
+    },
+    title: {
+      display: true,
+      text: "Time (h)",
+      color: dim,
+      font: axisTitleFont(),
+      padding: { top: 2, bottom: 0 },
+    },
+  };
+}
+
+/* The y counterpart. Same discipline: explicit font, explicit
+   colour, explicit padding, and a tick CEILING rather than a step,
+   so the labels stay readable whatever the day's peak turns out to
+   be. About six is the most a 200 px tall plot can carry.
+
+   afterFit pins the scale width, which is what actually aligns the
+   plot areas of the charts stacked down the page.
+
+   Returns a fresh plain object every call -- chart.options is a
+   Chart.js proxy and a shared object assigned into two charts
+   builds a self-reference the resolver recurses on. */
+function valueAxis(text, dim, grid, extra) {
+  const a = {
+    beginAtZero: true,
+    grid: { color: grid },
+    ticks: {
+      maxTicksLimit: 6,
+      color: dim,
+      padding: 4,
+      font: axisTickFont(),
+    },
+    title: {
+      display: true,
+      text: text,
+      color: dim,
+      font: axisTitleFont(),
+    },
+    afterFit: (scale) => { scale.width = Y_SCALE_W; },
+  };
+  if (extra) {
+    if (extra.min != null) a.min = extra.min;
+    if (extra.max != null) a.max = extra.max;
+    if (extra.callback) a.ticks.callback = extra.callback;
+    if (extra.stepSize) a.ticks.stepSize = extra.stepSize;
+  }
+  return a;
+}
+
+// 8 px under the ticks so the axis title is never clipped.
+function applyAxisPadding(chart) {
+  chart.options.layout.padding.bottom = 8;
+}
+
+// Minutes-of-day -> "HH:MM". Rounding to a whole minute FIRST is
+// what keeps decimals off the axis, and it also fixes a carry bug:
+// Math.round(59.9999) is 60, so the old version could render
+// "11:60" in a tooltip for a sample landing on a minute boundary.
 function hhmm(mins) {
-  const h = Math.floor(mins / 60), m = Math.round(mins % 60);
+  let t = Math.round(mins);
+  if (!isFinite(t) || t < 0) t = 0;
+  const h = Math.floor(t / 60), m = t % 60;
   return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
 }
+
+/* ============================================================
+   PART F - CEB RUNTIME SHADING
+
+   Every history sample the ESP writes already carries `src`, the
+   committed source state (0 none, 1 pack/solar, 2 CEB/utility) --
+   buildSampleJson() has shipped it since v4. So this needs NO new
+   firmware field, NO schema change and NO new upload path, and in
+   particular it is never inferred from SoC or PV.
+
+   Samples are about 60 s apart. A run is closed when the source
+   changes OR when the gap to the next sample exceeds SRC_GAP_MAX,
+   so a logging outage renders as an unshaded gap rather than as an
+   invented hour of grid time.
+   ============================================================ */
+const SRC_UTILITY = 2;              // matches enum Source in config.h
+const SRC_GAP_MAX = 5;              // minutes; longer is a data gap
+
+// -> { bands: [{a,b}] in minutes-of-day, cebMin, packMin }
+function cebRuns(rows, dateStr) {
+  const out = { bands: [], cebMin: 0, packMin: 0 };
+  if (!rows || rows.length < 2) return out;
+
+  let open = null;
+  for (let i = 0; i < rows.length - 1; i++) {
+    const a = rows[i], b = rows[i + 1];
+    if (a.src == null) continue;
+    const t0 = minutesOfDay(a.t, dateStr);
+    const t1 = minutesOfDay(b.t, dateStr);
+    const dt = t1 - t0;
+    if (!(dt > 0) || dt > SRC_GAP_MAX) {        // gap: close and skip
+      if (open) { out.bands.push(open); open = null; }
+      continue;
+    }
+    if (Number(a.src) === SRC_UTILITY) {
+      out.cebMin += dt;
+      if (open) open.b = t1;
+      else open = { a: t0, b: t1 };
+    } else {
+      out.packMin += dt;
+      if (open) { out.bands.push(open); open = null; }
+    }
+  }
+  if (open) out.bands.push(open);
+  return out;
+}
+
+function hoursMins(mins) {
+  const m = Math.max(0, Math.round(mins));
+  const h = Math.floor(m / 60);
+  return h ? `${h}h ${String(m % 60).padStart(2, "0")}m` : `${m}m`;
+}
+
+/* Drawn BEHIND the datasets, so the blue and green lines stay fully
+   legible on top of the tint. */
+const cebBandPlugin = {
+  id: "cebBands",
+  beforeDatasetsDraw(chart, _args, opts) {
+    const bands = opts && opts.bands;
+    if (!bands || !bands.length) return;
+    const x = chart.scales.x;
+    const area = chart.chartArea;
+    if (!x || !area) return;
+    const ctx = chart.ctx;
+    ctx.save();
+    ctx.fillStyle = opts.color || "rgba(200,150,60,0.16)";
+    for (const b of bands) {
+      const x0 = x.getPixelForValue(Math.max(0, b.a));
+      const x1 = x.getPixelForValue(Math.min(1440, b.b));
+      if (x1 <= x0) continue;
+      ctx.fillRect(x0, area.top, Math.max(1, x1 - x0), area.bottom - area.top);
+    }
+    ctx.restore();
+  },
+};
+Chart.register(cebBandPlugin);
 
 function drawDay() {
   // A CATEGORY axis takes its width from however many samples exist,
@@ -445,49 +861,405 @@ function drawDay() {
   const use = ring.rows.map((s) => ({ x: minutesOfDay(s.t, ring.date), y: s.p < 0 ? -s.p : 0 }));
 
   chart.config.type = "line";
-  chart.options.scales.y.title.text = "W";
-  chart.options.scales.y.beginAtZero = true;
+  // The same axis pair the SoC chart uses, so the two line up and
+  // share every font, colour and padding value.
+  chart.options.scales.y = valueAxis("W", themeColor("--muted"), themeColor("--grid"));
   chart.data.labels = [];                      // linear axis: points carry x
 
   // Must be a PLAIN literal. chart.options is a Chart.js proxy, so
   // Object.assign({}, chart.options.scales.x, ...) copies the
   // resolver's own internals back into itself and the scriptable
   // resolver then recurses forever ("Recursion detected").
-  chart.options.scales.x = {
-    type: "linear",
-    min: 0,
-    max: 1440,                                 // 24 h, never rescaled
-    offset: false,
-    bounds: "ticks",
-    ticks: {
-      stepSize: 120,                           // a label every 2 hours
-      autoSkip: false,
-      maxRotation: 0,
-      callback: (v) => hhmm(v),
-    },
-  };
+  chart.options.scales.x = timeAxis(themeColor("--muted"), themeColor("--grid"));
+  applyAxisPadding(chart);
 
+  // Usage first, generation second: the point of this system is to
+  // understand what the house consumed, with what the array made as
+  // the supporting number. The inline theme glue in index.html now
+  // colours by LABEL, not by index, so this order is safe to change.
   chart.data.datasets = [
-    { label: "Generation (charging)", data: gen, borderWidth: 2, pointRadius: 0,
-      fill: "origin", tension: 0.35, spanGaps: false },
     { label: "Electricity use", data: use, borderWidth: 2, pointRadius: 0,
       fill: "origin", tension: 0.35, spanGaps: false },
+    { label: "Generation (charging)", data: gen, borderWidth: 2, pointRadius: 0,
+      fill: "origin", tension: 0.35, spanGaps: false },
   ];
+  // Without an explicit title callback Chart.js prints the raw linear
+  // x value for a tooltip -- e.g. "457.8166666666667". Format it.
+  // NOTE: do NOT write `plugins.tooltip = plugins.tooltip || {}` here.
+  // chart.options is a Chart.js proxy, so assigning it into itself
+  // builds a self-reference and the resolver recurses forever
+  // ("Maximum call stack size exceeded"). plugins.tooltip always
+  // exists from the defaults, so just set the callbacks on it.
+  chart.options.plugins.tooltip.callbacks = {
+    title: (items) => (items.length ? hhmm(items[0].parsed.x) : ""),
+    label: (it) => ` ${it.dataset.label}: ${Math.round(it.parsed.y)} W`,
+  };
   chart.options.plugins.legend.display = true;
+
+  // Part F. Shade the periods the house actually ran on CEB, and
+  // say how long that was underneath.
+  const runs = cebRuns(ring.rows, ring.date);
+  // Dedicated tokens, identical in both themes: the band is a 15%
+  // wash and the swatch border is the solid yellow. Reading --amber
+  // instead would pick up the darker light-theme stroke colour.
+  const bandFill = themeColor("--ceb-band");
+  const bandLine = themeColor("--ceb-line");
+  chart.options.plugins.cebBands = { bands: runs.bands, color: bandFill };
+  // An empty dataset renders nothing but gives the legend its
+  // swatch, which is cheaper and less fragile than overriding
+  // generateLabels.
+  chart.data.datasets.push({
+    label: "On CEB", data: [], backgroundColor: bandFill,
+    borderColor: bandLine, borderWidth: 0, pointRadius: 0, fill: true,
+    // The theme glue in index.html repaints datasets by label; this
+    // one owns its colour because it has to match the shading.
+    ownColor: true,
+  });
+
   chart.update("none");                       // no animation = no flicker
+
+  const cebEl = $("ceb-caption");
+  if (cebEl) {
+    const known = runs.cebMin + runs.packMin;
+    cebEl.innerHTML = !known
+      ? "No source history stored for this day yet"
+      : `<span><span class="swatch"></span>CEB runtime today: <b>${hoursMins(runs.cebMin)}</b></span>` +
+        `<span>Pack runtime: <b>${hoursMins(runs.packMin)}</b></span>`;
+  }
+
+  // Same ring, same samples, further views of them.
+  drawSoc();
+  drawPred();
 
   currentRows = {
     kind: "day", date: ring.date,
-    columns: ["time", "voltage", "current", "power", "soc"],
+    columns: ["time", "voltage", "current", "power", "soc", "source"],
     rows: ring.rows.map((s) => ({
       time: new Date(s.t * 1000).toISOString(),
       voltage: s.v, current: s.i, power: s.p, soc: s.soc,
+      source: s.src == null ? "" : (Number(s.src) === SRC_UTILITY ? "CEB" : "Pack"),
     })),
   };
   const live = ring.date === localDate();
   $("chart-caption").textContent = ring.rows.length
     ? `Power in/out of the battery on ${ring.date} · ${ring.rows.length} samples${live ? " · live" : ""}`
     : `No samples stored for ${ring.date} yet`;
+}
+
+
+/* ============================================================
+   BATTERY SoC OVER TIME
+
+   Reuses the SAME ring the generation chart is built from -- the
+   ESP has always shipped `soc` inside every /history sample, so
+   this needs no new data source, no new Firebase path and no
+   firmware change to feed it.
+
+   Truthful by construction: one point per stored sample, no
+   interpolation, and spanGaps:false so a logging gap renders as a
+   gap rather than a straight line pretending the pack was there.
+   ============================================================ */
+let socChart = null;
+
+function drawSoc() {
+  const pts = ring.rows
+    .filter((s) => s.soc != null && isFinite(s.soc))
+    .map((s) => ({ x: minutesOfDay(s.t, ring.date), y: Number(s.soc) }));
+
+  const dim  = themeColor("--muted");
+  const grid = themeColor("--grid");
+  const tealC = themeColor("--teal");
+
+  const ds = [{
+    label: "Battery SoC",
+    data: pts,
+    borderColor: tealC,
+    backgroundColor: tealC + "2E",
+    borderWidth: 2,
+    pointRadius: 0,
+    fill: "origin",
+    tension: 0.3,
+    spanGaps: false,
+  }];
+
+  if (!socChart) {
+    socChart = new Chart($("chart-soc"), {
+      type: "line",
+      data: { labels: [], datasets: ds },
+      options: {
+        maintainAspectRatio: false,
+        animation: { duration: 0 },
+        interaction: { mode: "index", intersect: false },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              title: (items) => (items.length ? hhmm(items[0].parsed.x) : ""),
+              label: (it) => ` ${Math.round(it.parsed.y)} %`,
+            },
+          },
+        },
+        scales: {
+          x: timeAxis(dim, grid),
+          // Identical construction to the usage chart; only the
+          // range, the unit suffix and the title differ.
+          y: valueAxis("SoC", dim, grid,
+                       { min: 0, max: 100, stepSize: 20, callback: (v) => v + "%" }),
+        },
+      },
+    });
+  } else {
+    socChart.data.datasets = ds;
+  }
+
+  const o = socChart.options;
+  // Rebuilt rather than patched: crossing the 600 px breakpoint has
+  // to change stepSize and font size too, not just the colours.
+  o.scales.x = timeAxis(dim, grid);
+  o.scales.y = valueAxis("SoC", dim, grid,
+                         { min: 0, max: 100, stepSize: 20, callback: (v) => v + "%" });
+  applyAxisPadding(socChart);
+  socChart.update("none");
+
+  const el = $("soc-caption");
+  if (!el) return;
+  if (!pts.length) {
+    el.textContent = `No state-of-charge samples stored for ${ring.date} yet`;
+    return;
+  }
+  let lo = pts[0].y, hi = pts[0].y;
+  for (const p of pts) { if (p.y < lo) lo = p.y; if (p.y > hi) hi = p.y; }
+  el.textContent =
+    `State of charge on ${ring.date} · now ${Math.round(pts[pts.length - 1].y)}%` +
+    ` · low ${Math.round(lo)}% · high ${Math.round(hi)}%`;
+}
+
+
+/* ============================================================
+   PART G - PREDICTION ACCURACY
+
+   Two curves: what this array HAS produced hour by hour on
+   previous days, and what it produced today.
+
+   WHERE THE EXPECTED CURVE COMES FROM. The ESP32 does not publish
+   an hourly profile, and adding one would mean touching the upload
+   path, which is locked. So it is computed here from history days
+   that are already in Firebase.
+
+   That is not free -- a day is roughly 1400 samples -- so:
+     - at most PROFILE_DAYS days are ever fetched,
+     - the fetch is deferred to idle time after the live day has
+       loaded, so it never competes with the charts above,
+     - and only the RESULT (24 hours x 3 numbers) is cached, in
+       localStorage, keyed by date. One fetch per day per browser.
+
+   With fewer than PROFILE_MIN_DAYS days the card says so rather
+   than drawing a confident band through two data points.
+   ============================================================ */
+const PROFILE_DAYS = 5;
+const PROFILE_MIN_DAYS = 3;
+const PROFILE_KEY = "sp.pvProfile.v1";
+
+let predChart = null;
+let pvProfile = null;          // { date, days, hours:[{p25,p50,p75}|null x24] }
+let profileBusy = false;
+
+function loadProfileCache() {
+  try {
+    const raw = localStorage.getItem(PROFILE_KEY);
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    return (o && o.date === localDate() && Array.isArray(o.hours)) ? o : null;
+  } catch (e) { return null; }   // private mode, cleared storage, quota
+}
+
+function saveProfileCache(o) {
+  try { localStorage.setItem(PROFILE_KEY, JSON.stringify(o)); } catch (e) {}
+}
+
+function quantile(sorted, q) {
+  if (!sorted.length) return 0;
+  const i = (sorted.length - 1) * q;
+  const lo = Math.floor(i), hi = Math.ceil(i);
+  return lo === hi ? sorted[lo] : sorted[lo] + (sorted[hi] - sorted[lo]) * (i - lo);
+}
+
+/* Charging power only. p > 0 is energy going INTO the pack, which
+   is the same definition the generation curve uses -- this card
+   must not invent a second one. */
+function hourlyFromRows(rows, dateStr) {
+  const buckets = Array.from({ length: 24 }, () => []);
+  for (const r of rows) {
+    const m = minutesOfDay(r.t, dateStr);
+    if (!(m >= 0 && m < 1440)) continue;
+    buckets[Math.floor(m / 60)].push(r.p > 0 ? r.p : 0);
+  }
+  return buckets.map((b) => {
+    if (!b.length) return null;
+    b.sort((x, y) => x - y);
+    return { p25: quantile(b, 0.25), p50: quantile(b, 0.5), p75: quantile(b, 0.75) };
+  });
+}
+
+async function buildProfile() {
+  if (profileBusy) return;
+  const cached = loadProfileCache();
+  if (cached) { pvProfile = cached; drawPred(); return; }
+
+  profileBusy = true;
+  const perDay = [];          // [dayIndex][hour] = mean charging W
+  let got = 0;
+  for (let back = 1; back <= PROFILE_DAYS; back++) {
+    const d = new Date();
+    d.setDate(d.getDate() - back);
+    const key = localDate(d);      // the existing helper, not a second one
+    let snap;
+    try {
+      snap = await db.ref("history/" + key).limitToLast(RING_MAX).once("value");
+    } catch (e) { continue; }
+    const rows = [];
+    // DataSnapshot.forEach CANCELS on a truthy return, so the body
+    // must not return the push() result. Braces, deliberately.
+    snap.forEach((c) => { const v = c.val(); if (v && v.t) rows.push(v); });
+    if (rows.length < 60) continue;             // barely any data: skip
+    rows.sort((a, b) => a.t - b.t);
+    perDay.push(hourlyFromRows(rows, key));
+    got++;
+  }
+
+  const hours = [];
+  for (let h = 0; h < 24; h++) {
+    const vals = perDay.map((d) => (d[h] ? d[h].p50 : null)).filter((v) => v != null);
+    if (!vals.length) { hours.push(null); continue; }
+    vals.sort((a, b) => a - b);
+    hours.push({
+      p25: quantile(vals, 0.25),
+      p50: quantile(vals, 0.5),
+      p75: quantile(vals, 0.75),
+    });
+  }
+
+  pvProfile = { date: localDate(), days: got, hours };
+  saveProfileCache(pvProfile);
+  profileBusy = false;
+  drawPred();
+}
+
+function drawPred() {
+  const cv = $("chart-pred");
+  const cap = $("pred-caption");
+  if (!cv) return;
+
+  const dim = themeColor("--muted");
+  const grid = themeColor("--grid");
+  const green = themeColor("--gen");
+
+  const actual = ring.rows.map((s) => ({
+    x: minutesOfDay(s.t, ring.date),
+    y: s.p > 0 ? s.p : 0,
+  }));
+
+  const ds = [];
+  const enough = pvProfile && pvProfile.days >= PROFILE_MIN_DAYS;
+
+  if (enough) {
+    // The p25-p75 spread, drawn as two lines filling to each other.
+    const at = (h, k) => (pvProfile.hours[h] ? { x: h * 60 + 30, y: pvProfile.hours[h][k] } : null);
+    const band25 = [], band75 = [], mid = [];
+    for (let h = 0; h < 24; h++) {
+      const a = at(h, "p25"), b = at(h, "p75"), m = at(h, "p50");
+      if (a) band25.push(a);
+      if (b) band75.push(b);
+      if (m) mid.push(m);
+    }
+    ds.push({
+      label: "Typical spread", data: band75, borderColor: "transparent",
+      backgroundColor: dim + "22", borderWidth: 0, pointRadius: 0,
+      fill: "+1", tension: 0.35,
+    });
+    ds.push({
+      label: "_p25", data: band25, borderColor: "transparent",
+      borderWidth: 0, pointRadius: 0, fill: false, tension: 0.35,
+    });
+    ds.push({
+      label: "Expected PV", data: mid, borderColor: dim, borderDash: [6, 4],
+      borderWidth: 2, pointRadius: 0, fill: false, tension: 0.35,
+    });
+  }
+
+  ds.push({
+    label: "Actual PV today", data: actual, borderColor: green,
+    backgroundColor: green + "22", borderWidth: 2, pointRadius: 0,
+    fill: "origin", tension: 0.3, spanGaps: false,
+  });
+
+  if (!predChart) {
+    predChart = new Chart(cv, {
+      type: "line",
+      data: { labels: [], datasets: ds },
+      options: {
+        maintainAspectRatio: false,
+        animation: { duration: 0 },
+        interaction: { mode: "index", intersect: false },
+        plugins: {
+          legend: {
+            display: true,
+            labels: { filter: (i) => i.text !== "_p25", boxWidth: 10, boxHeight: 3,
+                      font: legendFont() },
+          },
+          tooltip: {
+            filter: (i) => i.dataset.label !== "_p25",
+            callbacks: {
+              title: (items) => (items.length ? hhmm(items[0].parsed.x) : ""),
+              label: (it) => ` ${it.dataset.label}: ${Math.round(it.parsed.y)} W`,
+            },
+          },
+        },
+        scales: {
+          x: timeAxis(dim, grid),
+          y: valueAxis("W", dim, grid),
+        },
+      },
+    });
+  } else {
+    predChart.data.datasets = ds;
+  }
+  // Same axis object as the other two charts, rebuilt so a resize
+  // across the breakpoint takes effect here too.
+  predChart.options.scales.x = timeAxis(dim, grid);
+  predChart.options.scales.y = valueAxis("W", dim, grid);
+  applyAxisPadding(predChart);
+  predChart.update("none");
+
+  if (!cap) return;
+  if (!pvProfile) { cap.textContent = "Building the historical profile…"; return; }
+  if (!enough) {
+    cap.textContent =
+      `Only ${pvProfile.days} day${pvProfile.days === 1 ? "" : "s"} of history so far` +
+      ` · the expected curve needs ${PROFILE_MIN_DAYS}`;
+    return;
+  }
+
+  // The accuracy line. Expected and baseline come from the ESP's own
+  // model (it owns the learned bias table); actual is today's
+  // harvest, the same number the cards above show.
+  const bits = [];
+  const cond = (live && live.fcConf > 0 && live.fcText && live.fcText !== "UNKNOWN")
+             ? live.fcText : null;
+  bits.push(`Forecast today: <b>${cond || "none cached"}</b>`);
+
+  const expWh = live && live.predTodayWh;
+  const actWh = live && live.harvestWh;
+  if (expWh != null && expWh > 0) bits.push(`Expected <b>${(expWh / 1000).toFixed(1)} kWh</b>`);
+  if (actWh != null) bits.push(`Actual <b>${(actWh / 1000).toFixed(1)} kWh</b>`);
+  if (expWh != null && expWh > 0 && actWh != null) {
+    // Symmetric: 2x expected and half expected are both "50% off".
+    const r = actWh / expWh;
+    const acc = Math.max(0, Math.round(100 * (r > 1 ? 1 / r : r)));
+    bits.push(`Accuracy <b>${acc}%</b>`);
+  }
+  cap.className = "panel-sub run-sum pred-acc";
+  cap.innerHTML = bits.map((b) => `<span>${b}</span>`).join("");
 }
 
 /* child_added listener for the day currently on screen. Detached
@@ -536,6 +1308,10 @@ async function loadDay(dateStr) {
       if (ringPush(c.val())) queueDayDraw();
     });
   }
+
+  // The charts above are painted; now the historical profile may
+  // use the idle time and the network.
+  kickProfile();
 }
 
 /* ============================================================
@@ -576,17 +1352,19 @@ async function loadMonth(monthStr) {           // "YYYY-MM"
   const harvested = rows.map(harvestKwh);
   const used = rows.map(usedKwh);
   setChartType("bar", labels, [
-    { label: "Harvested", data: harvested, borderRadius: 4 },
     { label: "Used", data: used, borderRadius: 4 },
+    { label: "Harvested", data: harvested, borderRadius: 4 },
   ]);
   chart.options.plugins.legend.display = true;
   chart.update();
   currentRows = { kind: "month", date: monthStr,
-    columns: ["date", "harvested_kWh", "used_kWh"],
+    columns: ["date", "used_kWh", "harvested_kWh"],
     rows: rows.map((r) => ({ date: r.date,
-      harvested_kWh: harvestKwh(r).toFixed(3), used_kWh: usedKwh(r).toFixed(3) })) };
+      used_kWh: usedKwh(r).toFixed(3), harvested_kWh: harvestKwh(r).toFixed(3) })) };
+  const totUsed = used.reduce((a, b) => a + b, 0);
   const total = harvested.reduce((a, b) => a + b, 0);
-  $("chart-caption").textContent = `Daily harvest for ${monthStr} · ${total.toFixed(1)} kWh total`;
+  $("chart-caption").textContent =
+    `${monthStr} · drawn ${totUsed.toFixed(1)} kWh · harvested ${total.toFixed(1)} kWh`;
 }
 
 async function loadYear(yearStr) {              // "YYYY"
@@ -609,12 +1387,14 @@ async function loadYear(yearStr) {              // "YYYY"
   chart.options.plugins.legend.display = true;
   chart.update();
   currentRows = { kind: "year", date: yearStr,
-    columns: ["month", "harvested_kWh", "used_kWh"],
+    columns: ["month", "used_kWh", "harvested_kWh"],
     rows: labels.map((name, i) => ({
       month: `${yearStr}-${String(i + 1).padStart(2, "0")}`,
-      harvested_kWh: chg[i].toFixed(3), used_kWh: dis[i].toFixed(3) })) };
+      used_kWh: dis[i].toFixed(3), harvested_kWh: chg[i].toFixed(3) })) };
+  const totUsedY = dis.reduce((a, b) => a + b, 0);
   const total = chg.reduce((a, b) => a + b, 0);
-  $("chart-caption").textContent = `Monthly harvest for ${yearStr} · ${total.toFixed(1)} kWh total`;
+  $("chart-caption").textContent =
+    `${yearStr} · drawn ${totUsedY.toFixed(1)} kWh · harvested ${total.toFixed(1)} kWh`;
 }
 
 function refreshChart() {
@@ -696,14 +1476,16 @@ async function loadMonthlyTab() {
   const total = kwh.reduce((a, b) => a + b, 0);
   const totalUsed = used.reduce((a, b) => a + b, 0);
   const totalDays = days.reduce((a, b) => a + b, 0);
+  // Busiest month is the biggest DRAW, not the biggest harvest:
+  // usage is the headline number on this dashboard now.
   let bestIdx = 0;
-  kwh.forEach((v, i) => { if (v > kwh[bestIdx]) bestIdx = i; });
+  used.forEach((v, i) => { if (v > used[bestIdx]) bestIdx = i; });
 
   /* ---- summary cards ---- */
   $("yr-kwh").textContent      = total.toFixed(1);
   $("yr-days").textContent     = totalDays;
-  $("yr-best").textContent     = total > 0 ? MONTH_NAMES[bestIdx].slice(0, 3) : "--";
-  $("yr-best-kwh").textContent = kwh[bestIdx].toFixed(1);
+  $("yr-best").textContent     = totalUsed > 0 ? MONTH_NAMES[bestIdx].slice(0, 3) : "--";
+  $("yr-best-kwh").textContent = used[bestIdx].toFixed(1);
   $("yr-used").textContent     = totalUsed.toFixed(1);
   $("yr-days2").textContent    = totalDays;
 
@@ -712,8 +1494,9 @@ async function loadMonthlyTab() {
   const solar = themeColor("--amber"), blue = themeColor("--use"), dim = themeColor("--muted");
   const grid = themeColor("--grid");
   const datasets = [
-    { label: "Harvested", data: kwh,  backgroundColor: solar, borderRadius: 6 },
+    // Used first so it draws and legends first.
     { label: "Used",      data: used, backgroundColor: blue,  borderRadius: 6 },
+    { label: "Harvested", data: kwh,  backgroundColor: solar, borderRadius: 6 },
   ];
 
   if (!monthlyChart) {
@@ -740,24 +1523,24 @@ async function loadMonthlyTab() {
   o.plugins.legend.labels.color = dim;
   monthlyChart.update();
 
-  /* ---- table ---- */
+  /* ---- table: used first, harvested second ---- */
   $("mtbody").innerHTML =
-    kwh.map((v, i) =>
-      `<tr><td>${MONTH_NAMES[i]}</td><td>${v.toFixed(2)}</td>` +
-      `<td>${used[i].toFixed(2)}</td><td>${days[i]}</td></tr>`).join("") +
-    `<tr class="mtotal"><td>Total ${year}</td><td>${total.toFixed(2)}</td>` +
-    `<td>${totalUsed.toFixed(2)}</td><td>${totalDays}</td></tr>`;
+    used.map((u, i) =>
+      `<tr><td>${MONTH_NAMES[i]}</td><td>${u.toFixed(2)}</td>` +
+      `<td>${kwh[i].toFixed(2)}</td><td>${days[i]}</td></tr>`).join("") +
+    `<tr class="mtotal"><td>Total ${year}</td><td>${totalUsed.toFixed(2)}</td>` +
+    `<td>${total.toFixed(2)}</td><td>${totalDays}</td></tr>`;
 
   $("monthly-caption").textContent =
-    `Total kWh harvested each month of ${year} · ${total.toFixed(1)} kWh so far`;
+    `${year} · drawn ${totalUsed.toFixed(1)} kWh · harvested ${total.toFixed(1)} kWh`;
 
   monthlyRows = {
     kind: "monthly", date: year,
-    columns: ["month", "harvested_kWh", "used_kWh", "days_logged"],
-    rows: kwh.map((v, i) => ({
+    columns: ["month", "used_kWh", "harvested_kWh", "days_logged"],
+    rows: used.map((u, i) => ({
       month: `${year}-${String(i + 1).padStart(2, "0")}`,
-      harvested_kWh: v.toFixed(3),
-      used_kWh: used[i].toFixed(3),
+      used_kWh: u.toFixed(3),
+      harvested_kWh: kwh[i].toFixed(3),
       days_logged: days[i],
     })),
   };
@@ -783,6 +1566,29 @@ document.querySelectorAll(".nav-btn").forEach((btn) => {
     if (tab === "monthly") loadMonthlyTab();
     else if (chart) chart.resize();
   });
+});
+
+/* Build the historical PV profile once, at idle, so it never
+   competes with the live charts for the main thread or the network.
+   requestIdleCallback is not in every browser; setTimeout is the
+   fallback, not a race. */
+let profileKicked = false;
+function kickProfile() {
+  if (profileKicked) return;
+  profileKicked = true;
+  const go = () => buildProfile().catch(() => {});
+  if (window.requestIdleCallback) window.requestIdleCallback(go, { timeout: 8000 });
+  else setTimeout(go, 3000);
+}
+
+/* Crossing the 600 px breakpoint changes tick spacing and font
+   size, so the axes have to be rebuilt -- a plain canvas resize
+   does not do it. Debounced: a drag across the breakpoint fires
+   dozens of resize events. */
+let resizeT = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { if (currentView === "day") drawDay(); }, 150);
 });
 
 /* ---------------- wire it up ---------------- */
@@ -821,7 +1627,8 @@ setInterval(() => {
   if (!$("tab-monthly").classList.contains("hidden")) loadMonthlyTab();
 }, 30 * 60 * 1000);
 
-/* redraw the monthly bars when the theme toggle flips the palette */
+/* redraw theme-coloured charts when the palette flips */
 new MutationObserver(() => {
   if (monthlyChart && !$("tab-monthly").classList.contains("hidden")) loadMonthlyTab();
+  if (socChart) drawSoc();          // SoC line/fill are theme colours
 }).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
