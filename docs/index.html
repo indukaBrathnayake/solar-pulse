@@ -167,7 +167,11 @@
       <span class="relay-chip" id="chip-util"><i></i>Utility</span>
       <span class="relay-chip" id="chip-light"><i></i>Lights</span>
     </div>
-    <p class="card-sub"><span id="util-min">0</span> min on CEB today · solar <span id="pv-now">0</span> W · load <span id="load-now">0</span> W</p>
+    <!-- Lights state. This page reads Firebase and has no route to
+         the ESP, so the ON/OFF/AUTO control lives on the on-device
+         dashboard; here the mode and its reason are reported. -->
+    <p class="card-sub" id="lights-line">lights --</p>
+    <p class="card-sub"><span id="util-min">0</span> min on CEB today · <span id="light-min">0</span> min of lights · solar <span id="pv-now">0</span> W · load <span id="load-now">0</span> W</p>
     <p class="card-sub tonight" id="tonight">tonight's floor --</p>
   </article>
 </section>
@@ -240,6 +244,24 @@
   </div>
   <p class="panel-sub" id="chart-caption">Today's power, watts in and out of the battery</p>
   <div class="chart-box"><canvas id="chart-main"></canvas></div>
+  <!-- CEB runtime, read from the `src` field the ESP has always
+       shipped inside every history sample. Never inferred. -->
+  <p class="panel-sub run-sum" id="ceb-caption"></p>
+</section>
+
+<!-- ================= PREDICTION ACCURACY =================
+     Expected PV (the historical hourly profile this site has
+     actually produced) against what the array did today. The
+     expected curve is computed in the browser from history days
+     already in Firebase -- it needs no new firmware field and no
+     new upload path. -->
+<section class="panel">
+  <div class="panel-head">
+    <h2>Prediction accuracy</h2>
+  </div>
+  <p class="panel-sub">Expected PV vs actual PV</p>
+  <div class="chart-box chart-box-soc"><canvas id="chart-pred"></canvas></div>
+  <p class="panel-sub" id="pred-caption">Building the historical profile…</p>
 </section>
 
 </main><!-- /tab-live -->
@@ -334,15 +356,21 @@
     if (typeof chart === "undefined") return;
     const c = colors();
 
-    /* axes + legend */
+    /* axes + legend.
+       COLOURS ONLY. Sizes, families, weights and padding all come
+       from valueAxis()/timeAxis() in app.js, which is the single
+       place they are defined; setting a bare {size: 11} here used
+       to drop the family and weight and was half the reason the
+       usage chart looked different from the SoC chart. */
     const sc = chart.options.scales;
     sc.x.ticks = Object.assign(sc.x.ticks || {}, { color: c.dim });
     sc.y.ticks = Object.assign(sc.y.ticks || {}, { color: c.dim });
     sc.x.grid = Object.assign(sc.x.grid || {}, { color: c.grid });
     sc.y.grid = Object.assign(sc.y.grid || {}, { color: c.grid });
     if (sc.y.title) sc.y.title.color = c.dim;
+    if (sc.x.title) sc.x.title.color = c.dim;
     chart.options.plugins.legend.labels =
-      { color: c.dim, boxWidth: 14, boxHeight: 3, font: { size: 11 } };
+      { color: c.dim, boxWidth: 14, boxHeight: 3, font: legendFont() };
 
     if (chart.config.type === "line") {
       /* day view: split the single ± power series into
@@ -364,7 +392,14 @@
       // Colour by LABEL, never by index: the day chart now lists
       // usage first and generation second, and an index-based rule
       // would silently paint them the wrong colours.
+      //
+      // d.ownColor opts a dataset out entirely. The "On CEB" legend
+      // swatch carries the amber of the runtime shading, and without
+      // this it was being repainted the electricity-use blue -- a
+      // legend key that named one thing and showed the colour of
+      // another.
       ds.forEach((d) => {
+        if (d.ownColor) return;
         const isGen = /generation/i.test(d.label || "");
         d.borderColor = isGen ? c.gen : c.use;
         d.backgroundColor = (isGen ? c.gen : c.use) + "2E";
@@ -384,7 +419,7 @@
   if (typeof chart !== "undefined") {
     const rawUpdate = chart.update.bind(chart);
     chart.update = function (mode) { styleChart(); rawUpdate(mode); };
-    Chart.defaults.font.family = "'JetBrains Mono', monospace";
+    Chart.defaults.font.family = FONT_MONO;   /* defined once, in app.js */
     styleChart(); rawUpdate("none");
   }
 
