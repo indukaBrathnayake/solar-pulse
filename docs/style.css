@@ -1,767 +1,1535 @@
 /* ============================================================
-   Solar Pulse · dual theme
-   dark (default): deep navy like Grafana / cloud dashboards
-     bg #0B0E17 · panel #131826 · solar #FACC15 · gen #A3E635
-     use #57A6F2 · violet #8B5CF6 · coral #F2495C
-   light: warm paper with the same accent family
-   Fonts: Chakra Petch (display) · Outfit (body) · JetBrains Mono (numbers)
-   app.js reads --teal / --amber / --coral for the time bar,
-   so those names are kept in both themes.
+   Solar Pulse dashboard
+   1) Paste your Firebase web config below (Console > Project
+      settings > Your apps > Web app > Config).
+   2) Nothing else needs editing.
    ============================================================ */
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyD7_JShDQoGrB0V6A_6Zvd7O3DbpueUhWg",
+  authDomain: "solar-pulse-8ba33.firebaseapp.com",
+  databaseURL: "https://solar-pulse-8ba33-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "solar-pulse-8ba33",
+   
+};
 
-:root, html[data-theme="dark"] {
-  --bg: #0B0E17;
-  --bg-glow-1: #131C33;
-  --bg-glow-2: #101828;
-  --paper: #131826;
-  --panel-2: #171E30;
-  --line: #232B3E;
-  --grid: rgba(138, 148, 172, 0.14);
-  --ink: #E9EEF8;
-  --muted: #8A94AC;
+// The ESP pushes /live every 3 s, so 30 s of silence is ten missed
+// pushes -- comfortably a real outage rather than one dropped packet.
+const STALE_MS = 30 * 1000;
+const AMP_DEADBAND = 0.25;           // below this = idle
+const PV_HOURS = [6, 19];            // charging inside this window = PV
+const CAPACITY_AH = 100;             // pack capacity, fixed system spec
 
-  --amber: #FACC15;          /* solar / harvest, strokes + dots  */
-  --amber-soft: #FACC1526;
-  --ceb-band: #FACC1526;     /* the runtime shading, both themes */
-  --ceb-line: #FACC15;       /* its legend swatch border         */
-  --amber-line: rgba(250, 204, 21, 0.5);   /* chip + pill borders */
-  --amber-text: #FACC15;     /* 12.1:1 on --bg, safe as text     */
-  --gen: #A3E635;            /* generation, lime                 */
-  --gen-soft: #A3E63533;
-  --gen-line: rgba(163, 230, 53, 0.45);    /* chip + pill borders */
-  --gen-text: #A3E635;       /* 12.4:1 on --bg, safe as text     */
-  --use: #57A6F2;            /* home draw, Helio blue */
-  --use-soft: rgba(87, 166, 242, 0.14);
-  --violet: #8B5CF6;
-  --teal: #3DD6C3;           /* battery accent (app.js uses --teal) */
-  --teal-soft: rgba(61, 214, 195, 0.13);
-  --coral: #F2495C;
-  --coral-soft: rgba(242, 73, 92, 0.14);
-  --ice: var(--use);
-  --ice-soft: var(--use-soft);
+firebase.initializeApp(FIREBASE_CONFIG);
+const db = firebase.database();
 
-  --ok-text: #A3E635;
-  --gold-text: #FACC15;
-  --warn-text: #FF8A96;
+const $ = (id) => document.getElementById(id);
+let live = null;
+// /daily rows are cached per year by daysForYear(); see the data
+// layer further down.
 
-  --radius: 16px;
-  --shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 10px 30px rgba(0, 0, 0, 0.35);
-  --idle-icon: #3A4560;
-  --idle-fill: #1B2338;
+/* ---------------- number count-up ---------------- */
+function tween(el, target, decimals = 2) {
+  const from = parseFloat(el.dataset.v || "0");
+  const t0 = performance.now(), dur = 500;
+  function step(t) {
+    const k = Math.min(1, (t - t0) / dur);
+    const v = from + (target - from) * (1 - Math.pow(1 - k, 3));
+    el.textContent = v.toFixed(decimals);
+    if (k < 1) requestAnimationFrame(step);
+    else el.dataset.v = target;
+  }
+  requestAnimationFrame(step);
 }
 
-html[data-theme="light"] {
-  /* Brilliant white page. The two glows are painted over --bg in
-     body::before, so they have to go white as well or the page
-     keeps a cream cast and is not actually #FFFFFF. Card and panel
-     surfaces are untouched. */
-  --bg: #FFFFFF;
-  --bg-glow-1: #FFFFFF;
-  --bg-glow-2: #FFFFFF;
-  --paper: #FFFFFF;
-  --panel-2: #FBFAF6;
-  --line: #E6E0D4;
-  --grid: rgba(90, 82, 70, 0.12);
-  --ink: #27221B;
-  --muted: #7A7264;
-
-  /* The FILL colours are the same lime and yellow as dark mode --
-     they are graphics, and they read fine as a line or a tint. The
-     matching *-text tokens below are darkened, because neither
-     passes contrast as text on white: #A3E635 is 1.5:1 and
-     #FACC15 is 1.55:1 against #FFFFFF. See the report. */
-  /* STROKES (chart lines, status dots) go one step deeper here.
-     On #FFFFFF the raw lime is 1.51:1 and the raw yellow 1.53:1 --
-     a 2 px curve in either is barely visible, and both are under
-     the 3:1 that non-text graphics need. The FILLS below keep the
-     exact requested tints, because a low-contrast wash is the
-     point of a background band. Reported. */
-  --amber: #A16207;          /* yellow-700, 5.1:1 on white       */
-  --amber-soft: #FACC1526;   /* the requested tint, unchanged    */
-  --ceb-band: #FACC1526;     /* the requested band, unchanged    */
-  --ceb-line: #FACC15;       /* the requested swatch border      */
-  --amber-line: rgba(250, 204, 21, 0.65);
-  --amber-text: #854D0E;     /* yellow-800, 6.9:1 on white       */
-  --gen: #65A30D;            /* lime-600,   3.1:1 on white       */
-  --gen-soft: #A3E63533;     /* the requested tint, unchanged    */
-  --gen-line: rgba(163, 230, 53, 0.65);
-  --gen-text: #4D7C0F;       /* lime-700,   5.1:1 on white       */
-  --use: #2E77C8;
-  --use-soft: #E7F0FA;
-  --violet: #7C4DE8;
-  --teal: #12907E;
-  --teal-soft: #E1F2EF;
-  --coral: #D8382E;
-  --coral-soft: #FBE7E2;
-  --ice: var(--use);
-  --ice-soft: var(--use-soft);
-
-  --ok-text: #4D7C0F;        /* lime-700, was green #146A38     */
-  --gold-text: #854D0E;      /* yellow-800, was amber #8A5B00   */
-  --warn-text: #A83B25;
-
-  --shadow: 0 1px 2px rgba(43, 36, 29, 0.05), 0 6px 20px rgba(43, 36, 29, 0.07);
-  --idle-icon: #CFC7B8;
-  --idle-fill: #F2EEE5;
+/* ---------------- pill helper ---------------- */
+function setPill(id, state, label) {
+  const p = $(id);
+  p.classList.remove("on", "gold", "warn");
+  if (state) p.classList.add(state);
+  p.childNodes[1].textContent = label;
 }
 
-* { margin: 0; padding: 0; box-sizing: border-box; }
-
-html { color-scheme: dark; }
-html[data-theme="light"] { color-scheme: light; }
-
-body {
-  background:
-    radial-gradient(1100px 480px at 75% -10%, var(--bg-glow-1) 0%, transparent 60%),
-    radial-gradient(850px 420px at 5% 110%, var(--bg-glow-2) 0%, transparent 55%),
-    var(--bg);
-  color: var(--ink);
-  font-family: "Outfit", system-ui, sans-serif;
-  min-height: 100vh;
-  padding: 18px clamp(12px, 3.5vw, 40px) 48px;
-  font-size: 15px;
-  transition: background 0.35s ease, color 0.35s ease;
+/* ---------------- relay chip helper ---------------- */
+function chip(id, on, tone) {
+  const el = $(id);
+  if (!el) return;
+  el.classList.remove("on", "warn", "gold");
+  if (on) el.classList.add(tone);
 }
 
-.mono { font-family: "JetBrains Mono", monospace; }
-.hidden { display: none !important; }
-
-/* ---------------- header ---------------- */
-.top {
-  display: flex; flex-wrap: wrap; gap: 12px;
-  align-items: center; justify-content: space-between;
-  margin-bottom: 16px;
-}
-.wordmark { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
-.wordmark h1 {
-  font-family: "Chakra Petch", sans-serif;
-  font-size: 1.25rem; font-weight: 700; letter-spacing: 0.18em;
-  background: linear-gradient(90deg, var(--amber), var(--gen) 55%, var(--use));
-  -webkit-background-clip: text; background-clip: text;
-  -webkit-text-fill-color: transparent; color: transparent;
-}
-.rig { color: var(--muted); font-size: 0.78rem; }
-
-.mark-dot {
-  width: 9px; height: 9px; border-radius: 50%;
-  background: var(--idle-icon); align-self: center;
-  transition: background 0.4s;
-}
-body.live .mark-dot { background: var(--gen); animation: heartbeat 2.4s ease-in-out infinite; }
-@keyframes heartbeat {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(163, 230, 53, 0.5); }
-  50%      { box-shadow: 0 0 0 7px rgba(163, 230, 53, 0); }
+function fmtHM(hours) {
+  if (!isFinite(hours) || hours <= 0) return "--";
+  const totalMin = Math.round(hours * 60);
+  const h = Math.floor(totalMin / 60), m = totalMin % 60;
+  return h > 0 ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m`;
 }
 
-.top-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+/* ---------------- main render ---------------- */
+function render() {
+  if (!live) return;
+  const now = Date.now();
+  const ageMs = now - live.ts * 1000;
+  const fresh = ageMs < STALE_MS;
+  const hour = new Date().getHours();
 
-/* ---------------- theme toggle ---------------- */
-.theme-btn {
-  width: 34px; height: 34px; border-radius: 10px;
-  display: inline-flex; align-items: center; justify-content: center;
-  background: var(--paper); border: 1px solid var(--line);
-  color: var(--muted); cursor: pointer; flex-shrink: 0;
-  transition: color 0.25s, border-color 0.25s, transform 0.1s;
-}
-.theme-btn:hover { color: var(--amber-text); border-color: var(--amber); }
-.theme-btn:active { transform: scale(0.94); }
-html[data-theme="dark"] .theme-btn .ic-moon { display: none; }
-html[data-theme="light"] .theme-btn .ic-sun { display: none; }
+  document.body.classList.toggle("live", fresh);
+  $("river").classList.toggle("stale", !fresh);
+  $("offline-banner").classList.toggle("hidden", fresh);
 
-/* ---------------- pills ---------------- */
-.pills { display: flex; gap: 7px; flex-wrap: wrap; }
-.pill {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 5px 11px; border-radius: 999px;
-  background: var(--paper);
-  border: 1px solid var(--line);
-  font-size: 0.71rem; font-weight: 500; letter-spacing: 0.02em; color: var(--muted);
-  transition: color 0.25s, border-color 0.25s, background 0.25s;
-}
-.pill i { width: 6px; height: 6px; border-radius: 50%; background: var(--idle-icon); transition: background 0.25s; }
-.pill.on     { color: var(--ok-text); border-color: var(--gen-line); background: var(--gen-soft); }
-.pill.on i   { background: var(--gen); }
-.pill.gold   { color: var(--gold-text); border-color: var(--amber-line); background: var(--amber-soft); }
-.pill.gold i { background: var(--amber); }
-.pill.warn   { color: var(--warn-text); border-color: rgba(242, 73, 92, 0.5); background: var(--coral-soft); }
-.pill.warn i { background: var(--coral); }
+  const seen = new Date(live.ts * 1000);
+  const seenTxt = seen.toLocaleString("en-GB", { hour12: false });
+  $("last-seen").textContent = seenTxt + (fresh ? " (live)" : "");
+  $("last-seen-banner").textContent = seenTxt;
 
-/* Alarm codes never render as a pill — the toast below handles it */
-#pill-alarm { display: none !important; }
+  setPill("pill-esp", fresh ? "on" : "warn", fresh ? "Monitor online" : "Monitor offline");
+  setPill("pill-bms", fresh && live.bmsLink ? "on" : "warn",
+          live.bmsLink ? "BMS linked" : "BMS lost");
 
-/* ---------------- offline banner ---------------- */
-.offline-banner {
-  background: var(--coral-soft);
-  border: 1px solid rgba(242, 73, 92, 0.4);
-  color: var(--warn-text);
-  padding: 9px 14px; border-radius: 10px;
-  font-size: 0.82rem; margin-bottom: 14px;
-}
+  const i = live.i ?? 0;
+  const charging = i > AMP_DEADBAND;
+  const discharging = i < -AMP_DEADBAND;
+  const daylight = hour >= PV_HOURS[0] && hour < PV_HOURS[1];
+  const pvActive = fresh && charging && daylight;
+  const gridSuspect = fresh && charging && !daylight;
+  const loadActive = fresh && discharging;
 
-/* ---------------- alarm toast ---------------- */
-.toast {
-  position: fixed; z-index: 60;
-  left: 50%; bottom: 22px; transform: translateX(-50%);
-  display: flex; align-items: center; gap: 10px;
-  max-width: min(560px, calc(100vw - 28px));
-  padding: 12px 14px; border-radius: 14px;
-  background: var(--paper);
-  border: 1px solid rgba(242, 73, 92, 0.55);
-  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.35), 0 0 0 4px var(--coral-soft);
-  color: var(--ink); font-size: 0.85rem; line-height: 1.4;
-  animation: toast-in 0.35s cubic-bezier(0.2, 0.9, 0.3, 1.2);
-}
-@keyframes toast-in {
-  from { transform: translate(-50%, 18px); opacity: 0; }
-  to   { transform: translate(-50%, 0);    opacity: 1; }
-}
-.toast-ic {
-  color: var(--coral); font-size: 1.05rem; flex-shrink: 0;
-  animation: toast-blink 1.4s ease-in-out infinite;
-}
-@keyframes toast-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
-.toast-x {
-  border: none; background: transparent; color: var(--muted);
-  font-size: 0.85rem; cursor: pointer; padding: 4px 6px; border-radius: 8px;
-  flex-shrink: 0;
-}
-.toast-x:hover { color: var(--ink); background: var(--coral-soft); }
+  $("river").classList.toggle("pv-on", pvActive || gridSuspect);
+  $("river").classList.toggle("load-on", loadActive);
 
-/* ---------------- energy flow ---------------- */
-.flow-card {
-  background: linear-gradient(180deg, var(--paper) 0%, var(--panel-2) 100%);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow);
-  padding: 22px clamp(10px, 3vw, 32px);
-  margin-bottom: 14px;
-  transition: background 0.35s ease;
-}
-.flow-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 6px; }
+  setPill("pill-pv",
+    pvActive ? "gold" : "",
+    pvActive ? "PV generating" : (gridSuspect ? "Charging (grid?)" : (daylight ? "PV idle" : "Night")));
+  setPill("pill-load", loadActive ? "on" : "", loadActive ? "Inverter feeding load" : "Load idle");
+  setPill("pill-bal", live.bal ? "gold" : "", live.bal ? "Balancing" : "Balancer idle");
 
-.node { display: flex; flex-direction: column; align-items: center; text-align: center; width: 168px; flex-shrink: 0; }
-.node-text { display: flex; flex-direction: column; align-items: center; }
-.node-value { font-family: "JetBrains Mono", monospace; font-size: 1.18rem; font-weight: 800; margin-top: 10px; }
-.node-label {
-  font-family: "Chakra Petch", sans-serif;
-  font-size: 0.66rem; letter-spacing: 0.22em; text-transform: uppercase;
-  color: var(--muted); margin-top: 3px;
-}
-.node-sub    { font-family: "JetBrains Mono", monospace; font-size: 0.78rem; color: var(--ink); margin-top: 2px; min-height: 1.1em; }
-.node-detail { font-family: "JetBrains Mono", monospace; font-size: 0.76rem; color: var(--muted); margin-top: 2px; white-space: nowrap; }
+  const alarm = (live.err ?? 0) !== 0;
+  $("pill-alarm").classList.toggle("hidden", !alarm);
+  if (alarm) setPill("pill-alarm", "warn", "BMS alarm 0x" + live.err.toString(16));
 
-/* ---- sun (v6-style: glowing core, halo, spinning rays) ---- */
-.node-icon { width: 76px; height: 76px; position: relative; display: flex; align-items: center; justify-content: center; }
-.sun-icon { color: var(--idle-icon); transition: color 0.6s; }
-.ray-svg { position: absolute; inset: 0; width: 100%; height: 100%; }
-.sun-halo {
-  position: absolute; inset: 6px; border-radius: 50%;
-  background: radial-gradient(circle, var(--amber-soft) 0%, transparent 68%);
-  opacity: 0; transition: opacity 0.6s;
-}
-.sun-core {
-  width: 44px; height: 44px; border-radius: 50%;
-  background: var(--idle-fill); border: 3px solid var(--idle-icon);
-  transition: background 0.6s, border-color 0.6s, box-shadow 0.6s;
-}
-.flow-card.pv-on .sun-icon { color: var(--amber); }
-.flow-card.pv-on .sun-halo { opacity: 1; animation: halo-pulse 3s ease-in-out infinite; }
-.flow-card.pv-on .sun-core {
-  background: radial-gradient(circle at 38% 32%, #FFE9B0, var(--amber) 85%);
-  border-color: var(--amber);
-  box-shadow: 0 0 22px rgba(250, 204, 21, 0.55);
-}
-.flow-card.pv-on #sun-rays { animation: spin 16s linear infinite; transform-origin: 50% 50%; }
-@keyframes spin { to { transform: rotate(360deg); } }
-@keyframes halo-pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.22); } }
+  const w = Math.abs(live.p ?? 0);
+  $("pv-watts").textContent = (charging ? w.toFixed(0) : "0") + " W";
+  $("pv-state").textContent = pvActive ? "generating" :
+      gridSuspect ? "charging after dark" : daylight ? "stopped" : "sun is down";
+  $("load-watts").textContent = (loadActive ? w.toFixed(0) : "0") + " W";
+  $("load-state").textContent = loadActive ? "drawing power" : "standby";
 
-/* ---- home (glowing window, chimney, frame) ---- */
-.home-icon { color: var(--idle-icon); transition: color 0.6s; }
-.home-chimney { fill: var(--idle-icon); transition: fill 0.6s; }
-#home-window { fill: var(--idle-fill); transition: fill 0.6s, filter 0.6s; }
-.home-frame { stroke: var(--paper); stroke-width: 1.6; opacity: 0; transition: opacity 0.6s; }
-.flow-card.load-on .home-icon { color: var(--use); }
-.flow-card.load-on .home-chimney { fill: var(--use); }
-.flow-card.load-on #home-window {
-  fill: var(--amber);
-  filter: drop-shadow(0 0 6px rgba(250, 204, 21, 0.75));
-  animation: window-flicker 4s ease-in-out infinite;
-}
-.flow-card.load-on .home-frame { opacity: 0.9; }
-@keyframes window-flicker {
-  0%, 100% { opacity: 1; } 92% { opacity: 1; } 94% { opacity: 0.75; } 96% { opacity: 1; }
-}
+  $("soc-big").textContent = (live.soc ?? "--") + "%";
+  $("pack-vi").textContent = `${(live.v ?? 0).toFixed(2)} V · ${i.toFixed(2)} A`;
+  $("batt-state").textContent = charging ? "charging" : discharging ? "discharging" : "resting";
 
-/* ---- battery (liquid fill + double wave, v6 style) ---- */
-.batt-shell {
-  width: 92px; height: 108px; border-radius: 14px;
-  border: 2.5px solid var(--teal);
-  position: relative; overflow: hidden;
-  background: var(--idle-fill);
-  box-shadow: inset 0 0 14px rgba(0, 0, 0, 0.18);
-}
-.batt-nub { position: absolute; top: 50%; right: -8px; transform: translateY(-50%); width: 7px; height: 26px; background: var(--teal); border-radius: 2px; }
-.batt-fill {
-  position: absolute; left: 0; right: 0; bottom: 0; height: 0%;
-  background: linear-gradient(180deg, rgba(61, 214, 195, 0.35), rgba(61, 214, 195, 0.75));
-  transition: height 1.1s ease;
-}
-html[data-theme="light"] .batt-fill {
-  background: linear-gradient(180deg, rgba(18, 144, 126, 0.35), rgba(18, 144, 126, 0.78));
-}
-.batt-wave {
-  position: absolute; left: -60%; top: -7px; width: 260%; height: 16px;
-  background: radial-gradient(ellipse 22px 8px at center, var(--teal) 0%, transparent 70%);
-  background-size: 44px 16px; background-repeat: repeat-x;
-  opacity: 0.55;
-}
-.batt-wave.w1 { animation: waveslide 3.4s linear infinite; }
-.batt-wave.w2 { top: -4px; opacity: 0.3; animation: waveslide 5.2s linear infinite reverse; }
-@keyframes waveslide { from { transform: translateX(0); } to { transform: translateX(44px); } }
-.batt-pct {
-  position: relative; z-index: 2; width: 100%; text-align: center;
-  font-family: "JetBrains Mono", monospace; font-weight: 800; font-size: 1.08rem;
-  padding-top: 40px; color: var(--ink);
-  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.35);
-}
-html[data-theme="light"] .batt-pct { text-shadow: 0 1px 4px rgba(255, 255, 255, 0.6); }
+  const soc = Math.max(0, Math.min(100, live.soc ?? 0));
+  $("batt-fill").style.height = soc + "%";
 
-/* ---- connectors: current flows LEFT → RIGHT (sun → battery → home) ---- */
-.connector {
-  flex: 1; min-width: 30px; height: 4px; margin-top: 38px;
-  position: relative; background: var(--line); border-radius: 3px; overflow: hidden;
-}
-.dashes { position: absolute; inset: 0; opacity: 0; transition: opacity 0.4s; }
-#conn-pv .dashes   { background-image: repeating-linear-gradient(90deg, var(--amber) 0 12px, transparent 12px 22px); }
-#conn-load .dashes { background-image: repeating-linear-gradient(90deg, var(--gen) 0 12px, transparent 12px 22px); }
-.flow-card.pv-on #conn-pv .dashes,
-.flow-card.load-on #conn-load .dashes { opacity: 1; animation: flow-h 0.9s linear infinite; }
-/* positive offset = dashes travel to the RIGHT (this was reversed before) */
-@keyframes flow-h { from { background-position-x: 0; } to { background-position-x: 22px; } }
+  /* time remaining */
+  const remAh = live.remAh ?? 0;
+  let hrs = null, label = "resting", pct = 0, color = "var(--teal)";
+  if (charging) {
+    hrs = (CAPACITY_AH - remAh) / i;
+    label = `${fmtHM(hrs)} to full`;
+    pct = Math.min(100, (1 - hrs / 10) * 100);
+    color = "var(--amber)";
+  } else if (discharging) {
+    hrs = remAh / Math.abs(i);
+    label = `${fmtHM(hrs)} to empty at this rate`;
+    pct = Math.min(100, (hrs / 24) * 100);
+    color = hrs < 2 ? "var(--coral)" : "var(--teal)";
+  } else {
+    label = "resting, no load or charge";
+    pct = 0;
+  }
+  $("time-fill").style.width = (fresh ? pct : 0) + "%";
+  $("time-fill").style.background = color;
+  $("time-label").textContent = fresh ? label : "no recent data";
 
-.flow-card.stale { filter: grayscale(0.75) brightness(0.9); }
+  /* ---------- powering the house ----------
+     AUTHORITATIVE. live.house is computed by the firmware from the
+     committed relay state (srcActual) inside the one source state
+     machine -- it is not inferred here from SoC, PV, voltage, time
+     or the CEB threshold, and there is no second source-control
+     system in the browser.
 
-/* ---------------- time remaining ---------------- */
-.time-remaining { margin-top: 12px; }
-.time-track { height: 6px; background: var(--line); border-radius: 4px; overflow: hidden; }
-.time-fill { height: 100%; width: 0%; background: var(--teal); border-radius: 4px; transition: width 1s ease, background 0.4s; }
-.time-label { font-family: "JetBrains Mono", monospace; font-size: 0.74rem; color: var(--muted); margin-top: 5px; }
+     On the v5 changeover relay the coil being energised IS "CEB";
+     everything else, including the break-before-make dead time,
+     leaves the load bus on the inverter. That is why "not switched"
+     is gone: with this hardware there is no such electrical state,
+     and showing it was the bug. */
+  const house = live.house || null;          // "CEB" | "Pack"
+  const onCeb = house === "CEB";
+  $("src-name").textContent = fresh && house ? house : "--";
+  $("src-why").textContent = live.why
+    ? (live.manual ? "manual · " : "automatic · ") + live.why
+    : "controller not reporting";
+  chip("chip-solar", fresh && house === "Pack", "on");
+  chip("chip-util",  fresh && onCeb, "warn");
+  chip("chip-light", fresh && live.light,  "gold");
 
-/* ---------------- cards ---------------- */
-.cards {
-  display: grid; gap: 12px;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  margin-bottom: 14px;
-}
-.card {
-  background: var(--paper);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow);
-  padding: 16px 18px;
-  position: relative; overflow: hidden;
-  transition: background 0.35s ease;
-}
-.card::before {
-  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
-  border-radius: 3px 0 0 3px;
-}
-.card.accent-solar::before { background: linear-gradient(180deg, var(--amber), transparent); }
-.card.accent-gen::before   { background: linear-gradient(180deg, var(--gen), transparent); }
-.card.accent-use::before   { background: linear-gradient(180deg, var(--use), transparent); }
+  /* Lights. The chip shows the OUTPUT; this line shows the MODE and
+     why it is where it is, which are different facts -- in AUTO at
+     noon the lamp is off and nothing is wrong. Firmware that
+     predates these keys omits them, so the line hides rather than
+     inventing a schedule. */
+  const ll = $("lights-line");
+  if (ll) {
+    const lm = live.lightMode;
+    if (!fresh || !lm) {
+      ll.textContent = "lights --";
+    } else if (live.lightsLow) {
+      ll.textContent = "lights off · low battery";
+    } else if (lm === "auto") {
+      ll.textContent = `lights auto · on at ${live.lightOn || "--:--"}` +
+        (live.lightSunset === false ? " (fallback, no sunset cached)" : " (sunset)") +
+        ` · off at ${live.lightOff || "--:--"}`;
+    } else {
+      ll.textContent = `lights forced ${lm}`;
+    }
+  }
+  if ($("light-min")) $("light-min").textContent = live.lightMin ?? 0;
+  $("util-min").textContent  = live.utilMin ?? 0;
+  $("pv-now").textContent    = (live.pvW ?? 0).toFixed(0);
+  $("load-now").textContent  = (live.loadW ?? 0).toFixed(0);
 
-.card-eyebrow {
-  font-family: "Chakra Petch", sans-serif;
-  font-size: 0.66rem; letter-spacing: 0.18em; text-transform: uppercase;
-  margin-bottom: 6px; font-weight: 600;
-}
-.card-eyebrow.amber { color: var(--amber-text); }
-.card-eyebrow.teal  { color: var(--gen-text); }
-.card-eyebrow.ice   { color: var(--use); }
-.card-num {
-  font-family: "JetBrains Mono", monospace;
-  font-size: clamp(1.6rem, 3.4vw, 2.2rem);
-  font-weight: 800; line-height: 1;
-}
-.card-num .unit { font-size: 0.85rem; color: var(--muted); margin-left: 7px; font-weight: 400; }
-.card-sub { color: var(--muted); font-size: 0.76rem; margin-top: 8px; }
+  /* ---------- CEB / weather plan ----------
+     v5 replaces the old 99%-target "rainy" rule with the CEB state
+     machine. Firmware that predates it omits live.ceb, in which case
+     the line hides itself rather than showing a wrong number. */
+  const tn = $("tonight");
+  if (live.ceb == null) {
+    tn.classList.add("hidden");
+  } else {
+    tn.classList.remove("hidden");
+    const heavy = live.wx === "heavy";
+    tn.classList.toggle("rainy", heavy);
+    const wxTxt = live.wx === "clear" ? "clear day"
+                : heavy               ? "poor-solar day"
+                : live.wx === "half"  ? "mixed day"
+                : "forecast unavailable";
+    tn.textContent = live.ceb
+      ? `CEB carrying the house · ${wxTxt} · handing back at ${live.cebRel} if the pack allows`
+      : `on solar · ${wxTxt} · CEB engages at ${live.cebOn}%`;
+  }
 
-/* ---------------- panels ---------------- */
-.panel {
-  background: var(--paper);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow);
-  padding: 16px 18px;
-  margin-bottom: 14px;
-  transition: background 0.35s ease;
-}
-.panel-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
-.panel-head h2 {
-  font-family: "Chakra Petch", sans-serif;
-  font-size: 0.84rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink);
-}
-.panel-sub { color: var(--muted); font-size: 0.74rem; font-family: "JetBrains Mono", monospace; }
+  setPill("pill-src",
+    !fresh || !house ? "" : onCeb ? "warn" : "on",
+    house ? (onCeb ? "On CEB" : "On Pack") : "Source --");
+  $("pill-travel").classList.toggle("hidden", !live.travel);
+  if (live.travel) setPill("pill-travel", "gold", "Travel mode");
 
-/* ---------------- pack · 4 cells in series ---------------- */
-.pack {
-  display: flex; align-items: center; justify-content: center;
-  gap: 4px; padding: 10px 2px 4px;
-}
-.pack-term {
-  font-family: "JetBrains Mono", monospace; font-weight: 800; font-size: 1.05rem;
-  width: 30px; height: 30px; border-radius: 50%; flex-shrink: 0;
-  display: inline-flex; align-items: center; justify-content: center;
-  border: 2px solid var(--line); color: var(--muted); background: var(--panel-2);
-}
-.pack-plus  { color: var(--coral); border-color: rgba(242, 73, 92, 0.55); }
-.pack-minus { color: var(--use);   border-color: rgba(87, 166, 242, 0.55); }
+  tween($("today-chg"), (live.harvestWh ?? live.todayChg ?? 0) / 1000, 2);
+  tween($("today-dis"), (live.todayDis ?? 0) / 1000, 2);
+  tween($("peak-w"), live.peakW ?? 0, 0);
+  tween($("life-chg"), (live.lifeChg ?? 0) / 1000, 1);
+  tween($("life-dis"), (live.lifeDis ?? 0) / 1000, 1);
+  tween($("rem-ah"), live.remAh ?? 0, 1);
+  $("soh").textContent = live.soh ?? "--";
+  $("cycles").textContent = live.cyc ?? "--";
+  $("mos-line").textContent =
+    `MOS chg ${live.chgMos ? "ON" : "OFF"} / dis ${live.disMos ? "ON" : "OFF"}`;
 
-.cell { text-align: center; flex: 0 1 96px; min-width: 58px; }
-.cell-cap {
-  width: 34%; height: 7px; margin: 0 auto;
-  background: var(--line); border-radius: 4px 4px 0 0;
-}
-.cell-bar {
-  height: 92px; border-radius: 10px;
-  background: var(--idle-fill); border: 1.5px solid var(--line);
-  display: flex; align-items: flex-end; overflow: hidden;
-  position: relative;
-  box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.15);
-}
-/* charge-level gradient anchored to the tube, so the visible color
-   tracks the level: red when low, amber mid, green when full */
-.cell-fill {
-  width: 100%; height: 0%;
-  background: linear-gradient(180deg,
-      var(--gen) 0%, #CBE85C 34%, var(--amber) 62%, var(--coral) 100%);
-  background-size: 100% 92px;
-  background-position: bottom;
-  transition: height 1s ease;
-}
-.cell-gloss {
-  position: absolute; top: 6px; bottom: 6px; left: 14%;
-  width: 12%; border-radius: 6px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.28), rgba(255, 255, 255, 0.02));
-  pointer-events: none;
-}
-.cell-v { font-family: "JetBrains Mono", monospace; font-size: 0.84rem; font-weight: 600; margin-top: 6px; }
-.cell-n {
-  font-family: "Chakra Petch", sans-serif;
-  color: var(--muted); font-size: 0.6rem; letter-spacing: 0.2em;
-}
+  const cells = [live.c1, live.c2, live.c3, live.c4];
+  const vMin = 2.9, vMax = 3.55;
+  cells.forEach((v, k) => {
+    if (v == null) return;
+    $("cv" + (k + 1)).textContent = v.toFixed(3) + " V";
+    const pctC = Math.max(4, Math.min(100, (v - vMin) / (vMax - vMin) * 100));
+    $("cf" + (k + 1)).style.height = pctC + "%";
+  });
+  const delta = (Math.max(...cells) - Math.min(...cells)) * 1000;
+  $("delta-mv").textContent = isFinite(delta) ? delta.toFixed(0) : "--";
+  $("t1").textContent = live.t1 ?? "--";
+  $("t2").textContent = live.t2 ?? "--";
+  $("mos-t").textContent = live.mosT ?? "--";
+  $("bal-state").textContent = live.bal ? `ON ${(live.balI ?? 0).toFixed(2)} A` : "idle";
 
-.pack-link {
-  display: inline-flex; align-items: center; gap: 3px;
-  flex: 0 0 auto; margin-bottom: 34px;
-}
-.pack-link b { width: 20px; height: 3px; background: var(--muted); border-radius: 2px; opacity: 0.6; }
-.pack-link i {
-  font-style: normal; font-family: "JetBrains Mono", monospace;
-  font-size: 0.62rem; color: var(--muted);
-}
-
-/* ---------------- chart controls ---------------- */
-.chart-head { align-items: center; }
-.chart-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.seg { display: inline-flex; background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px; padding: 2px; }
-.seg-btn {
-  border: none; background: transparent; cursor: pointer;
-  font-family: "Chakra Petch", sans-serif; font-size: 0.74rem; font-weight: 600;
-  padding: 5px 12px; border-radius: 7px; color: var(--muted);
-  transition: background 0.2s, color 0.2s;
-}
-.seg-btn.active { background: var(--use-soft); color: var(--use); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18); }
-.picker {
-  font-family: "JetBrains Mono", monospace; font-size: 0.76rem;
-  border: 1px solid var(--line); border-radius: 8px; padding: 5px 9px;
-  background: var(--panel-2); color: var(--ink);
-}
-.btn-export {
-  font-family: "Chakra Petch", sans-serif; font-size: 0.76rem; font-weight: 600;
-  border: 1px solid var(--gen-line); background: var(--gen-soft); color: var(--ok-text);
-  padding: 6px 13px; border-radius: 8px; cursor: pointer;
-  transition: background 0.2s, transform 0.1s;
-}
-.btn-export:hover { filter: brightness(1.12); }
-.btn-export:active { transform: scale(0.97); }
-
-.chart-box { position: relative; height: 260px; }
-.chart-box canvas { width: 100% !important; height: 100% !important; }
-
-/* ---------------- footer ---------------- */
-.foot {
-  margin-top: 6px; color: var(--muted);
-  font-size: 0.74rem; display: flex; gap: 8px; flex-wrap: wrap;
-  font-family: "JetBrains Mono", monospace;
+  renderWeather();
+  trackBacklog(live.buffered ?? 0);
 }
 
 /* ============================================================
-   Responsive / mobile
+   BACKLOG / BACKFILL TRACKING
+
+   While WiFi is down the ESP keeps logging to its own flash. When
+   it reconnects it replays that backlog into history/<date>/<ts>
+   using the ORIGINAL timestamps, so the writes land in the middle
+   of the day, not at the end.
+
+   That is invisible to the day feed: it is orderByKey().limitToLast(1)
+   + child_added, a window that only ever contains the newest key.
+   Backfilled keys are older, fall outside the window, and never
+   fire. The gap therefore stayed on screen until a manual reload.
+
+   So watch the ESP's own queue depth instead. When it drains to
+   zero after having been non-zero, the backlog is now in the cloud
+   and every affected view is re-fetched from scratch.
    ============================================================ */
-@media (max-width: 760px) {
-  body { padding: 14px 12px 40px; }
+let backlogPrev = null;      // last seen depth, null = nothing seen yet
+let backlogPeak = 0;         // high-water mark for this outage
+let backfillTimer = null;
 
-  .top { align-items: flex-start; }
-  .top-right { width: 100%; justify-content: space-between; }
-  .pills {
-    flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch;
-    scrollbar-width: none; padding-bottom: 2px; max-width: calc(100% - 44px);
+function trackBacklog(n) {
+  const note = $("buffered-note");
+  const wasDraining = backlogPrev !== null && backlogPrev > 0;
+
+  if (n > backlogPeak) backlogPeak = n;
+
+  // While the "backfilled N samples" message is showing, #buffered-n
+  // does not exist. Leave the note alone until it is restored.
+  const slot = $("buffered-n");
+  if (slot) {
+    note.classList.toggle("hidden", n === 0 && !backfillTimer);
+    slot.textContent = n;
+    note.classList.toggle("syncing", n > 0 && backlogPrev !== null && n < backlogPrev);
   }
-  .pills::-webkit-scrollbar { display: none; }
-  .pill { flex-shrink: 0; }
 
-  /* flow stacks vertically: sun → battery → home, current flows DOWN.
-     Each row is centered as a unit (icon + text together) instead of
-     hugging the left edge, so the connector dashes below can also sit
-     on the card's centre line. */
-  .flow-row { flex-direction: column; align-items: center; gap: 4px; }
-  .node { width: 100%; flex-direction: row; justify-content: center; text-align: left; gap: 14px; }
-  .node-text { align-items: flex-start; }
-  .node-icon, .batt-shell { flex-shrink: 0; }
-  .node-value, .node-label, .node-sub, .node-detail { margin-top: 0; }
-  .node-detail { white-space: normal; }
+  // Drained: the ESP has handed its whole backlog to Firebase.
+  if (wasDraining && n === 0) scheduleBackfillRefresh(backlogPeak);
 
-  .connector { flex: none; width: 4px; height: 26px; margin: 0 auto; }
-  #conn-pv .dashes   { background-image: repeating-linear-gradient(180deg, var(--amber) 0 12px, transparent 12px 22px); }
-  #conn-load .dashes { background-image: repeating-linear-gradient(180deg, var(--gen) 0 12px, transparent 12px 22px); }
-  .flow-card.pv-on #conn-pv .dashes,
-  .flow-card.load-on #conn-load .dashes { animation: flow-v 0.9s linear infinite; }
-
-  .cards { grid-template-columns: 1fr; }
-
-  /* pack stays one row, just tighter */
-  .pack { gap: 3px; }
-  .cell { min-width: 50px; }
-  .cell-bar { height: 74px; }
-  .cell-fill { background-size: 100% 74px; }
-  .cell-v { font-size: 0.72rem; }
-  .pack-term { width: 24px; height: 24px; font-size: 0.9rem; }
-  .pack-link b { width: 10px; }
-  .pack-link i { display: none; }
-  .pack-link { margin-bottom: 26px; }
-
-  .chart-head { flex-direction: column; align-items: flex-start; }
-  .chart-controls { width: 100%; }
-  .btn-export { margin-left: auto; }
-  .chart-box { height: 220px; }
-
-  .toast { bottom: 12px; font-size: 0.8rem; }
+  backlogPrev = n;
+  if (n === 0) backlogPeak = 0;
 }
 
-@media (max-width: 380px) {
-  .cell-n { display: none; }
-  .cell-v { font-size: 0.66rem; }
+/* Debounced so a backlog that drains over several batches triggers
+   one refresh at the end, not one per batch. */
+function scheduleBackfillRefresh(count) {
+  if (backfillTimer) clearTimeout(backfillTimer);
+  const note = $("buffered-note");
+  note.classList.remove("hidden");
+  note.classList.add("syncing");
+  $("buffered-n").textContent = 0;
+
+  backfillTimer = setTimeout(async () => {
+    backfillTimer = null;
+    await applyBackfill(count);
+  }, 2500);
 }
 
-/* dashes travel DOWNWARD in the stacked mobile layout */
-@keyframes flow-v { from { background-position-y: 0; } to { background-position-y: 22px; } }
-
-@media (prefers-reduced-motion: reduce) {
-  .dashes, #sun-rays, .batt-wave, .mark-dot, .sun-halo, #home-window, .toast-ic {
-    animation: none !important;
+async function applyBackfill(count) {
+  // Day chart: full re-fetch. The incremental feed structurally
+  // cannot see backdated keys, so re-read the whole day.
+  if (currentView === "day") {
+    await loadDay($("pick-day").value || localDate());
   }
+  // Daily totals feed the month and year views and the Monthly tab.
+  invalidateDaily();
+  if (currentView !== "day") refreshChart();
+  if (!$("tab-monthly").classList.contains("hidden")) loadMonthlyTab();
+
+  const note = $("buffered-note");
+  note.classList.remove("syncing");
+  note.classList.add("done");
+  note.innerHTML = `· backfilled ${count} sample${count === 1 ? "" : "s"} from the ESP`;
+  setTimeout(() => {
+    note.classList.add("hidden");
+    note.classList.remove("done");
+    note.innerHTML = '· <span id="buffered-n">0</span> samples waiting on the ESP';
+  }, 8000);
+}
+
+
+
+/* ============================================================
+   TODAY'S WEATHER
+
+   Rendered from live.wxIcon / live.wxText, which the ESP32 derives
+   from the WMO weather code. The OLED renders from the same enum,
+   so the two displays cannot disagree about today's condition.
+
+   One distinct shape per condition -- not one generic cloud with
+   different labels.
+   ============================================================ */
+const WX_SVG = {
+  sunny: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4.2" fill="currentColor" stroke="none"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.6" y1="4.6" x2="6.4" y2="6.4"/><line x1="17.6" y1="17.6" x2="19.4" y2="19.4"/><line x1="4.6" y1="19.4" x2="6.4" y2="17.6"/><line x1="17.6" y1="6.4" x2="19.4" y2="4.6"/></g></svg>',
+  partly: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="8.5" cy="7.5" r="3.2" fill="currentColor" stroke="none"/><line x1="8.5" y1="1.4" x2="8.5" y2="3"/><line x1="2.4" y1="7.5" x2="4" y2="7.5"/><line x1="4.2" y1="3.2" x2="5.3" y2="4.3"/><path d="M8 19h9a3.5 3.5 0 0 0 .3-7 5 5 0 0 0-9.5 1.2A3 3 0 0 0 8 19z"/></svg>',
+  cloudy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 18h10a3.8 3.8 0 0 0 .3-7.6 5.4 5.4 0 0 0-10.3 1.3A3.2 3.2 0 0 0 7 18z"/></svg>',
+  fog: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 13h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 13z"/><line x1="4" y1="17" x2="20" y2="17"/><line x1="6" y1="20.5" x2="18" y2="20.5"/></svg>',
+  rain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 14h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 14z"/><line x1="8.5" y1="17" x2="7.5" y2="20"/><line x1="13" y1="17" x2="12" y2="20"/><line x1="17.5" y1="17" x2="16.5" y2="20"/></svg>',
+  heavyrain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 13h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 13z"/><line x1="7" y1="15.5" x2="5.6" y2="19"/><line x1="10.5" y1="15.5" x2="9.1" y2="19"/><line x1="14" y1="15.5" x2="12.6" y2="19"/><line x1="17.5" y1="15.5" x2="16.1" y2="19"/><line x1="9" y1="19.5" x2="8" y2="22"/><line x1="15" y1="19.5" x2="14" y2="22"/></svg>',
+  storm: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 12.5h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 12.5z"/><path d="M13 15l-3.2 4.2h3L11 23"/><line x1="17" y1="15.5" x2="16" y2="18.5"/></svg>',
+  unknown: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 16h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 16z"/><line x1="12" y1="19.5" x2="12" y2="19.6" stroke-width="2.4"/></svg>',
+};
+
+function renderWeather() {
+  const strip = $("wx-strip");
+  if (!strip) return;
+  // Firmware that predates the weather keys omits them: hide rather
+  // than invent a condition.
+  if (!live || !live.wxIcon) { strip.classList.add("hidden"); return; }
+  strip.classList.remove("hidden");
+
+  const key = WX_SVG[live.wxIcon] ? live.wxIcon : "unknown";
+  strip.dataset.wx = key;
+  $("wx-ico").innerHTML = WX_SVG[key];
+  $("wx-cond").textContent = live.wxText || "UNKNOWN";
+
+  const bits = [];
+  if (live.wxCloud != null)  bits.push(`${live.wxCloud}% cloud`);
+  if (live.wxPrecip != null) bits.push(`${Number(live.wxPrecip).toFixed(1)} mm rain`);
+  // What the controller is ACTING on, which may differ from the
+  // forecast once measured PV has overridden it.
+  if (live.pvVerdict === "good")      bits.push("PV confirms a good day");
+  else if (live.pvVerdict === "poor") bits.push("PV says worse than forecast");
+  $("wx-sub").textContent = bits.join(" · ");
+
+  const age = live.wxAgeDays;
+  const el = $("wx-age");
+  if (age == null || age < 0) {
+    el.textContent = "no forecast";
+    el.classList.add("stale");
+  } else if (age === 0) {
+    el.textContent = "today";
+    el.classList.remove("stale");
+  } else {
+    el.textContent = `forecast ${age}d old`;
+    el.classList.toggle("stale", age >= 2);
+  }
+}
+
+/* ---------------- chart ---------------- */
+/* ============================================================
+   ONE AXIS CONFIGURATION, SHARED BY EVERY CHART
+
+   The Generation & Usage chart used to build its own axes: no
+   explicit tick font, so it fell through to Chart.defaults at
+   12 px while its x ticks were 10 px, and no maxTicksLimit, so the
+   y axis labelled every 50 W. Two different sizes on one chart is
+   what read as "shaky and oversized".
+
+   'IBM Plex Mono' was also never loaded -- index.html requests
+   Chakra Petch, Outfit and JetBrains Mono -- so this default
+   silently resolved to the generic monospace face, and the inline
+   theme script then overrode it with JetBrains Mono anyway. Naming
+   the family that is actually fetched removes a difference that
+   depended on script order.
+
+   Everything below is defined ONCE and handed to every chart, so
+   the axes cannot drift apart again.
+   ============================================================ */
+const FONT_MONO = "'JetBrains Mono', monospace";
+const FONT_UI   = "Outfit, system-ui, sans-serif";
+
+// Tick text. 10 px desktop / 9 px mobile, regular weight -- the
+// heavy look came from an unset weight resolving against a face
+// loaded at 400/600/800.
+const axisTickFont  = () => ({ family: FONT_MONO, size: isNarrow() ? 9 : 10, weight: 400 });
+const axisTitleFont = () => ({ family: FONT_UI,   size: isNarrow() ? 10 : 11, weight: 500 });
+const legendFont    = () => ({ family: FONT_UI,   size: 11, weight: 500 });
+
+// A fixed y-scale width so every plot area starts at the same x and
+// the charts line up vertically down the page. Chart.js sizes the
+// y scale to its widest label, so "500" and "100%" would otherwise
+// give two different left edges.
+const Y_SCALE_W = 46;
+
+Chart.defaults.color = "#8B8175";
+Chart.defaults.borderColor = "#ECE3D6";
+Chart.defaults.font.family = FONT_MONO;
+
+const chart = new Chart($("chart-main"), {
+  type: "line",
+  data: { labels: [], datasets: [{
+    data: [], borderColor: "#F2A20C", borderWidth: 2, pointRadius: 0,
+    fill: { target: "origin", above: "rgba(242,162,12,0.10)", below: "rgba(30,140,125,0.10)" },
+    tension: 0.3,
+  }]},
+  options: {
+    animation: { duration: 300 }, plugins: { legend: { display: false } },
+    scales: { x: { ticks: { maxTicksLimit: 8 } }, y: { title: { display: true, text: "W" } } },
+  },
+});
+
+function setChartType(type, labels, datasets) {
+  chart.config.type = type;
+  chart.data.labels = labels;
+  chart.data.datasets = datasets;
+  chart.options.scales.y =
+    valueAxis(type === "line" ? "W" : "kWh", themeColor("--muted"), themeColor("--grid"));
+  // The day view pins x to a linear 0-1440 minute axis. Month and
+  // year are label-indexed bars, so the category axis has to be put
+  // back or they inherit the fixed 24 h range and render nothing.
+  chart.options.scales.x = {
+    type: "category",
+    ticks: { maxTicksLimit: 12, maxRotation: 0 },
+  };
+  chart.update();
+}
+
+function localDate(d = new Date()) { return d.toLocaleDateString("en-CA"); }
+
+let currentView = "day";
+let currentRows = { labels: [], harvested: [], used: [] };  // for CSV export
+
+/* ============================================================
+   DAY VIEW - CIRCULAR SAMPLE BUFFER
+
+   The old version read history once with .once("value") and only
+   re-read it on a tab switch or the 30-minute timer, so the "live"
+   graph was in fact a snapshot that sat still for half an hour.
+
+   Now: a fixed-size ring keyed by unix timestamp.
+     - seeded from /history/<date> on load
+     - appended from the /live listener as values arrive (3 s)
+     - appended from a child_added listener so the canonical
+       one-minute samples and any backlog upload also land
+     - deduplicated by timestamp, so nothing is ever counted twice
+     - sorted only when a sample actually arrives out of order,
+       which happens after an offline backlog is flushed
+     - bounded at RING_MAX, oldest dropped: memory cannot grow and
+       the window scrolls instead of accumulating forever
+   ============================================================ */
+/* One slot per MINUTE of the day, which is exactly the resolution the
+   ESP logs at. Two reasons this is bucketed rather than a plain
+   timestamp set:
+
+   1. The /live listener fires every LIVE_PUSH_MS (5 s). Keyed by raw
+      timestamp that is 720 new points per hour, ~17000 a day, so the
+      ring hit its cap by mid-morning and evicted the start of the day
+      — the chart could not show a full day even in principle.
+   2. Canonical history samples are ~60 s apart but NOT aligned to :00,
+      so a live point and the history point for the same minute have
+      different timestamps and would both be kept as duplicates.
+
+   Bucketing by floor(t/60) fixes both: at most 1440 points per day,
+   the whole day always fits, and history (canonical) overwrites the
+   live estimate for the same minute when it arrives. */
+const RING_MAX = 1600;                   // 1440 minutes + headroom
+
+const ring = {
+  rows: [],            // ascending by .t
+  slot: new Map(),     // minute bucket -> row, for O(1) dedupe/upsert
+  date: null,          // which local date this ring holds
+};
+
+function ringReset(dateStr) {
+  ring.rows.length = 0;
+  ring.slot.clear();
+  ring.date = dateStr;
+}
+
+/* isLive: a 5 s estimate for the minute in progress. It may be
+   replaced by a later live sample, and is always superseded by the
+   canonical one-minute history sample for the same bucket. */
+function ringPush(s, isLive) {
+  const ts = Number(s && s.t);
+  if (!isFinite(ts) || ts <= 0) return false;
+  const bucket = Math.floor(ts / 60);
+
+  const existing = ring.slot.get(bucket);
+  if (existing) {
+    // History always wins. A live sample only refreshes another live one.
+    if (!isLive || existing.live) {
+      Object.assign(existing, s, { live: !!isLive });
+      return true;
+    }
+    return false;
+  }
+
+  const row = Object.assign({}, s, { live: !!isLive });
+  ring.slot.set(bucket, row);
+  const n = ring.rows.length;
+  if (n && ts < ring.rows[n - 1].t) {
+    ring.rows.push(row);
+    ring.rows.sort((a, b) => a.t - b.t);      // rare: backlog arrived late
+  } else {
+    ring.rows.push(row);
+  }
+  while (ring.rows.length > RING_MAX) {
+    const dropped = ring.rows.shift();
+    ring.slot.delete(Math.floor(dropped.t / 60));
+  }
+  return true;
+}
+
+/* one rAF-coalesced redraw, so a burst of samples repaints once */
+let drawQueued = false;
+function queueDayDraw() {
+  if (drawQueued || currentView !== "day") return;
+  drawQueued = true;
+  requestAnimationFrame(() => { drawQueued = false; drawDay(); });
+}
+
+/* Minutes since local midnight of the day being displayed. This is
+   the x coordinate for the day chart. */
+function minutesOfDay(ts, dateStr) {
+  const midnight = new Date(dateStr + "T00:00:00").getTime();   // local
+  return (ts * 1000 - midnight) / 60000;
 }
 
 /* ============================================================
-   v3 additions
-   · bottom tab bar (Live / Monthly)
-   · source card: which relay is carrying the house
-   · monthly table
+   PART E - THE SHARED TIME AXIS
+
+   Both day charts previously drew a label every 2 hours as
+   "00:00", "02:00", ... Twelve five-character labels do not fit
+   across 360 px, so they collided into an unreadable block; on
+   desktop they were merely crowded.
+
+   Three changes fix it, and BOTH charts take the axis from this
+   one function so they cannot drift apart or misalign vertically:
+
+     1. Hours only. "06" instead of "06:00" is 60% narrower and
+        loses nothing -- the unit is named once, in the axis title.
+     2. A breakpoint. 3-hourly on desktop, 6-hourly under 600 px.
+     3. autoSkip with maxTicksLimit, so if a container is narrower
+        than the breakpoint assumed, Chart.js drops labels itself
+        rather than overprinting them.
+
+   Labels stay horizontal (maxRotation 0): rotated ticks are
+   harder to read and cost vertical space that the chart needs.
    ============================================================ */
-
-/* the toast sits above the nav bar now */
-body { padding-bottom: 96px; }
-
-.tab-panel { display: block; }
-
-/* ---------------- source card ---------------- */
-.card.accent-src::before { background: linear-gradient(180deg, var(--violet), transparent); }
-.card-eyebrow.violet { color: var(--violet); }
-.card.accent-src .card-num {
-  font-family: "Chakra Petch", sans-serif;
-  font-size: clamp(1.05rem, 2.2vw, 1.35rem);
-  letter-spacing: 0.02em; font-weight: 700;
+const NARROW_PX = 600;
+function isNarrow() {
+  return (window.innerWidth || document.documentElement.clientWidth) < NARROW_PX;
 }
 
-.relay-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
-.relay-chip {
-  display: inline-flex; align-items: center; gap: 6px;
-  font-size: 0.68rem; letter-spacing: 0.04em;
-  border: 1px solid var(--line); border-radius: 999px;
-  padding: 4px 10px; color: var(--muted);
-  transition: color 0.25s, border-color 0.25s, background 0.25s;
+// Minutes-of-day -> "00".."24". Whole hours only; ticks always land
+// on an exact hour because stepSize is a multiple of 60.
+function hourTick(mins) {
+  const h = Math.round(mins / 60);
+  return String(h).padStart(2, "0");
 }
-.relay-chip i {
-  width: 6px; height: 6px; border-radius: 50%;
-  background: var(--idle-icon); transition: background 0.25s, box-shadow 0.25s;
-}
-.relay-chip.on   { color: var(--ok-text);   border-color: var(--gen-line); background: var(--gen-soft); }
-.relay-chip.on i { background: var(--gen);   box-shadow: 0 0 8px var(--gen); }
-.relay-chip.warn   { color: var(--warn-text); border-color: rgba(242, 73, 92, 0.5); background: var(--coral-soft); }
-.relay-chip.warn i { background: var(--coral); box-shadow: 0 0 8px var(--coral); }
-.relay-chip.gold   { color: var(--gold-text); border-color: var(--amber-line); background: var(--amber-soft); }
-.relay-chip.gold i { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
 
-/* ---------------- monthly tab ---------------- */
-.mtable {
-  width: 100%; border-collapse: collapse; margin-top: 18px;
-  font-family: "JetBrains Mono", monospace; font-size: 0.76rem;
+/* MUST return a fresh plain object every call. chart.options is a
+   Chart.js proxy; handing back a shared object that has already been
+   assigned into one chart's options and assigning it into another
+   builds a self-reference and the scriptable resolver recurses
+   forever. Same trap documented on the tooltip callbacks below. */
+function timeAxis(dim, grid) {
+  const narrow = isNarrow();
+  return {
+    type: "linear",
+    min: 0,
+    max: 1440,
+    offset: false,
+    bounds: "ticks",
+    grid: { color: grid },
+    ticks: {
+      stepSize: narrow ? 360 : 180,          // 6 h on mobile, 3 h on desktop
+      autoSkip: true,
+      maxTicksLimit: narrow ? 5 : 9,
+      maxRotation: 0,
+      minRotation: 0,
+      padding: 4,
+      color: dim,
+      font: axisTickFont(),
+      callback: (v) => hourTick(v),
+    },
+    title: {
+      display: true,
+      text: "Time (h)",
+      color: dim,
+      font: axisTitleFont(),
+      padding: { top: 2, bottom: 0 },
+    },
+  };
 }
-.mtable th {
-  text-align: right; color: var(--muted); font-weight: 500;
-  padding: 8px 6px; border-bottom: 1px solid var(--line);
-  font-family: "Outfit", sans-serif; letter-spacing: 0.03em;
+
+/* The y counterpart. Same discipline: explicit font, explicit
+   colour, explicit padding, and a tick CEILING rather than a step,
+   so the labels stay readable whatever the day's peak turns out to
+   be. About six is the most a 200 px tall plot can carry.
+
+   afterFit pins the scale width, which is what actually aligns the
+   plot areas of the charts stacked down the page.
+
+   Returns a fresh plain object every call -- chart.options is a
+   Chart.js proxy and a shared object assigned into two charts
+   builds a self-reference the resolver recurses on. */
+function valueAxis(text, dim, grid, extra) {
+  const a = {
+    beginAtZero: true,
+    grid: { color: grid },
+    ticks: {
+      maxTicksLimit: 6,
+      color: dim,
+      padding: 4,
+      font: axisTickFont(),
+    },
+    title: {
+      display: true,
+      text: text,
+      color: dim,
+      font: axisTitleFont(),
+    },
+    afterFit: (scale) => { scale.width = Y_SCALE_W; },
+  };
+  if (extra) {
+    if (extra.min != null) a.min = extra.min;
+    if (extra.max != null) a.max = extra.max;
+    if (extra.callback) a.ticks.callback = extra.callback;
+    if (extra.stepSize) a.ticks.stepSize = extra.stepSize;
+  }
+  return a;
 }
-.mtable th:first-child, .mtable td:first-child { text-align: left; }
-.mtable td {
-  text-align: right; padding: 7px 6px;
-  border-bottom: 1px solid var(--grid);
-  font-variant-numeric: tabular-nums;
+
+// 8 px under the ticks so the axis title is never clipped.
+function applyAxisPadding(chart) {
+  chart.options.layout.padding.bottom = 8;
 }
-.mtable td:first-child { color: var(--muted); font-family: "Outfit", sans-serif; }
-.mtable tr.mtotal td {
-  border-top: 1px solid var(--line); border-bottom: 0;
-  font-weight: 800; color: var(--amber-text); padding-top: 10px;
+
+// Minutes-of-day -> "HH:MM". Rounding to a whole minute FIRST is
+// what keeps decimals off the axis, and it also fixes a carry bug:
+// Math.round(59.9999) is 60, so the old version could render
+// "11:60" in a tooltip for a sample landing on a minute boundary.
+function hhmm(mins) {
+  let t = Math.round(mins);
+  if (!isFinite(t) || t < 0) t = 0;
+  const h = Math.floor(t / 60), m = t % 60;
+  return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
 }
-.mtable tr.mtotal td:first-child { color: var(--amber-text); }
+
+/* ============================================================
+   PART F - CEB RUNTIME SHADING
+
+   Every history sample the ESP writes already carries `src`, the
+   committed source state (0 none, 1 pack/solar, 2 CEB/utility) --
+   buildSampleJson() has shipped it since v4. So this needs NO new
+   firmware field, NO schema change and NO new upload path, and in
+   particular it is never inferred from SoC or PV.
+
+   Samples are about 60 s apart. A run is closed when the source
+   changes OR when the gap to the next sample exceeds SRC_GAP_MAX,
+   so a logging outage renders as an unshaded gap rather than as an
+   invented hour of grid time.
+   ============================================================ */
+const SRC_UTILITY = 2;              // matches enum Source in config.h
+const SRC_GAP_MAX = 5;              // minutes; longer is a data gap
+
+// -> { bands: [{a,b}] in minutes-of-day, cebMin, packMin }
+function cebRuns(rows, dateStr) {
+  const out = { bands: [], cebMin: 0, packMin: 0 };
+  if (!rows || rows.length < 2) return out;
+
+  let open = null;
+  for (let i = 0; i < rows.length - 1; i++) {
+    const a = rows[i], b = rows[i + 1];
+    if (a.src == null) continue;
+    const t0 = minutesOfDay(a.t, dateStr);
+    const t1 = minutesOfDay(b.t, dateStr);
+    const dt = t1 - t0;
+    if (!(dt > 0) || dt > SRC_GAP_MAX) {        // gap: close and skip
+      if (open) { out.bands.push(open); open = null; }
+      continue;
+    }
+    if (Number(a.src) === SRC_UTILITY) {
+      out.cebMin += dt;
+      if (open) open.b = t1;
+      else open = { a: t0, b: t1 };
+    } else {
+      out.packMin += dt;
+      if (open) { out.bands.push(open); open = null; }
+    }
+  }
+  if (open) out.bands.push(open);
+  return out;
+}
+
+function hoursMins(mins) {
+  const m = Math.max(0, Math.round(mins));
+  const h = Math.floor(m / 60);
+  return h ? `${h}h ${String(m % 60).padStart(2, "0")}m` : `${m}m`;
+}
+
+/* Drawn BEHIND the datasets, so the blue and green lines stay fully
+   legible on top of the tint. */
+const cebBandPlugin = {
+  id: "cebBands",
+  beforeDatasetsDraw(chart, _args, opts) {
+    const bands = opts && opts.bands;
+    if (!bands || !bands.length) return;
+    const x = chart.scales.x;
+    const area = chart.chartArea;
+    if (!x || !area) return;
+    const ctx = chart.ctx;
+    ctx.save();
+    ctx.fillStyle = opts.color || "rgba(200,150,60,0.16)";
+    for (const b of bands) {
+      const x0 = x.getPixelForValue(Math.max(0, b.a));
+      const x1 = x.getPixelForValue(Math.min(1440, b.b));
+      if (x1 <= x0) continue;
+      ctx.fillRect(x0, area.top, Math.max(1, x1 - x0), area.bottom - area.top);
+    }
+    ctx.restore();
+  },
+};
+Chart.register(cebBandPlugin);
+
+function drawDay() {
+  // A CATEGORY axis takes its width from however many samples exist,
+  // so a half-empty day stretched a few morning readings across the
+  // whole canvas and the axis moved every time a sample landed.
+  // A fixed linear axis in minutes-of-day pins the chart to
+  // 00:00-24:00 always: the curve grows into a stable frame instead
+  // of the frame resizing around the curve.
+  const gen = ring.rows.map((s) => ({ x: minutesOfDay(s.t, ring.date), y: s.p > 0 ? s.p : 0 }));
+  const use = ring.rows.map((s) => ({ x: minutesOfDay(s.t, ring.date), y: s.p < 0 ? -s.p : 0 }));
+
+  chart.config.type = "line";
+  // The same axis pair the SoC chart uses, so the two line up and
+  // share every font, colour and padding value.
+  chart.options.scales.y = valueAxis("W", themeColor("--muted"), themeColor("--grid"));
+  chart.data.labels = [];                      // linear axis: points carry x
+
+  // Must be a PLAIN literal. chart.options is a Chart.js proxy, so
+  // Object.assign({}, chart.options.scales.x, ...) copies the
+  // resolver's own internals back into itself and the scriptable
+  // resolver then recurses forever ("Recursion detected").
+  chart.options.scales.x = timeAxis(themeColor("--muted"), themeColor("--grid"));
+  applyAxisPadding(chart);
+
+  // Usage first, generation second: the point of this system is to
+  // understand what the house consumed, with what the array made as
+  // the supporting number. The inline theme glue in index.html now
+  // colours by LABEL, not by index, so this order is safe to change.
+  chart.data.datasets = [
+    { label: "Electricity use", data: use, borderWidth: 2, pointRadius: 0,
+      fill: "origin", tension: 0.35, spanGaps: false },
+    { label: "Generation (charging)", data: gen, borderWidth: 2, pointRadius: 0,
+      fill: "origin", tension: 0.35, spanGaps: false },
+  ];
+  // Without an explicit title callback Chart.js prints the raw linear
+  // x value for a tooltip -- e.g. "457.8166666666667". Format it.
+  // NOTE: do NOT write `plugins.tooltip = plugins.tooltip || {}` here.
+  // chart.options is a Chart.js proxy, so assigning it into itself
+  // builds a self-reference and the resolver recurses forever
+  // ("Maximum call stack size exceeded"). plugins.tooltip always
+  // exists from the defaults, so just set the callbacks on it.
+  chart.options.plugins.tooltip.callbacks = {
+    title: (items) => (items.length ? hhmm(items[0].parsed.x) : ""),
+    label: (it) => ` ${it.dataset.label}: ${Math.round(it.parsed.y)} W`,
+  };
+  chart.options.plugins.legend.display = true;
+
+  // Part F. Shade the periods the house actually ran on CEB, and
+  // say how long that was underneath.
+  const runs = cebRuns(ring.rows, ring.date);
+  // Dedicated tokens, identical in both themes: the band is a 15%
+  // wash and the swatch border is the solid yellow. Reading --amber
+  // instead would pick up the darker light-theme stroke colour.
+  const bandFill = themeColor("--ceb-band");
+  const bandLine = themeColor("--ceb-line");
+  chart.options.plugins.cebBands = { bands: runs.bands, color: bandFill };
+  // An empty dataset renders nothing but gives the legend its
+  // swatch, which is cheaper and less fragile than overriding
+  // generateLabels.
+  chart.data.datasets.push({
+    label: "On CEB", data: [], backgroundColor: bandFill,
+    borderColor: bandLine, borderWidth: 0, pointRadius: 0, fill: true,
+    // The theme glue in index.html repaints datasets by label; this
+    // one owns its colour because it has to match the shading.
+    ownColor: true,
+  });
+
+  chart.update("none");                       // no animation = no flicker
+
+  const cebEl = $("ceb-caption");
+  if (cebEl) {
+    const known = runs.cebMin + runs.packMin;
+    cebEl.innerHTML = !known
+      ? "No source history stored for this day yet"
+      : `<span><span class="swatch"></span>CEB runtime today: <b>${hoursMins(runs.cebMin)}</b></span>` +
+        `<span>Pack runtime: <b>${hoursMins(runs.packMin)}</b></span>`;
+  }
+
+  // Same ring, same samples, further views of them.
+  drawSoc();
+  drawPred();
+
+  currentRows = {
+    kind: "day", date: ring.date,
+    columns: ["time", "voltage", "current", "power", "soc", "source"],
+    rows: ring.rows.map((s) => ({
+      time: new Date(s.t * 1000).toISOString(),
+      voltage: s.v, current: s.i, power: s.p, soc: s.soc,
+      source: s.src == null ? "" : (Number(s.src) === SRC_UTILITY ? "CEB" : "Pack"),
+    })),
+  };
+  const live = ring.date === localDate();
+  $("chart-caption").textContent = ring.rows.length
+    ? `Power in/out of the battery on ${ring.date} · ${ring.rows.length} samples${live ? " · live" : ""}`
+    : `No samples stored for ${ring.date} yet`;
+}
+
+
+/* ============================================================
+   BATTERY SoC OVER TIME
+
+   Reuses the SAME ring the generation chart is built from -- the
+   ESP has always shipped `soc` inside every /history sample, so
+   this needs no new data source, no new Firebase path and no
+   firmware change to feed it.
+
+   Truthful by construction: one point per stored sample, no
+   interpolation, and spanGaps:false so a logging gap renders as a
+   gap rather than a straight line pretending the pack was there.
+   ============================================================ */
+let socChart = null;
+
+function drawSoc() {
+  const pts = ring.rows
+    .filter((s) => s.soc != null && isFinite(s.soc))
+    .map((s) => ({ x: minutesOfDay(s.t, ring.date), y: Number(s.soc) }));
+
+  const dim  = themeColor("--muted");
+  const grid = themeColor("--grid");
+  const tealC = themeColor("--teal");
+
+  const ds = [{
+    label: "Battery SoC",
+    data: pts,
+    borderColor: tealC,
+    backgroundColor: tealC + "2E",
+    borderWidth: 2,
+    pointRadius: 0,
+    fill: "origin",
+    tension: 0.3,
+    spanGaps: false,
+  }];
+
+  if (!socChart) {
+    socChart = new Chart($("chart-soc"), {
+      type: "line",
+      data: { labels: [], datasets: ds },
+      options: {
+        maintainAspectRatio: false,
+        animation: { duration: 0 },
+        interaction: { mode: "index", intersect: false },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              title: (items) => (items.length ? hhmm(items[0].parsed.x) : ""),
+              label: (it) => ` ${Math.round(it.parsed.y)} %`,
+            },
+          },
+        },
+        scales: {
+          x: timeAxis(dim, grid),
+          // Identical construction to the usage chart; only the
+          // range, the unit suffix and the title differ.
+          y: valueAxis("SoC", dim, grid,
+                       { min: 0, max: 100, stepSize: 20, callback: (v) => v + "%" }),
+        },
+      },
+    });
+  } else {
+    socChart.data.datasets = ds;
+  }
+
+  const o = socChart.options;
+  // Rebuilt rather than patched: crossing the 600 px breakpoint has
+  // to change stepSize and font size too, not just the colours.
+  o.scales.x = timeAxis(dim, grid);
+  o.scales.y = valueAxis("SoC", dim, grid,
+                         { min: 0, max: 100, stepSize: 20, callback: (v) => v + "%" });
+  applyAxisPadding(socChart);
+  socChart.update("none");
+
+  const el = $("soc-caption");
+  if (!el) return;
+  if (!pts.length) {
+    el.textContent = `No state-of-charge samples stored for ${ring.date} yet`;
+    return;
+  }
+  let lo = pts[0].y, hi = pts[0].y;
+  for (const p of pts) { if (p.y < lo) lo = p.y; if (p.y > hi) hi = p.y; }
+  el.textContent =
+    `State of charge on ${ring.date} · now ${Math.round(pts[pts.length - 1].y)}%` +
+    ` · low ${Math.round(lo)}% · high ${Math.round(hi)}%`;
+}
+
+
+/* ============================================================
+   PART G - PREDICTION ACCURACY
+
+   Two curves: what this array HAS produced hour by hour on
+   previous days, and what it produced today.
+
+   WHERE THE EXPECTED CURVE COMES FROM. The ESP32 does not publish
+   an hourly profile, and adding one would mean touching the upload
+   path, which is locked. So it is computed here from history days
+   that are already in Firebase.
+
+   That is not free -- a day is roughly 1400 samples -- so:
+     - at most PROFILE_DAYS days are ever fetched,
+     - the fetch is deferred to idle time after the live day has
+       loaded, so it never competes with the charts above,
+     - and only the RESULT (24 hours x 3 numbers) is cached, in
+       localStorage, keyed by date. One fetch per day per browser.
+
+   With fewer than PROFILE_MIN_DAYS days the card says so rather
+   than drawing a confident band through two data points.
+   ============================================================ */
+const PROFILE_DAYS = 5;
+const PROFILE_MIN_DAYS = 3;
+const PROFILE_KEY = "sp.pvProfile.v1";
+
+let predChart = null;
+let pvProfile = null;          // { date, days, hours:[{p25,p50,p75}|null x24] }
+let profileBusy = false;
+
+function loadProfileCache() {
+  try {
+    const raw = localStorage.getItem(PROFILE_KEY);
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    return (o && o.date === localDate() && Array.isArray(o.hours)) ? o : null;
+  } catch (e) { return null; }   // private mode, cleared storage, quota
+}
+
+function saveProfileCache(o) {
+  try { localStorage.setItem(PROFILE_KEY, JSON.stringify(o)); } catch (e) {}
+}
+
+function quantile(sorted, q) {
+  if (!sorted.length) return 0;
+  const i = (sorted.length - 1) * q;
+  const lo = Math.floor(i), hi = Math.ceil(i);
+  return lo === hi ? sorted[lo] : sorted[lo] + (sorted[hi] - sorted[lo]) * (i - lo);
+}
+
+/* Charging power only. p > 0 is energy going INTO the pack, which
+   is the same definition the generation curve uses -- this card
+   must not invent a second one. */
+function hourlyFromRows(rows, dateStr) {
+  const buckets = Array.from({ length: 24 }, () => []);
+  for (const r of rows) {
+    const m = minutesOfDay(r.t, dateStr);
+    if (!(m >= 0 && m < 1440)) continue;
+    buckets[Math.floor(m / 60)].push(r.p > 0 ? r.p : 0);
+  }
+  return buckets.map((b) => {
+    if (!b.length) return null;
+    b.sort((x, y) => x - y);
+    return { p25: quantile(b, 0.25), p50: quantile(b, 0.5), p75: quantile(b, 0.75) };
+  });
+}
+
+async function buildProfile() {
+  if (profileBusy) return;
+  const cached = loadProfileCache();
+  if (cached) { pvProfile = cached; drawPred(); return; }
+
+  profileBusy = true;
+  const perDay = [];          // [dayIndex][hour] = mean charging W
+  let got = 0;
+  for (let back = 1; back <= PROFILE_DAYS; back++) {
+    const d = new Date();
+    d.setDate(d.getDate() - back);
+    const key = localDate(d);      // the existing helper, not a second one
+    let snap;
+    try {
+      snap = await db.ref("history/" + key).limitToLast(RING_MAX).once("value");
+    } catch (e) { continue; }
+    const rows = [];
+    // DataSnapshot.forEach CANCELS on a truthy return, so the body
+    // must not return the push() result. Braces, deliberately.
+    snap.forEach((c) => { const v = c.val(); if (v && v.t) rows.push(v); });
+    if (rows.length < 60) continue;             // barely any data: skip
+    rows.sort((a, b) => a.t - b.t);
+    perDay.push(hourlyFromRows(rows, key));
+    got++;
+  }
+
+  const hours = [];
+  for (let h = 0; h < 24; h++) {
+    const vals = perDay.map((d) => (d[h] ? d[h].p50 : null)).filter((v) => v != null);
+    if (!vals.length) { hours.push(null); continue; }
+    vals.sort((a, b) => a - b);
+    hours.push({
+      p25: quantile(vals, 0.25),
+      p50: quantile(vals, 0.5),
+      p75: quantile(vals, 0.75),
+    });
+  }
+
+  pvProfile = { date: localDate(), days: got, hours };
+  saveProfileCache(pvProfile);
+  profileBusy = false;
+  drawPred();
+}
+
+function drawPred() {
+  const cv = $("chart-pred");
+  const cap = $("pred-caption");
+  if (!cv) return;
+
+  const dim = themeColor("--muted");
+  const grid = themeColor("--grid");
+  const green = themeColor("--gen");
+
+  const actual = ring.rows.map((s) => ({
+    x: minutesOfDay(s.t, ring.date),
+    y: s.p > 0 ? s.p : 0,
+  }));
+
+  const ds = [];
+  const enough = pvProfile && pvProfile.days >= PROFILE_MIN_DAYS;
+
+  if (enough) {
+    // The p25-p75 spread, drawn as two lines filling to each other.
+    const at = (h, k) => (pvProfile.hours[h] ? { x: h * 60 + 30, y: pvProfile.hours[h][k] } : null);
+    const band25 = [], band75 = [], mid = [];
+    for (let h = 0; h < 24; h++) {
+      const a = at(h, "p25"), b = at(h, "p75"), m = at(h, "p50");
+      if (a) band25.push(a);
+      if (b) band75.push(b);
+      if (m) mid.push(m);
+    }
+    ds.push({
+      label: "Typical spread", data: band75, borderColor: "transparent",
+      backgroundColor: dim + "22", borderWidth: 0, pointRadius: 0,
+      fill: "+1", tension: 0.35,
+    });
+    ds.push({
+      label: "_p25", data: band25, borderColor: "transparent",
+      borderWidth: 0, pointRadius: 0, fill: false, tension: 0.35,
+    });
+    ds.push({
+      label: "Expected PV", data: mid, borderColor: dim, borderDash: [6, 4],
+      borderWidth: 2, pointRadius: 0, fill: false, tension: 0.35,
+    });
+  }
+
+  ds.push({
+    label: "Actual PV today", data: actual, borderColor: green,
+    backgroundColor: green + "22", borderWidth: 2, pointRadius: 0,
+    fill: "origin", tension: 0.3, spanGaps: false,
+  });
+
+  if (!predChart) {
+    predChart = new Chart(cv, {
+      type: "line",
+      data: { labels: [], datasets: ds },
+      options: {
+        maintainAspectRatio: false,
+        animation: { duration: 0 },
+        interaction: { mode: "index", intersect: false },
+        plugins: {
+          legend: {
+            display: true,
+            labels: { filter: (i) => i.text !== "_p25", boxWidth: 10, boxHeight: 3,
+                      font: legendFont() },
+          },
+          tooltip: {
+            filter: (i) => i.dataset.label !== "_p25",
+            callbacks: {
+              title: (items) => (items.length ? hhmm(items[0].parsed.x) : ""),
+              label: (it) => ` ${it.dataset.label}: ${Math.round(it.parsed.y)} W`,
+            },
+          },
+        },
+        scales: {
+          x: timeAxis(dim, grid),
+          y: valueAxis("W", dim, grid),
+        },
+      },
+    });
+  } else {
+    predChart.data.datasets = ds;
+  }
+  // Same axis object as the other two charts, rebuilt so a resize
+  // across the breakpoint takes effect here too.
+  predChart.options.scales.x = timeAxis(dim, grid);
+  predChart.options.scales.y = valueAxis("W", dim, grid);
+  applyAxisPadding(predChart);
+  predChart.update("none");
+
+  if (!cap) return;
+  if (!pvProfile) { cap.textContent = "Building the historical profile…"; return; }
+  if (!enough) {
+    cap.textContent =
+      `Only ${pvProfile.days} day${pvProfile.days === 1 ? "" : "s"} of history so far` +
+      ` · the expected curve needs ${PROFILE_MIN_DAYS}`;
+    return;
+  }
+
+  // The accuracy line. Expected and baseline come from the ESP's own
+  // model (it owns the learned bias table); actual is today's
+  // harvest, the same number the cards above show.
+  const bits = [];
+  const cond = (live && live.fcConf > 0 && live.fcText && live.fcText !== "UNKNOWN")
+             ? live.fcText : null;
+  bits.push(`Forecast today: <b>${cond || "none cached"}</b>`);
+
+  const expWh = live && live.predTodayWh;
+  const actWh = live && live.harvestWh;
+  if (expWh != null && expWh > 0) bits.push(`Expected <b>${(expWh / 1000).toFixed(1)} kWh</b>`);
+  if (actWh != null) bits.push(`Actual <b>${(actWh / 1000).toFixed(1)} kWh</b>`);
+  if (expWh != null && expWh > 0 && actWh != null) {
+    // Symmetric: 2x expected and half expected are both "50% off".
+    const r = actWh / expWh;
+    const acc = Math.max(0, Math.round(100 * (r > 1 ? 1 / r : r)));
+    bits.push(`Accuracy <b>${acc}%</b>`);
+  }
+  cap.className = "panel-sub run-sum pred-acc";
+  cap.innerHTML = bits.map((b) => `<span>${b}</span>`).join("");
+}
+
+/* child_added listener for the day currently on screen. Detached
+   whenever the day changes so listeners cannot pile up -- that was
+   the memory leak path.
+
+   loadGen guards the await: spinning the date picker fires several
+   loadDay() calls, and without it a slow earlier fetch would land
+   its rows into the newer day's ring and attach a second listener. */
+let dayRef = null;
+let loadGen = 0;
+
+function detachDayFeed() {
+  if (dayRef) { dayRef.off(); dayRef = null; }
+}
+
+async function loadDay(dateStr) {
+  const gen = ++loadGen;
+  detachDayFeed();
+  ringReset(dateStr);
+  drawDay();                                   // paint empty immediately
+
+  let snap;
+  try {
+    snap = await db.ref("history/" + dateStr).limitToLast(RING_MAX).once("value");
+  } catch (e) {
+    $("chart-caption").textContent = `Could not load ${dateStr}: ${e.message || e}`;
+    return;
+  }
+  if (gen !== loadGen) return;                 // superseded while awaiting
+
+  // NOTE: Firebase's DataSnapshot.forEach ABORTS as soon as the
+  // callback returns a truthy value. ringPush returns true on a
+  // successful insert, so `forEach(c => ringPush(c.val()))` loaded
+  // exactly ONE sample and silently discarded the rest of the day.
+  // The braces matter: this callback must return undefined.
+  snap.forEach((c) => { ringPush(c.val()); });
+  drawDay();
+
+  // Only today keeps streaming; past days are static.
+  if (dateStr === localDate()) {
+    detachDayFeed();                           // belt and braces
+    dayRef = db.ref("history/" + dateStr).orderByKey().limitToLast(1);
+    dayRef.on("child_added", (c) => {
+      if (gen !== loadGen || ring.date !== dateStr) return;
+      if (ringPush(c.val())) queueDayDraw();
+    });
+  }
+
+  // The charts above are painted; now the historical profile may
+  // use the idle time and the network.
+  kickProfile();
+}
+
+/* ============================================================
+   DAILY TOTALS - QUERIED PER YEAR
+
+   limitToLast(400) silently truncated anything older than ~13
+   months, so a second year of history could never be totalled
+   correctly. Key-range queries return exactly the year asked for,
+   however far back it is.
+   ============================================================ */
+const dailyByYear = new Map();
+
+function harvestKwh(r) { return (r.harvestWh ?? r.chgWh ?? 0) / 1000; }
+function usedKwh(r)    { return (r.disWh ?? 0) / 1000; }
+
+async function daysForYear(year) {
+  const key = String(year);
+  if (dailyByYear.has(key)) return dailyByYear.get(key);
+  const snap = await db.ref("daily").orderByKey()
+    .startAt(key + "-01-01").endAt(key + "-12-31").once("value");
+  const rows = [];
+  // Same trap as loadDay: Array.prototype.push returns the new LENGTH,
+  // which is >= 1 and therefore truthy, so Firebase cancelled the
+  // enumeration after the first day. Every monthly and yearly total
+  // was computed from a single day. Braces = returns undefined.
+  snap.forEach((c) => { rows.push({ date: c.key, ...(c.val() || {}) }); });
+  dailyByYear.set(key, rows);
+  return rows;
+}
+
+function invalidateDaily() { dailyByYear.clear(); }
+
+async function loadMonth(monthStr) {           // "YYYY-MM"
+  detachDayFeed();
+  const rows = (await daysForYear(monthStr.slice(0, 4)))
+    .filter((r) => r.date.startsWith(monthStr));
+  const labels = rows.map((r) => r.date.slice(8));
+  const harvested = rows.map(harvestKwh);
+  const used = rows.map(usedKwh);
+  setChartType("bar", labels, [
+    { label: "Used", data: used, borderRadius: 4 },
+    { label: "Harvested", data: harvested, borderRadius: 4 },
+  ]);
+  chart.options.plugins.legend.display = true;
+  chart.update();
+  currentRows = { kind: "month", date: monthStr,
+    columns: ["date", "used_kWh", "harvested_kWh"],
+    rows: rows.map((r) => ({ date: r.date,
+      used_kWh: usedKwh(r).toFixed(3), harvested_kWh: harvestKwh(r).toFixed(3) })) };
+  const totUsed = used.reduce((a, b) => a + b, 0);
+  const total = harvested.reduce((a, b) => a + b, 0);
+  $("chart-caption").textContent =
+    `${monthStr} · drawn ${totUsed.toFixed(1)} kWh · harvested ${total.toFixed(1)} kWh`;
+}
+
+async function loadYear(yearStr) {              // "YYYY"
+  detachDayFeed();
+  const rows = await daysForYear(yearStr);
+  // Always twelve buckets: a month with no data must read 0, not
+  // vanish, or the bars silently shift along the axis.
+  const chg = Array(12).fill(0), dis = Array(12).fill(0);
+  rows.forEach((r) => {
+    const m = parseInt(r.date.slice(5, 7), 10) - 1;
+    if (m < 0 || m > 11) return;
+    chg[m] += harvestKwh(r);
+    dis[m] += usedKwh(r);
+  });
+  const labels = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  setChartType("bar", labels, [
+    { label: "Harvested", data: chg, borderRadius: 4 },
+    { label: "Used", data: dis, borderRadius: 4 },
+  ]);
+  chart.options.plugins.legend.display = true;
+  chart.update();
+  currentRows = { kind: "year", date: yearStr,
+    columns: ["month", "used_kWh", "harvested_kWh"],
+    rows: labels.map((name, i) => ({
+      month: `${yearStr}-${String(i + 1).padStart(2, "0")}`,
+      used_kWh: dis[i].toFixed(3), harvested_kWh: chg[i].toFixed(3) })) };
+  const totUsedY = dis.reduce((a, b) => a + b, 0);
+  const total = chg.reduce((a, b) => a + b, 0);
+  $("chart-caption").textContent =
+    `${yearStr} · drawn ${totUsedY.toFixed(1)} kWh · harvested ${total.toFixed(1)} kWh`;
+}
+
+function refreshChart() {
+  if (currentView === "day") loadDay($("pick-day").value || localDate());
+  else if (currentView === "month") loadMonth($("pick-month").value || localDate().slice(0, 7));
+  else loadYear($("pick-year").value || String(new Date().getFullYear()));
+}
+
+/* ---------------- view switcher ---------------- */
+document.querySelectorAll(".seg-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".seg-btn").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    currentView = btn.dataset.view;
+    $("pick-day").classList.toggle("hidden", currentView !== "day");
+    $("pick-month").classList.toggle("hidden", currentView !== "month");
+    $("pick-year").classList.toggle("hidden", currentView !== "year");
+    chart.options.plugins.legend.display = currentView !== "day";
+    refreshChart();
+  });
+});
+$("pick-day").value = localDate();
+$("pick-month").value = localDate().slice(0, 7);
+$("pick-year").value = String(new Date().getFullYear());
+$("pick-day").addEventListener("change", refreshChart);
+$("pick-month").addEventListener("change", refreshChart);
+$("pick-year").addEventListener("change", refreshChart);
+
+/* ---------------- CSV export ---------------- */
+function toCSV(columns, rows) {
+  const esc = (v) => `"${String(v).replace(/"/g, '""')}"`;
+  const head = columns.map(esc).join(",");
+  const body = rows.map((r) => columns.map((c) => esc(r[c] ?? "")).join(",")).join("\n");
+  return head + "\n" + body;
+}
+function downloadText(filename, text) {
+  const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+$("btn-export").addEventListener("click", () => {
+  if (!currentRows.rows || !currentRows.rows.length) return;
+  const csv = toCSV(currentRows.columns, currentRows.rows);
+  downloadText(`solar-pulse-${currentRows.kind}-${currentRows.date}.csv`, csv);
+});
+
+/* ============================================================
+   MONTHLY TAB
+   Built from /daily, the one-row-per-day log the ESP32 keeps in
+   its own flash and mirrors to Firebase. Twelve bars, one per
+   month of the chosen year, plus a table of the same numbers.
+   ============================================================ */
+const MONTH_NAMES = ["January","February","March","April","May","June",
+                     "July","August","September","October","November","December"];
+let monthlyChart = null;
+let monthlyRows = null;
+
+function themeColor(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+async function loadMonthlyTab() {
+  const year = String($("pick-myear").value || new Date().getFullYear());
+
+  const rows = await daysForYear(year);
+  const kwh = Array(12).fill(0), used = Array(12).fill(0), days = Array(12).fill(0);
+  rows.forEach((r) => {
+    const m = parseInt(r.date.slice(5, 7), 10) - 1;
+    if (m < 0 || m > 11) return;
+    // harvestWh is firmware v3; fall back to chgWh for older rows
+    kwh[m]  += (r.harvestWh ?? r.chgWh ?? 0) / 1000;
+    used[m] += (r.disWh || 0) / 1000;
+    days[m] += 1;
+  });
+
+  const total = kwh.reduce((a, b) => a + b, 0);
+  const totalUsed = used.reduce((a, b) => a + b, 0);
+  const totalDays = days.reduce((a, b) => a + b, 0);
+  // Busiest month is the biggest DRAW, not the biggest harvest:
+  // usage is the headline number on this dashboard now.
+  let bestIdx = 0;
+  used.forEach((v, i) => { if (v > used[bestIdx]) bestIdx = i; });
+
+  /* ---- summary cards ---- */
+  $("yr-kwh").textContent      = total.toFixed(1);
+  $("yr-days").textContent     = totalDays;
+  $("yr-best").textContent     = totalUsed > 0 ? MONTH_NAMES[bestIdx].slice(0, 3) : "--";
+  $("yr-best-kwh").textContent = used[bestIdx].toFixed(1);
+  $("yr-used").textContent     = totalUsed.toFixed(1);
+  $("yr-days2").textContent    = totalDays;
+
+  /* ---- bar chart ---- */
+  const labels = MONTH_NAMES.map((m) => m.slice(0, 3));
+  const solar = themeColor("--amber"), blue = themeColor("--use"), dim = themeColor("--muted");
+  const grid = themeColor("--grid");
+  const datasets = [
+    // Used first so it draws and legends first.
+    { label: "Used",      data: used, backgroundColor: blue,  borderRadius: 6 },
+    { label: "Harvested", data: kwh,  backgroundColor: solar, borderRadius: 6 },
+  ];
+
+  if (!monthlyChart) {
+    monthlyChart = new Chart($("chart-monthly"), {
+      type: "bar",
+      data: { labels, datasets },
+      options: {
+        maintainAspectRatio: false,
+        animation: { duration: 300 },
+        plugins: { legend: { labels: { boxWidth: 14, boxHeight: 3, font: { size: 11 } } } },
+        scales: { y: { beginAtZero: true, title: { display: true, text: "kWh" } } },
+      },
+    });
+  } else {
+    monthlyChart.data.labels = labels;
+    monthlyChart.data.datasets = datasets;
+  }
+  const o = monthlyChart.options;
+  o.scales.x.ticks = Object.assign(o.scales.x.ticks || {}, { color: dim });
+  o.scales.y.ticks = Object.assign(o.scales.y.ticks || {}, { color: dim });
+  o.scales.x.grid = Object.assign(o.scales.x.grid || {}, { color: grid });
+  o.scales.y.grid = Object.assign(o.scales.y.grid || {}, { color: grid });
+  o.scales.y.title.color = dim;
+  o.plugins.legend.labels.color = dim;
+  monthlyChart.update();
+
+  /* ---- table: used first, harvested second ---- */
+  $("mtbody").innerHTML =
+    used.map((u, i) =>
+      `<tr><td>${MONTH_NAMES[i]}</td><td>${u.toFixed(2)}</td>` +
+      `<td>${kwh[i].toFixed(2)}</td><td>${days[i]}</td></tr>`).join("") +
+    `<tr class="mtotal"><td>Total ${year}</td><td>${totalUsed.toFixed(2)}</td>` +
+    `<td>${total.toFixed(2)}</td><td>${totalDays}</td></tr>`;
+
+  $("monthly-caption").textContent =
+    `${year} · drawn ${totalUsed.toFixed(1)} kWh · harvested ${total.toFixed(1)} kWh`;
+
+  monthlyRows = {
+    kind: "monthly", date: year,
+    columns: ["month", "used_kWh", "harvested_kWh", "days_logged"],
+    rows: used.map((u, i) => ({
+      month: `${year}-${String(i + 1).padStart(2, "0")}`,
+      used_kWh: u.toFixed(3),
+      harvested_kWh: kwh[i].toFixed(3),
+      days_logged: days[i],
+    })),
+  };
+}
+
+$("pick-myear").value = String(new Date().getFullYear());
+$("pick-myear").addEventListener("change", loadMonthlyTab);
+$("btn-export-month").addEventListener("click", () => {
+  if (!monthlyRows) return;
+  downloadText(`solar-pulse-monthly-${monthlyRows.date}.csv`,
+               toCSV(monthlyRows.columns, monthlyRows.rows));
+});
 
 /* ---------------- bottom tab bar ---------------- */
-.bottom-nav {
-  position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
-  display: flex; gap: 4px;
-  padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
-  background: color-mix(in srgb, var(--bg) 88%, transparent);
-  border-top: 1px solid var(--line);
-  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
-}
-.nav-btn {
-  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px;
-  background: none; border: 0; cursor: pointer;
-  color: var(--muted); font-family: "Chakra Petch", sans-serif;
-  font-size: 0.66rem; letter-spacing: 0.14em; text-transform: uppercase;
-  padding: 7px 0 5px; border-radius: 12px;
-  transition: color 0.2s, background 0.2s;
-}
-.nav-btn:hover { color: var(--ink); }
-.nav-btn.active { color: var(--amber-text); background: var(--amber-soft); }
+document.querySelectorAll(".nav-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".nav-btn").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    const tab = btn.dataset.tab;
+    $("tab-live").classList.toggle("hidden", tab !== "live");
+    $("tab-monthly").classList.toggle("hidden", tab !== "monthly");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    if (tab === "monthly") loadMonthlyTab();
+    else if (chart) chart.resize();
+  });
+});
 
-@media (max-width: 760px) {
-  body { padding-bottom: 96px; }
-  .mtable { font-size: 0.7rem; }
-  .mtable th, .mtable td { padding: 6px 3px; }
-
-  /* The pill strip is already a horizontal scroller on a phone, and the
-     "Powering the house" card says the same thing with more detail.
-     Drop the source pill here so the strip does not get longer than it
-     was before v3. The travel pill stays: it is hidden unless you are
-     actually away, and that is worth seeing at a glance. */
-  #pill-src { display: none; }
+/* Build the historical PV profile once, at idle, so it never
+   competes with the live charts for the main thread or the network.
+   requestIdleCallback is not in every browser; setTimeout is the
+   fallback, not a race. */
+let profileKicked = false;
+function kickProfile() {
+  if (profileKicked) return;
+  profileKicked = true;
+  const go = () => buildProfile().catch(() => {});
+  if (window.requestIdleCallback) window.requestIdleCallback(go, { timeout: 8000 });
+  else setTimeout(go, 3000);
 }
 
-/* keep the alarm toast clear of the tab bar */
-.toast { bottom: 88px; }
-@media (max-width: 760px) { .toast { bottom: 82px; } }
+/* Crossing the 600 px breakpoint changes tick spacing and font
+   size, so the axes have to be rebuilt -- a plain canvas resize
+   does not do it. Debounced: a drag across the breakpoint fires
+   dozens of resize events. */
+let resizeT = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { if (currentView === "day") drawDay(); }, 150);
+});
 
-/* tonight's evening-floor plan, inside the source card */
-.tonight { display: flex; align-items: center; gap: 6px; }
-.tonight::before {
-  content: ""; width: 6px; height: 6px; border-radius: 50%;
-  background: var(--gen); flex: none;
-}
-.tonight.rainy { color: var(--gold-text); }
-.tonight.rainy::before { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+/* ---------------- wire it up ---------------- */
+db.ref("live").on("value", (snap) => {
+  live = snap.val();
+  render();
 
-/* ============================================================
-   ESP backlog indicator (footer)
-   · default   : "N samples waiting on the ESP"
-   · .syncing  : backlog is draining into Firebase right now
-   · .done     : backlog landed, views have been re-fetched
-   ============================================================ */
-#buffered-note { transition: color 0.3s ease; }
-#buffered-note.syncing {
-  color: var(--amber);
-  animation: backlog-pulse 1.3s ease-in-out infinite;
-}
-#buffered-note.done { color: var(--gen-text); }
-@keyframes backlog-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-@media (prefers-reduced-motion: reduce) {
-  #buffered-note.syncing { animation: none; }
-}
+  // Feed the live sample straight into the day ring. This is what
+  // makes the graph actually live at the ESP's 3 s cadence instead
+  // of waiting for the next one-minute history write.
+  if (live && currentView === "day" && ring.date === localDate()) {
+    if (ringPush({ t: live.ts, v: live.v, i: live.i, p: live.p, soc: live.soc }, true)) {
+      queueDayDraw();
+    }
+  }
+});
 
-/* ---- battery SoC over time ----
-   Slightly shorter than the power chart: a 0-100% band needs less
-   vertical room than watts, and it keeps the new panel from pushing
-   "Generation & usage" too far down the page. */
-.chart-box-soc { height: 200px; }
-@media (max-width: 760px) { .chart-box-soc { height: 170px; } }
+setInterval(render, 3000);             // staleness watchdog
 
-/* ---- today's weather strip ----
-   Compact, same card language as everything else: paper surface,
-   1 px line, existing radius. Deliberately one row so it does not
-   push the energy flow down the page. */
-.wx-strip {
-  display: flex; align-items: center; gap: 14px;
-  background: var(--paper); border: 1px solid var(--line);
-  border-radius: var(--radius); box-shadow: var(--shadow);
-  padding: 12px 16px; margin-bottom: 14px;
-}
-.wx-ico { flex: none; width: 40px; height: 40px; display: block; color: var(--amber); }
-.wx-ico svg { width: 100%; height: 100%; display: block; }
-.wx-txt { min-width: 0; }
-.wx-cond {
-  font-family: "Chakra Petch", sans-serif;
-  font-size: 0.95rem; font-weight: 700; letter-spacing: 0.08em;
-  text-transform: uppercase; line-height: 1.1;
-}
-.wx-sub { color: var(--muted); font-size: 0.74rem; margin-top: 2px; }
-.wx-age {
-  margin-left: auto; flex: none;
-  color: var(--muted); font-size: 0.68rem; letter-spacing: 0.04em;
-  text-align: right;
-}
-.wx-age.stale { color: var(--gold-text); }
+/* Midnight in the browser: roll the day view over to the new date
+   so an overnight tab does not sit on yesterday forever. */
+setInterval(() => {
+  if (currentView !== "day") return;
+  const today = localDate();
+  if (ring.date && ring.date !== today && $("pick-day").value === ring.date) {
+    $("pick-day").value = today;
+    loadDay(today);
+  }
+}, 60 * 1000);
 
-/* icon tints per condition, using the existing accent palette */
-.wx-strip[data-wx="sunny"]     .wx-ico { color: var(--amber); }
-.wx-strip[data-wx="partly"]    .wx-ico { color: var(--amber); }
-.wx-strip[data-wx="cloudy"]    .wx-ico { color: var(--muted); }
-.wx-strip[data-wx="fog"]       .wx-ico { color: var(--muted); }
-.wx-strip[data-wx="rain"]      .wx-ico { color: var(--use); }
-.wx-strip[data-wx="heavyrain"] .wx-ico { color: var(--use); }
-.wx-strip[data-wx="storm"]     .wx-ico { color: var(--violet); }
+refreshChart();
 
-@media (max-width: 760px) {
-  .wx-strip { padding: 10px 13px; gap: 11px; }
-  .wx-ico { width: 34px; height: 34px; }
-  .wx-cond { font-size: 0.86rem; }
-}
+setInterval(() => {
+  invalidateDaily();
+  if (currentView !== "day") refreshChart();
+  if (!$("tab-monthly").classList.contains("hidden")) loadMonthlyTab();
+}, 30 * 60 * 1000);
 
-/* ============================================================
-   CEB RUNTIME SUMMARY + PREDICTION ACCURACY CARD  (patch 2)
-   Reuses the existing .panel / .panel-sub styling so the new card
-   is visually identical to the ones around it.
-   ============================================================ */
-.run-sum {
-  margin-top: 10px;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 14px;
-  align-items: center;
-}
-.run-sum .swatch {
-  display: inline-block;
-  width: 10px;
-  height: 10px;
-  border-radius: 2px;
-  margin-right: 6px;
-  vertical-align: -1px;
-  background: var(--amber);
-  opacity: 0.45;
-}
-.pred-acc { font-variant-numeric: tabular-nums; }
-.pred-acc b { color: var(--text-1); }
-
-@media (max-width: 600px) {
-  .run-sum { gap: 2px 10px; font-size: 12px; }
-}
+/* redraw theme-coloured charts when the palette flips */
+new MutationObserver(() => {
+  if (monthlyChart && !$("tab-monthly").classList.contains("hidden")) loadMonthlyTab();
+  if (socChart) drawSoc();          // SoC line/fill are theme colours
+}).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
