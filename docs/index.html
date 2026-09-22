@@ -7,9 +7,9 @@
 <title>Nipuna's Solar - Atabage, Udagama</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Outfit:wght@400;500;600&family=JetBrains+Mono:wght@400;600;800&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=20260909-5aa47a">
+<link rel="stylesheet" href="style.css?v=20260923-2e1189">
 </head>
-<body data-build="20260909-5aa47a">
+<body data-build="20260923-2e1189">
 
 <header class="top">
   <!-- Two lines only. The old third line (site, array size, pack
@@ -57,11 +57,12 @@
   Monitor offline · showing last saved data from <span id="last-seen-banner">--</span>
 </div>
 
-<!-- Alarm toast · appears only while the BMS raises a protection flag -->
-<div class="toast hidden" id="alarm-toast" role="alert">
+<!-- PART D · 23:00 low-pack alarm. Display only; it never touches
+     source control. Acknowledging clears it for the rest of tonight. -->
+<div class="toast hidden" id="night-banner" role="alert">
   <span class="toast-ic">⚠</span>
-  <span class="toast-txt">BMS protection alarm is active. Battery output may be limited — open the JK app for details.</span>
-  <button class="toast-x" id="toast-x" aria-label="Dismiss">✕</button>
+  <span class="toast-txt"><b>TURN OFF INVERTER</b> — <span id="night-text"></span></span>
+  <button class="toast-x" id="night-ack" aria-label="Acknowledge">Acknowledge</button>
 </div>
 
 <!-- ======================= TAB: LIVE ======================= -->
@@ -187,6 +188,7 @@
     <!-- Lights state. This page reads Firebase and has no route to
          the ESP, so the ON/OFF/AUTO control lives on the on-device
          dashboard; here the mode and its reason are reported. -->
+    <p class="card-sub" id="solar-day"></p>
     <p class="card-sub" id="lights-line">lights --</p>
     <p class="card-sub"><span id="util-min">0</span> min on CEB today · <span id="light-min">0</span> min of lights · solar <span id="pv-now">0</span> W · load <span id="load-now">0</span> W</p>
     <p class="card-sub tonight" id="tonight">tonight's floor --</p>
@@ -291,7 +293,7 @@
   </div>
   <p class="panel-sub" id="reset-sub">Waiting for the controller…</p>
   <table class="mtable" id="reset-table">
-    <thead><tr><th>Boot</th><th>Reason</th><th>Previous uptime</th></tr></thead>
+    <thead><tr><th>Boot</th><th>Reason</th><th>Previous uptime</th><th>Faulting task</th></tr></thead>
     <tbody id="reset-rows"></tbody>
   </table>
 </section>
@@ -359,7 +361,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-<script src="app.js?v=20260909-5aa47a"></script>
+<script src="app.js?v=20260923-2e1189"></script>
 
 <!-- ============================================================
      UI glue · lives here so app.js stays 100% untouched
@@ -467,24 +469,19 @@
   document.getElementById("theme-btn").addEventListener("click", () =>
     setTheme(root.dataset.theme === "dark" ? "light" : "dark"));
 
-  /* ---------- alarm toast ----------
-     The alarm pill stays in the DOM so app.js keeps working,
-     but CSS hides it. When app.js reveals it, this observer
-     pops the toast instead — no raw alarm codes shown. */
-  const pill = document.getElementById("pill-alarm");
-  const toast = document.getElementById("alarm-toast");
-  let dismissed = false;
-  function syncToast() {
-    const active = !pill.classList.contains("hidden");
-    if (!active) dismissed = false;               /* re-arm when the alarm clears */
-    toast.classList.toggle("hidden", !active || dismissed);
-  }
-  new MutationObserver(syncToast)
-    .observe(pill, { attributes: true, attributeFilter: ["class"] });
-  document.getElementById("toast-x").addEventListener("click", () => {
-    dismissed = true; toast.classList.add("hidden");
+  /* PART F. The routine-protection toast is gone. app.js masks the
+     one permanently-set bit (19) and still raises the pill for every
+     other bit, so a genuine fault is as visible as it ever was --
+     it just no longer greets you on a healthy pack. */
+
+  /* PART D. Acknowledge the 23:00 alarm. The cloud dashboard cannot
+     reach the ESP, so this hides the banner locally for this
+     session; the on-device page carries the real acknowledge that
+     tells the firmware. */
+  const nightAck = document.getElementById("night-ack");
+  if (nightAck) nightAck.addEventListener("click", () => {
+    document.getElementById("night-banner").classList.add("hidden");
   });
-  syncToast();
 })();
 </script>
 </body>

@@ -143,19 +143,30 @@ function renderResets() {
   }
   const faults = rows.filter((r) => RESET_FAULT.includes(r[0])).length;
   if (sub) {
-    sub.textContent = `Last ${rows.length} boot${rows.length === 1 ? "" : "s"}` +
-      ` · ${faults} fault${faults === 1 ? "" : "s"}` +
-      (live.relayOps != null ? ` · ${live.relayOps} lifetime relay transfers` : "");
+    const bits = [`Last ${rows.length} boot${rows.length === 1 ? "" : "s"}`,
+                  `${faults} fault${faults === 1 ? "" : "s"}`];
+    if (live.relayOps != null) bits.push(`${live.relayOps} lifetime relay transfers`);
+    if (live.heapMin != null) bits.push(`min free heap ${Math.round(live.heapMin / 1024)} kB`);
+    if (live.stkNet != null) {
+      bits.push(`stack headroom ble ${live.stkBle} / net ${live.stkNet} / loop ${live.stkLoop} B`);
+    }
+    sub.textContent = bits.join(" · ");
   }
   body.innerHTML = rows.map((r) => {
-    const [reason, stamp, upMin] = r;
+    // Older firmware sent 3 columns; patch 5 adds the faulting task
+    // and PC, so read positionally and tolerate the short form.
+    const [reason, stamp, upMin, task, pc] = r;
     const fault = RESET_FAULT.includes(reason);
     const when = stamp && stamp > 19700101
       ? `${String(stamp).slice(0, 4)}-${String(stamp).slice(4, 6)}-${String(stamp).slice(6, 8)}`
       : "clock unset";
     const prev = upMin ? fmtUp(upMin * 60) : "--";
+    const where = task
+      ? `${task}${pc ? " @ 0x" + (pc >>> 0).toString(16).toUpperCase() : ""}`
+      : "--";
     return `<tr class="${fault ? "fault" : ""}"><td>${when}</td>` +
-           `<td>${reason} · ${RESET_BLURB[reason] || ""}</td><td>${prev}</td></tr>`;
+           `<td>${reason} · ${RESET_BLURB[reason] || ""}</td><td>${prev}</td>` +
+           `<td class="mono">${where}</td></tr>`;
   }).join("");
 }
 
@@ -198,9 +209,20 @@ function render() {
   setPill("pill-load", loadActive ? "on" : "", loadActive ? "Inverter feeding load" : "Load idle");
   setPill("pill-bal", live.bal ? "gold" : "", live.bal ? "Balancing" : "Balancer idle");
 
-  const alarm = (live.err ?? 0) !== 0;
+  /* PART F. Bit 19 of the JK alarm word is set permanently on this
+     pack while everything measurable about it is healthy -- SoC 65%,
+     13.07 V, both MOSFETs on, SoH 100% -- so the banner fired on
+     every single page load and trained people to dismiss it.
+
+     The bit is masked; the other 31 still raise the banner. That
+     matters: removing the banner outright would have hidden a real
+     overvoltage, overtemperature or cell-imbalance fault too. */
+  const BMS_ERR_IGNORE_MASK = 0x00080000;        // matches config.h 8s
+  const errRaw = live.err ?? 0;
+  const errReal = errRaw & ~BMS_ERR_IGNORE_MASK;
+  const alarm = errReal !== 0;
   $("pill-alarm").classList.toggle("hidden", !alarm);
-  if (alarm) setPill("pill-alarm", "warn", "BMS alarm 0x" + live.err.toString(16));
+  if (alarm) setPill("pill-alarm", "warn", "BMS alarm 0x" + errReal.toString(16));
 
   const w = Math.abs(live.p ?? 0);
   $("pv-watts").textContent = (charging ? w.toFixed(0) : "0") + " W";
@@ -280,6 +302,38 @@ function render() {
     }
   }
   if ($("light-min")) $("light-min").textContent = live.lightMin ?? 0;
+
+  /* PART C. The solar-day classification and, when it is holding a
+     release back, the deadline it is holding to. */
+  const sd = $("solar-day");
+  if (sd) {
+    const cls = live.solarDay;
+    const ratio = live.solarRatio;
+    if (!fresh || !cls || cls === "unknown") {
+      sd.textContent = "";
+    } else if (live.cebHold) {
+      sd.textContent = `poor solar day · ${ratio}% of expected · holding CEB to ` +
+                       `${live.cebHoldTill} so the array can charge the pack`;
+    } else if (cls === "poor") {
+      sd.textContent = `poor solar day · ${ratio}% of expected`;
+    } else {
+      sd.textContent = `solar normal · ${ratio}% of expected`;
+    }
+  }
+
+  /* PART D. The 23:00 low-pack alarm. Display only -- the source
+     state machine has no idea this exists. */
+  const nb = $("night-banner");
+  if (nb) {
+    const on = !!(fresh && live.nightAlarm);
+    nb.classList.toggle("hidden", !on);
+    const nt = $("night-text");
+    if (on && nt) {
+      nt.textContent = `Pack at ${live.soc}% at ${live.nightWarn != null ?
+        "23:00, below " + live.nightWarn + "%" : "23:00"} — it will not last the night. ` +
+        `Turn the inverter off.`;
+    }
+  }
   $("util-min").textContent  = live.utilMin ?? 0;
   $("pv-now").textContent    = (live.pvW ?? 0).toFixed(0);
   $("load-now").textContent  = (live.loadW ?? 0).toFixed(0);
@@ -1056,12 +1110,16 @@ function drawSoc() {
    With fewer than PROFILE_MIN_DAYS days the card says so rather
    than drawing a confident band through two data points.
    ============================================================ */
-const PROFILE_DAYS = 5;
-const PROFILE_MIN_DAYS = 3;
-const PROFILE_KEY = "sp.pvProfile.v1";
+const PROFILE_DAYS = 21;        // days pulled for the model
+const PROFILE_MIN_DAYS = 7;     // fewer valid days -> LEARNING, no curve
+const PROFILE_SLOT_MIN = 30;    // half-hour resolution
+const PROFILE_SLOTS = (24 * 60) / PROFILE_SLOT_MIN;
+const PROFILE_KEY = "sp.pvProfile.v2";   // v2: slots changed, cache invalidated
+const Y_MIN_TOP = 300;          // a quiet day must not look dramatic
 
 let predChart = null;
-let pvProfile = null;          // { date, days, hours:[{p25,p50,p75}|null x24] }
+let predDay = null;             // the date the current instance was built for
+let pvProfile = null;           // { date, days, slots:[{p25,p50,p75}|null] }
 let profileBusy = false;
 
 function loadProfileCache() {
@@ -1069,8 +1127,9 @@ function loadProfileCache() {
     const raw = localStorage.getItem(PROFILE_KEY);
     if (!raw) return null;
     const o = JSON.parse(raw);
-    return (o && o.date === localDate() && Array.isArray(o.hours)) ? o : null;
-  } catch (e) { return null; }   // private mode, cleared storage, quota
+    return (o && o.date === localDate() && Array.isArray(o.slots)
+            && o.slots.length === PROFILE_SLOTS) ? o : null;
+  } catch (e) { return null; }
 }
 
 function saveProfileCache(o) {
@@ -1084,21 +1143,37 @@ function quantile(sorted, q) {
   return lo === hi ? sorted[lo] : sorted[lo] + (sorted[hi] - sorted[lo]) * (i - lo);
 }
 
-/* Charging power only. p > 0 is energy going INTO the pack, which
-   is the same definition the generation curve uses -- this card
-   must not invent a second one. */
-function hourlyFromRows(rows, dateStr) {
-  const buckets = Array.from({ length: 24 }, () => []);
+/* A day is worth learning from only if it actually logged. These
+   rules exclude the obvious rubbish rather than trying to be clever:
+   a day the logger missed, a day with no generation at all, and a
+   day whose peak is impossible for a 580 W array. */
+const MIN_SAMPLES_PER_DAY = 600;    // ~10 h of one-minute logging
+const MAX_PLAUSIBLE_W = 2000;
+
+function dayIsValid(rows) {
+  if (!rows || rows.length < MIN_SAMPLES_PER_DAY) return false;
+  let peak = 0, anyCharge = false;
+  for (const r of rows) {
+    const p = r.p > 0 ? r.p : 0;
+    if (p > peak) peak = p;
+    if (p > 5) anyCharge = true;
+  }
+  return anyCharge && peak <= MAX_PLAUSIBLE_W;
+}
+
+/* One day -> a per-slot mean of charging power. Charging only, the
+   same definition the generation curve uses; this card must not
+   invent a second one. */
+function slotsFromRows(rows, dateStr) {
+  const acc = Array.from({ length: PROFILE_SLOTS }, () => ({ sum: 0, n: 0 }));
   for (const r of rows) {
     const m = minutesOfDay(r.t, dateStr);
     if (!(m >= 0 && m < 1440)) continue;
-    buckets[Math.floor(m / 60)].push(r.p > 0 ? r.p : 0);
+    const k = Math.floor(m / PROFILE_SLOT_MIN);
+    acc[k].sum += r.p > 0 ? r.p : 0;
+    acc[k].n++;
   }
-  return buckets.map((b) => {
-    if (!b.length) return null;
-    b.sort((x, y) => x - y);
-    return { p25: quantile(b, 0.25), p50: quantile(b, 0.5), p75: quantile(b, 0.75) };
-  });
+  return acc.map((a) => (a.n ? a.sum / a.n : null));
 }
 
 async function buildProfile() {
@@ -1107,48 +1182,75 @@ async function buildProfile() {
   if (cached) { pvProfile = cached; drawPred(); return; }
 
   profileBusy = true;
-  const perDay = [];          // [dayIndex][hour] = mean charging W
-  let got = 0;
+  const perDay = [];
+  let looked = 0, rejected = 0;
   for (let back = 1; back <= PROFILE_DAYS; back++) {
     const d = new Date();
     d.setDate(d.getDate() - back);
-    const key = localDate(d);      // the existing helper, not a second one
+    const key = localDate(d);
     let snap;
     try {
       snap = await db.ref("history/" + key).limitToLast(RING_MAX).once("value");
     } catch (e) { continue; }
+    looked++;
     const rows = [];
-    // DataSnapshot.forEach CANCELS on a truthy return, so the body
-    // must not return the push() result. Braces, deliberately.
+    // DataSnapshot.forEach CANCELS on a truthy return -- braces matter.
     snap.forEach((c) => { const v = c.val(); if (v && v.t) rows.push(v); });
-    if (rows.length < 60) continue;             // barely any data: skip
+    if (!dayIsValid(rows)) { rejected++; continue; }
     rows.sort((a, b) => a.t - b.t);
-    perDay.push(hourlyFromRows(rows, key));
-    got++;
+    perDay.push(slotsFromRows(rows, key));
   }
 
-  const hours = [];
-  for (let h = 0; h < 24; h++) {
-    const vals = perDay.map((d) => (d[h] ? d[h].p50 : null)).filter((v) => v != null);
-    if (!vals.length) { hours.push(null); continue; }
+  /* Per SLOT, across days: the median is the expected curve and the
+     25th/75th are the spread. Taken across DAYS, so one washout
+     cannot drag the shape -- which is exactly what the old
+     mean-of-5-days version let happen. */
+  const slots = [];
+  for (let k = 0; k < PROFILE_SLOTS; k++) {
+    const vals = perDay.map((d) => d[k]).filter((v) => v != null);
+    if (vals.length < 3) { slots.push(null); continue; }
     vals.sort((a, b) => a - b);
-    hours.push({
-      p25: quantile(vals, 0.25),
-      p50: quantile(vals, 0.5),
-      p75: quantile(vals, 0.75),
-    });
+    slots.push({ p25: quantile(vals, 0.25), p50: quantile(vals, 0.5),
+                 p75: quantile(vals, 0.75) });
   }
 
-  pvProfile = { date: localDate(), days: got, hours };
+  pvProfile = { date: localDate(), days: perDay.length, looked, rejected, slots };
   saveProfileCache(pvProfile);
   profileBusy = false;
   drawPred();
+}
+
+/* PART E(e). A fixed top rounded up to the next 100 W above the
+   day's own peak, never below Y_MIN_TOP, so a 60 W day and a 500 W
+   day are read on comparable axes instead of each being stretched
+   to fill the box. */
+function predYMax(actual, slots) {
+  let peak = 0;
+  for (const p of actual) if (p.y > peak) peak = p.y;
+  if (slots) for (const sl of slots) if (sl && sl.p75 > peak) peak = sl.p75;
+  return Math.max(Y_MIN_TOP, Math.ceil((peak * 1.1) / 100) * 100);
 }
 
 function drawPred() {
   const cv = $("chart-pred");
   const cap = $("pred-caption");
   if (!cv) return;
+
+  /* PART E(c). THE GHOST TEXT.
+
+     Chart.js paints tooltips onto the canvas. Re-pointing an
+     existing instance at a new day's datasets (what this used to do)
+     leaves the previous frame's tooltip composited underneath --
+     that is the "07:37 / Expected PV / Generation (charging) 2 W"
+     ghosted over the plot. Chart.getChart() also catches the other
+     half of it: any instance still bound to this canvas, including
+     one created before a day change.
+
+     So: on a day change, DESTROY and rebuild. */
+  const bound = Chart.getChart(cv);
+  if (bound && bound !== predChart) bound.destroy();
+  if (predChart && predDay !== ring.date) { predChart.destroy(); predChart = null; }
+  predDay = ring.date;
 
   const dim = themeColor("--muted");
   const grid = themeColor("--grid");
@@ -1161,37 +1263,51 @@ function drawPred() {
 
   const ds = [];
   const enough = pvProfile && pvProfile.days >= PROFILE_MIN_DAYS;
+  let bandHidden = false;
 
   if (enough) {
-    // The p25-p75 spread, drawn as two lines filling to each other.
-    const at = (h, k) => (pvProfile.hours[h] ? { x: h * 60 + 30, y: pvProfile.hours[h][k] } : null);
-    const band25 = [], band75 = [], mid = [];
-    for (let h = 0; h < 24; h++) {
-      const a = at(h, "p25"), b = at(h, "p75"), m = at(h, "p50");
-      if (a) band25.push(a);
-      if (b) band75.push(b);
-      if (m) mid.push(m);
+    const at = (k, key) => (pvProfile.slots[k]
+      ? { x: k * PROFILE_SLOT_MIN + PROFILE_SLOT_MIN / 2, y: pvProfile.slots[k][key] }
+      : null);
+
+    /* PART E(b). If the p25-p75 spread is wider than the expected
+       value itself, the model is not saying anything useful about
+       this site yet -- so it says nothing, rather than drawing a
+       confident-looking grey band around noise. */
+    let wide = 0, counted = 0;
+    for (const sl of pvProfile.slots) {
+      if (!sl || sl.p50 < 20) continue;          // ignore the flat night
+      counted++;
+      if ((sl.p75 - sl.p25) > sl.p50) wide++;
     }
-    ds.push({
-      label: "Typical spread", data: band75, borderColor: "transparent",
-      backgroundColor: dim + "22", borderWidth: 0, pointRadius: 0,
-      fill: "+1", tension: 0.35,
-    });
-    ds.push({
-      label: "_p25", data: band25, borderColor: "transparent",
-      borderWidth: 0, pointRadius: 0, fill: false, tension: 0.35,
-    });
-    ds.push({
-      label: "Expected PV", data: mid, borderColor: dim, borderDash: [6, 4],
-      borderWidth: 2, pointRadius: 0, fill: false, tension: 0.35,
-    });
+    bandHidden = counted > 0 && wide > counted / 2;
+
+    const mid = [], b25 = [], b75 = [];
+    for (let k = 0; k < PROFILE_SLOTS; k++) {
+      const m = at(k, "p50"), lo = at(k, "p25"), hi = at(k, "p75");
+      if (m) mid.push(m);
+      if (lo) b25.push(lo);
+      if (hi) b75.push(hi);
+    }
+
+    if (!bandHidden) {
+      ds.push({ label: "Typical spread", data: b75, borderColor: "transparent",
+                backgroundColor: dim + "22", borderWidth: 0, pointRadius: 0,
+                fill: "+1", tension: 0.35, ownColor: true });
+      ds.push({ label: "_p25", data: b25, borderColor: "transparent",
+                borderWidth: 0, pointRadius: 0, fill: false, tension: 0.35,
+                ownColor: true });
+    }
+    ds.push({ label: "Expected PV", data: mid, borderColor: dim,
+              borderDash: [6, 4], borderWidth: 2, pointRadius: 0, fill: false,
+              tension: 0.35, ownColor: true });
   }
 
-  ds.push({
-    label: "Actual PV today", data: actual, borderColor: green,
-    backgroundColor: green + "22", borderWidth: 2, pointRadius: 0,
-    fill: "origin", tension: 0.3, spanGaps: false,
-  });
+  ds.push({ label: "Actual PV today", data: actual, borderColor: green,
+            backgroundColor: green + "22", borderWidth: 2, pointRadius: 0,
+            fill: "origin", tension: 0.3, spanGaps: false, ownColor: true });
+
+  const yMax = predYMax(actual, enough ? pvProfile.slots : null);
 
   if (!predChart) {
     predChart = new Chart(cv, {
@@ -1202,11 +1318,9 @@ function drawPred() {
         animation: { duration: 0 },
         interaction: { mode: "index", intersect: false },
         plugins: {
-          legend: {
-            display: true,
-            labels: { filter: (i) => i.text !== "_p25", boxWidth: 10, boxHeight: 3,
-                      font: legendFont() },
-          },
+          legend: { display: true,
+                    labels: { filter: (i) => i.text !== "_p25", boxWidth: 10,
+                              boxHeight: 3, font: legendFont() } },
           tooltip: {
             filter: (i) => i.dataset.label !== "_p25",
             callbacks: {
@@ -1215,49 +1329,58 @@ function drawPred() {
             },
           },
         },
-        scales: {
-          x: timeAxis(dim, grid),
-          y: valueAxis("W", dim, grid),
-        },
+        scales: { x: timeAxis(dim, grid), y: valueAxis("W", dim, grid) },
       },
     });
   } else {
     predChart.data.datasets = ds;
   }
-  // Same axis object as the other two charts, rebuilt so a resize
-  // across the breakpoint takes effect here too.
   predChart.options.scales.x = timeAxis(dim, grid);
-  predChart.options.scales.y = valueAxis("W", dim, grid);
+  predChart.options.scales.y = valueAxis("W", dim, grid, { min: 0, max: yMax });
   applyAxisPadding(predChart);
+  // Belt and braces against a stale tooltip surviving the update.
+  if (predChart.tooltip && predChart.tooltip.setActiveElements) {
+    predChart.tooltip.setActiveElements([], { x: 0, y: 0 });
+  }
   predChart.update("none");
 
   if (!cap) return;
   if (!pvProfile) { cap.textContent = "Building the historical profile…"; return; }
+
+  /* PART E(a). Under PROFILE_MIN_DAYS valid days there is no curve
+     and no band -- it says LEARNING and how far along it is. */
   if (!enough) {
-    cap.textContent =
-      `Only ${pvProfile.days} day${pvProfile.days === 1 ? "" : "s"} of history so far` +
-      ` · the expected curve needs ${PROFILE_MIN_DAYS}`;
+    cap.className = "panel-sub";
+    cap.textContent = `LEARNING · ${pvProfile.days} valid day` +
+      `${pvProfile.days === 1 ? "" : "s"} of ${PROFILE_MIN_DAYS} needed` +
+      (pvProfile.rejected ? ` · ${pvProfile.rejected} day${pvProfile.rejected === 1 ? "" : "s"} rejected as incomplete` : "");
     return;
   }
 
-  // The accuracy line. Expected and baseline come from the ESP's own
-  // model (it owns the learned bias table); actual is today's
-  // harvest, the same number the cards above show.
   const bits = [];
-  const cond = (live && live.fcConf > 0 && live.fcText && live.fcText !== "UNKNOWN")
-             ? live.fcText : null;
-  bits.push(`Forecast today: <b>${cond || "none cached"}</b>`);
+
+  /* PART E(d). Never a bare "none cached". Either the real label, or
+     a sentence that says what is actually being used instead. */
+  const fcOk = (live && live.fcConf > 0 && live.fcText && live.fcText !== "UNKNOWN");
+  bits.push(fcOk ? `Forecast today: <b>${live.fcText}</b>`
+                 : `<b>Forecast unavailable</b> · using PV history`);
 
   const expWh = live && live.predTodayWh;
   const actWh = live && live.harvestWh;
   if (expWh != null && expWh > 0) bits.push(`Expected <b>${(expWh / 1000).toFixed(1)} kWh</b>`);
   if (actWh != null) bits.push(`Actual <b>${(actWh / 1000).toFixed(1)} kWh</b>`);
   if (expWh != null && expWh > 0 && actWh != null) {
-    // Symmetric: 2x expected and half expected are both "50% off".
+    /* PART E(f). Symmetric ratio accuracy:
+         acc = 100 * min(actual, expected) / max(actual, expected)
+       so 2x and 0.5x both score 50%, and the figure cannot exceed
+       100% by over-delivering. Stated in the report. */
     const r = actWh / expWh;
     const acc = Math.max(0, Math.round(100 * (r > 1 ? 1 / r : r)));
     bits.push(`Accuracy <b>${acc}%</b>`);
   }
+  bits.push(`model: ${pvProfile.days} day median`);
+  if (bandHidden) bits.push(`spread too wide to plot`);
+
   cap.className = "panel-sub run-sum pred-acc";
   cap.innerHTML = bits.map((b) => `<span>${b}</span>`).join("");
 }

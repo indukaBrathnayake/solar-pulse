@@ -115,6 +115,11 @@
 #include <freertos/semphr.h>
 #include <esp_task_wdt.h>
 #include <esp_system.h>        // esp_reset_reason()
+// Core dump to flash is ENABLED in arduino-esp32 2.0.17 and the
+// huge_app partition table already carries a 64 kB coredump
+// partition, so a panic is being written to flash whether or not
+// anyone reads it. Reading it is what patch 5 adds.
+#include <esp_core_dump.h>
 #if __has_include("esp_coexist.h")
   #include "esp_coexist.h"      // WiFi/BLE radio arbitration, see setup()
 #endif
@@ -251,6 +256,8 @@ static int      socTrend     = 0;         // -1 falling, 0 flat, +1 rising
 
 static float    pvFilt   = 0;             // low-pass array watts
 static float    loadFilt = 0;             // low-pass house draw
+static float    packVFilt = 0;            // low-pass pack volts (8p)
+static bool     packVOk  = false;         // has a plausible sample landed
 static bool     filtInit = false;
 
 // ---- CEB source state machine ----
@@ -261,6 +268,12 @@ static uint16_t cebRelMin  = 0;           // today's release deadline, minutes
 // Persistence gates. Every engage/release condition passes through
 // one of these, so no transition can come from a single sample.
 static Persist  pEngage, pRelease, pCritical, pLostBms, pUrgent;
+// Voltage floor (8p) and the solar-day classifier (8q). Both use the
+// same debounce discipline as everything else in section 12.
+static Persist  pVoltLow, pVoltOk, pPoorDay, pGoodDay;
+static bool     cebVoltArmed = false;     // Schmitt state of the V floor
+static bool     poorSolarDay = false;     // latched day classification
+static bool     cebSolarHold = false;     // release delayed by 8q
 static bool     cebLowArmed = false;      // Schmitt state of the CEB floor
 static SrcPhase srcPhase   = SRCP_WAIT;   // startup stabilisation
 static bool     srcEverSet = false;       // has a source ever been commanded
@@ -275,6 +288,17 @@ static SrcReason srcLastReason = SR_NONE;
 static uint32_t relayOps = 0;             // lifetime transfer count
 static bool     sysFault = false;         // panic / brownout / watchdog boot
 static ResetRec resetLog[RESET_LOG_N];
+
+// ---- last panic, decoded from the core dump at boot ----
+static char     panicTask[16] = "";
+static uint32_t panicPc = 0;
+static uint32_t panicBt[8] = {0};
+static uint8_t  panicBtN = 0;
+
+// Task handles, declared here rather than beside diagTick() because
+// buildLiveJson() publishes their stack watermarks and is defined
+// much earlier in the file.
+static TaskHandle_t hBle = nullptr, hNet = nullptr;
 
 // Heap / stack trend. Reporting only; nothing here can move a relay.
 static uint32_t heapMinEver = 0xFFFFFFFF;
@@ -299,6 +323,12 @@ static bool     lightsLow   = false;      // latched low-battery lockout
 static uint32_t lightSecToday = 0;        // lights runtime today, seconds
 static bool     loadCutoff  = false;      // true = protection has opened the load
 static bool     emergAlarm  = false;      // latched 10% + discharging
+// Night alarm (config.h 8r). DISPLAY AND BUZZER ONLY -- no part of
+// section 12 reads any of these.
+static bool     nightAlarm  = false;      // latched 23:00 low-pack warning
+static bool     nightAcked  = false;      // cleared from the dashboard
+static uint32_t nightNextMs = 0;          // next chirp
+static int32_t  nightArmDay = 0;          // date the alarm last armed
 static BuzzTone buzzMode    = BUZZ_SILENT;
 static uint32_t utilitySecToday = 0;
 
@@ -784,6 +814,19 @@ static void filterUpdate(float dt) {
   loadFilt += a * (loadW - loadFilt);
 }
 
+// Pack voltage, filtered exactly as the power signals are (config.h
+// 8p). A sample outside the plausible window for a 4S pack is
+// dropped rather than averaged in, for the same reason socUpdate()
+// rejects an impossible SoC byte: one bad frame must not be able to
+// reach a relay.
+static void packVUpdate(float v, float dt) {
+  if (v < PACK_V_VALID_MIN || v > PACK_V_VALID_MAX) return;
+  if (!packVOk) { packVFilt = v; packVOk = true; return; }
+  if (dt <= 0 || dt > 5.0f) return;
+  float a = dt / (PACK_V_FILTER_TC_S + dt);
+  packVFilt += a * (v - packVFilt);
+}
+
 // Validate one raw SoC byte and maintain the short-term trend.
 //
 // THE ROOT CAUSE OF THE REPORTED OSCILLATION. bmsShared.soc is frame
@@ -868,6 +911,7 @@ static void integrateEnergy(const BmsData& b) {
     pvW = 0;
     loadW = 0;
     filtInit = false;                // do not drag the filters across a gap
+    packVOk  = false;                // and never judge voltage on stale data
     return;
   }
 
@@ -880,6 +924,7 @@ static void integrateEnergy(const BmsData& b) {
   if (dt <= 0 || dt > 5.0f) return;  // clamp: a gap is not energy
 
   filterUpdate(dt);                  // v7: filtered PV/load for the controller
+  packVUpdate(b.packV, dt);          // 8p: filtered pack voltage
 
   float wh = b.packW * dt / 3600.0f;
   if (b.packI >  CURRENT_DEADBAND) { todayChgWh += wh;  lifeChgWh += wh; }
@@ -938,6 +983,47 @@ static void sourceSave(Source s, SrcReason why) {
   srcLastReason = why;
 }
 
+// Pull the faulting task, PC and backtrace out of the core dump
+// left by the last panic, then ERASE it so the next panic is
+// captured fresh rather than the first one being kept forever.
+//
+// This is the whole of Part A.1: no breadcrumbs, no guessing --
+// the panic handler already recorded the truth, it was simply
+// never read back.
+static void panicCapture() {
+  if (esp_core_dump_image_check() != ESP_OK) return;
+
+  esp_core_dump_summary_t* sum =
+      (esp_core_dump_summary_t*)malloc(sizeof(esp_core_dump_summary_t));
+  if (!sum) return;                       // no heap: leave the dump for next boot
+
+  if (esp_core_dump_get_summary(sum) == ESP_OK) {
+    strncpy(panicTask, sum->exc_task, sizeof(panicTask) - 1);
+    panicTask[sizeof(panicTask) - 1] = 0;
+    panicPc = sum->exc_pc;
+    panicBtN = (uint8_t)sum->exc_bt_info.depth;
+    if (panicBtN > 8) panicBtN = 8;
+    for (uint8_t i = 0; i < panicBtN; i++) panicBt[i] = sum->exc_bt_info.bt[i];
+
+    prefs.putBytes("pnct", panicTask, sizeof(panicTask));
+    prefs.putUInt("pncpc", panicPc);
+    prefs.putBytes("pncbt", panicBt, sizeof(panicBt));
+    prefs.putUChar("pncbn", panicBtN);
+  }
+  free(sum);
+  esp_core_dump_image_erase();
+}
+
+static void panicLoad() {
+  size_t n = prefs.getBytesLength("pnct");
+  if (n == sizeof(panicTask)) prefs.getBytes("pnct", panicTask, sizeof(panicTask));
+  panicPc  = prefs.getUInt("pncpc", 0);
+  panicBtN = prefs.getUChar("pncbn", 0);
+  if (prefs.getBytesLength("pncbt") == sizeof(panicBt))
+    prefs.getBytes("pncbt", panicBt, sizeof(panicBt));
+  if (panicBtN > 8) panicBtN = 8;
+}
+
 static void resetLogLoad() {
   size_t n = prefs.getBytesLength(RESET_LOG_NVS);
   if (n == sizeof(resetLog)) prefs.getBytes(RESET_LOG_NVS, resetLog, sizeof(resetLog));
@@ -951,6 +1037,11 @@ static void resetLogPush(uint8_t reason, int32_t stamp, uint16_t prevUpMin) {
   resetLog[0].upMin  = prevUpMin;
   resetLog[0].reason = reason;
   resetLog[0].pad    = 0;
+  // Attach the faulting task to THIS boot's record, so the table
+  // says not just "PANIC" but "PANIC in netTask".
+  memset(resetLog[0].task, 0, sizeof(resetLog[0].task));
+  strncpy(resetLog[0].task, panicTask, sizeof(resetLog[0].task) - 1);
+  resetLog[0].pc = panicPc;
   prefs.putBytes(RESET_LOG_NVS, resetLog, sizeof(resetLog));
 }
 
@@ -991,9 +1082,12 @@ static int buildResetJson(char* out, size_t cap) {
   bool first = true;
   for (int i = 0; i < RESET_LOG_N && n < (int)cap; i++) {
     if (!resetLog[i].reason && !resetLog[i].stamp) continue;
-    n += snprintf(out + n, cap - n, "%s[\"%s\",%ld,%u]",
+    char tk[13];
+    memcpy(tk, resetLog[i].task, 12); tk[12] = 0;
+    n += snprintf(out + n, cap - n, "%s[\"%s\",%ld,%u,\"%s\",%lu]",
                   first ? "" : ",", resetReasonName(resetLog[i].reason),
-                  (long)resetLog[i].stamp, (unsigned)resetLog[i].upMin);
+                  (long)resetLog[i].stamp, (unsigned)resetLog[i].upMin,
+                  tk, (unsigned long)resetLog[i].pc);
     first = false;
   }
   if (n < (int)cap) n += snprintf(out + n, cap - n, "]");
@@ -1001,7 +1095,7 @@ static int buildResetJson(char* out, size_t cap) {
 }
 
 static int buildLiveJson(char* out, size_t cap) {
-  char resets[340];
+  char resets[560];
   buildResetJson(resets, sizeof(resets));
   BmsData b = bmsGet();
   time_t t = nowEpoch();
@@ -1026,6 +1120,11 @@ static int buildLiveJson(char* out, size_t cap) {
     "\"fcCloud\":%d,\"fcRain\":%.1f,"
     "\"baseWh\":%.0f,\"predTodayWh\":%.0f,"
     "\"boot\":\"%s\",\"sysFault\":%s,\"relayOps\":%lu,"
+    "\"panicTask\":\"%s\",\"panicPc\":%lu,"
+    "\"heapBlock\":%lu,\"stkBle\":%u,\"stkNet\":%u,\"stkLoop\":%u,"
+    "\"packV\":%.2f,\"packVOk\":%s,\"vCebOn\":%.2f,\"vCebOff\":%.2f,"
+    "\"solarDay\":\"%s\",\"solarRatio\":%d,\"cebHold\":%s,\"cebHoldTill\":\"%02d:%02d\","
+    "\"nightAlarm\":%s,\"nightWarn\":%d,"
     "\"srcRestored\":%s,\"xferBurst\":%s,\"heapMin\":%lu,\"resets\":%s,"
     "\"lightMode\":\"%s\",\"lightMin\":%lu,\"lightsLow\":%s,"
     "\"lightOn\":\"%02d:%02d\",\"lightOff\":\"%02d:%02d\",\"lightSunset\":%s,"
@@ -1067,6 +1166,15 @@ static int buildLiveJson(char* out, size_t cap) {
     predToday().baseWh, predToday().predWh,
     resetReasonName((uint8_t)bootReason), sysFault ? "true" : "false",
     (unsigned long)relayOps,
+    panicTask, (unsigned long)panicPc,
+    (unsigned long)ESP.getMaxAllocHeap(),
+    hBle ? uxTaskGetStackHighWaterMark(hBle) : 0,
+    hNet ? uxTaskGetStackHighWaterMark(hNet) : 0,
+    (unsigned)uxTaskGetStackHighWaterMark(nullptr),
+    packVFilt, packVOk ? "true" : "false", PACK_V_CEB_ON, PACK_V_CEB_OFF,
+    solarDayName(), solarDayRatio(), cebSolarHold ? "true" : "false",
+    cebHoldDeadlineMin() / 60, cebHoldDeadlineMin() % 60,
+    nightAlarm ? "true" : "false", NIGHT_SOC_WARN,
     srcRestored ? "true" : "false", xferBurst ? "true" : "false",
     (unsigned long)ESP.getMinFreeHeap(), resets,
     lightModeName(), (unsigned long)(lightSecToday / 60),
@@ -1164,7 +1272,7 @@ static bool fbRequest(const char* method, const String& path, const String& body
 }
 
 static void pushLive() {
-  static char buf[3200];
+  static char buf[3800];
   buildLiveJson(buf, sizeof(buf));
   fbRequest("PUT", "/live", buf);
 }
@@ -2082,9 +2190,29 @@ const char* wxDecisionSrc() {
 // three flat arrays of known shape, and 40 kB of parser for that
 // would be heap this device does not have to spare.
 
+// Open-Meteo returns a "daily_units" object BEFORE "daily", and it
+// contains every one of the same key names:
+//
+//   "daily_units":{"time":"iso8601","weather_code":"wmo code",...},
+//   "daily":{"time":[...],"weather_code":[...],...}
+//
+// A bare indexOf("\"weather_code\"") therefore lands in daily_units,
+// and the next '[' after that is the TIME array in daily. Every
+// numeric field was being read out of the date strings: "2026-09-23"
+// -> toFloat() -> 2026 -> wxCondFromCode(2026) -> WC_UNKNOWN.
+//
+// That is why the forecast has been permanently "unknown" and why
+// the dashboard said "none cached" while the fetch reported success.
+// Searching from the start of the "daily" OBJECT fixes all of it:
+// the condition, the cloud cover, the rainfall and the sunset.
+static int dailyBase(const String& body) {
+  int d = body.indexOf("\"daily\":");
+  return d < 0 ? 0 : d;
+}
+
 // Numeric element i of the array that follows "key".
 static bool jsonArrNum(const String& body, const char* key, int i, float* out) {
-  int k = body.indexOf(key);
+  int k = body.indexOf(key, dailyBase(body));
   if (k < 0) return false;
   int a = body.indexOf('[', k);
   int b = body.indexOf(']', a);
@@ -2106,7 +2234,7 @@ static bool jsonArrNum(const String& body, const char* key, int i, float* out) {
 // midnight, 0 when absent. Open-Meteo returns sunset as a local
 // ISO timestamp, so only the clock part is needed.
 static uint16_t jsonArrHHMM(const String& body, const char* key, int i) {
-  int k = body.indexOf(key);
+  int k = body.indexOf(key, dailyBase(body));
   if (k < 0) return 0;
   int a = body.indexOf('[', k);
   int b = body.indexOf(']', a);
@@ -2128,7 +2256,7 @@ static uint16_t jsonArrHHMM(const String& body, const char* key, int i) {
 
 // "YYYY-MM-DD" element i of the "time" array -> YYYYMMDD.
 static int32_t jsonArrDate(const String& body, int i) {
-  int k = body.indexOf("\"time\"");
+  int k = body.indexOf("\"time\"", dailyBase(body));
   if (k < 0) return 0;
   int a = body.indexOf('[', k);
   int b = body.indexOf(']', a);
@@ -2156,12 +2284,29 @@ static bool weatherFetch() {
   return false;
 #else
   if (WiFi.status() != WL_CONNECTED || !timeReady()) return false;
-  // A forecast is never worth crowding the heap the BLE stack and
-  // the Firebase session need. Skip and try again later.
-  if (ESP.getFreeHeap() < HEAP_TLS_FLOOR + 20000UL) {
-    Serial.println("[wx] skipped, heap low");
+
+  // PATCH 5 PART A. This fetch used to allocate a second mbedTLS
+  // context while the persistent Firebase one was still alive.
+  // Two contexts is ~90 kB against a heap that idles near 80 kB;
+  // the field unit recorded a minimum-ever free heap of 20.8 kB and
+  // then panicked whenever NimBLE or AsyncTCP asked for memory at
+  // the wrong moment.
+  //
+  // So: release the Firebase session for the duration. tlsEnsure()
+  // rebuilds it on the very next push -- that is its existing,
+  // designed behaviour, the same path it already takes on an idle
+  // timeout or a WiFi drop. No Firebase logic is modified.
+  tlsDrop("weather fetch needs the heap");
+
+  if (ESP.getFreeHeap() < WX_TLS_HEADROOM) {
+    Serial.printf("[wx] skipped, only %lu bytes free (need %lu)\n",
+                  (unsigned long)ESP.getFreeHeap(), (unsigned long)WX_TLS_HEADROOM);
     return false;
   }
+  // Never contend with the BLE link for the radio, and feed the
+  // watchdog around the two blocking calls below.
+  if (bleBusy) { Serial.println("[wx] deferred, BLE link coming up"); return false; }
+  esp_task_wdt_reset();
 
   String url = String("https://") + WEATHER_HOST +
                "/v1/forecast?latitude=" + WEATHER_LAT +
@@ -2182,12 +2327,14 @@ static bool weatherFetch() {
   String body;
   if (http.begin(*c, url)) {
     int code = http.GET();
+    esp_task_wdt_reset();                 // GET can sit for the full timeout
     if (code == 200) { body = http.getString(); ok = body.length() > 40; }
     else Serial.printf("[wx] HTTP %d\n", code);
     http.end();
   }
   c->stop();
   delete c;
+  esp_task_wdt_reset();
   if (!ok) return false;
 
   // Parse into a SCRATCH array and commit only if something real
@@ -2204,6 +2351,14 @@ static bool weatherFetch() {
     jsonArrNum(body, "\"cloud_cover_mean\"", i, &cloud);
     jsonArrNum(body, "\"precipitation_sum\"", i, &precip);
     WxCond cd = wxCondFromCode((int)code);
+    // A code we cannot map is not a forecast. Committing it would
+    // put fcConfidence() at zero anyway, but it would also make
+    // wxFetchedStamp claim a successful fetch -- which is exactly
+    // how the "none cached" state hid a parser bug for weeks.
+    if (cd == WC_UNKNOWN) {
+      Serial.printf("[wx] day %ld: unmapped weather code %d, skipped\n", (long)st, (int)code);
+      continue;
+    }
     tmp[i].stamp    = st;
     tmp[i].cond     = (uint8_t)cd;
     tmp[i].cloud    = (cloud < 0) ? wxCloudFromCond(cd)
@@ -2238,7 +2393,23 @@ static void weatherTask() {
   // than burning a retry slot before NTP has landed.
   if (!timeReady()) { wxNextTry = now + 30000UL; return; }
 
+  // PATCH 5 PART A. wxNextTry lived only in RAM, so every boot
+  // re-ran the fetch within seconds. Combined with the heap spike
+  // above that produced a self-sustaining loop: fetch, panic,
+  // reboot, fetch. The schedule is now an EPOCH in NVS, so a
+  // reboot inherits the same next-fetch time a running device
+  // would have had, and a crash loop cannot re-trigger it.
+  //
+  // Plus a hard floor: nothing is fetched in the first two minutes
+  // after any boot, so the radio, the BLE link and the Firebase
+  // session all settle first.
+  if (now < WX_BOOT_DEFER_MS) return;
+
   int32_t today = dateStamp(nowEpoch());
+  time_t  nowEp = nowEpoch();
+  int64_t nextEp = prefs.getLong64(WX_NVS_NEXT, 0);
+  if (nextEp > 1700000000LL && nowEp < (time_t)nextEp) return;
+
   bool due = (int32_t)(now - wxNextTry) >= 0;
 
   // One refresh each morning before the 08:30 handover decision, so
@@ -2262,9 +2433,11 @@ static void weatherTask() {
   if (weatherFetch()) {
     wxFails = 0;
     wxNextTry = now + WEATHER_REFRESH_MS;
+    prefs.putLong64(WX_NVS_NEXT, (int64_t)(nowEpoch() + WEATHER_REFRESH_MS / 1000UL));
   } else {
     wxFails++;
     wxNextTry = now + WEATHER_RETRY_MS;
+    prefs.putLong64(WX_NVS_NEXT, (int64_t)(nowEpoch() + WEATHER_RETRY_MS / 1000UL));
     Serial.printf("[wx] fetch failed (%lu in a row), retry in %lu min\n",
                   (unsigned long)wxFails, (unsigned long)(WEATHER_RETRY_MS / 60000UL));
   }
@@ -2292,6 +2465,69 @@ static bool pvVerdictPoor() {
 
 const char* pvVerdictName() {
   return pvVerdictGood() ? "good" : pvVerdictPoor() ? "poor" : "pending";
+}
+
+// ---- PART C: is today a genuinely poor solar day? ----------------
+//
+// Observed PV energy so far against what this site's OWN history
+// says to expect by this hour. Measured PV outranks the forecast,
+// as section 8k already establishes -- the forecast never enters
+// this comparison at all.
+//
+// Returns -1 when there is no baseline to compare against, in which
+// case nothing downstream may claim the day is poor.
+int solarDayRatio() {
+  int pct = pvWindowPct();
+  if (pct <= 0) return -1;                 // before the window opens
+  float base;
+  int days = 0;
+  if (!pvHistMedianWh(&base, &days) || base < 1.0f) return -1;
+
+  // Expected harvest BY NOW is the day's median scaled by how much
+  // of the counting window has elapsed. Same window, same units, so
+  // the ratio is dimensionless and comparable across days.
+  float expectedSoFar = base * pct / 100.0f;
+  if (expectedSoFar < 1.0f) return -1;
+  float observed = harvestWhToday();
+  long r = (long)(observed * 100.0f / expectedSoFar);
+  if (r < 0) r = 0;
+  if (r > 999) r = 999;
+  return (int)r;
+}
+
+// Latched with two persistence gates, so a passing cloud cannot
+// flip the classification and neither can a single bright minute.
+static void solarDayUpdate(uint32_t now) {
+  int r = solarDayRatio();
+  if (r < 0) { pPoorDay.reset(); pGoodDay.reset(); return; }
+
+  if (!poorSolarDay) {
+    if (pPoorDay.hold(r < POOR_DAY_RATIO, (uint32_t)POOR_DAY_HOLD_MIN * 60000UL, now)) {
+      poorSolarDay = true;
+      pPoorDay.reset();
+      Serial.printf("SOLAR DAY: POOR - observed %d.%02d of expected - CEB hold until %02d:%02d\n",
+                    r / 100, r % 100, CEB_HOLD_DEADLINE_H, CEB_HOLD_DEADLINE_M);
+    }
+  } else {
+    if (pGoodDay.hold(r >= GOOD_SOLAR_RATIO, (uint32_t)GOOD_DAY_HOLD_MIN * 60000UL, now)) {
+      poorSolarDay = false;
+      pGoodDay.reset();
+      Serial.printf("SOLAR DAY: RECOVERED - observed %d.%02d of expected - CEB release armed\n",
+                    r / 100, r % 100);
+    }
+  }
+}
+
+// The hold deadline in minutes-from-midnight, extended only while
+// the day is STILL classified poor.
+int cebHoldDeadlineMin() {
+  return poorSolarDay ? (CEB_HOLD_BAD_H * 60 + CEB_HOLD_BAD_M)
+                      : (CEB_HOLD_DEADLINE_H * 60 + CEB_HOLD_DEADLINE_M);
+}
+
+const char* solarDayName() {
+  if (!poorSolarDay) return solarDayRatio() < 0 ? "unknown" : "normal";
+  return "poor";
 }
 
 // The class the CEB machine actually acts on. Three tiers, in
@@ -2590,6 +2826,21 @@ static EtaOut etaCompute() {
 static void sourceRestore() {
   relayOps = prefs.getUInt(SRC_NVS_OPS, 0);
 
+#if RELAY_SOLAR_PIN < 0
+  // PATCH 5 PART A. On the v5 changeover there is one coil:
+  // de-energised IS the inverter, so the safe boot state that
+  // setup() just applied and SRC_SOLAR are the SAME electrical
+  // state. Leaving srcActual at SRC_NONE made relayTask see
+  // "want SOLAR != actual NONE" on every boot and run a full
+  // break-before-make transfer -- 800 ms of dead time and a
+  // relayOps increment for contacts that never moved.
+  //
+  // That is what inflated the field unit's counter to 890 while
+  // three days of stored history showed ZERO actual source
+  // changes: it was counting reboots, not transfers.
+  srcActual = SRC_SOLAR;
+#endif
+
   uint8_t st  = prefs.getUChar(SRC_NVS_STATE, (uint8_t)SRC_NONE);
   int64_t when = prefs.getLong64(SRC_NVS_EPOCH, 0);
   uint8_t why = prefs.getUChar(SRC_NVS_REASON, (uint8_t)SR_NONE);
@@ -2842,20 +3093,53 @@ static Source decideSource() {
     cebLowArmed = true;
   }
 
+  //    PART B. A SECOND, PARALLEL floor on pack VOLTAGE. Every SoC
+  //    condition above is untouched; this is an extra way in, not a
+  //    replacement. SoC on LiFePO4 is a coulomb count that drifts
+  //    and the JK only recalibrates it at the extremes, so a pack
+  //    reading 30% while its terminals sag to 11.5 V under load is
+  //    not at 30%. Same Schmitt shape as the SoC floor, for the same
+  //    quantisation reason, and it uses the FILTERED voltage.
+  if (packVOk) {
+    if (cebVoltArmed) {
+      if (packVFilt >= PACK_V_CEB_OFF) cebVoltArmed = false;
+    } else if (packVFilt <= PACK_V_CEB_ON) {
+      cebVoltArmed = true;
+    }
+  } else {
+    cebVoltArmed = false;             // no trustworthy voltage, no opinion
+  }
+
   if (!cebOn) {
-    bool low = cebLowArmed;
-    if (pEngage.hold(low, SRC_ENGAGE_HOLD_MS, now)) {
+    bool low  = cebLowArmed;
+    // Both gates run every tick so neither starves the other.
+    bool socHit  = pEngage.hold(low, SRC_ENGAGE_HOLD_MS, now);
+    bool voltHit = pVoltLow.hold(cebVoltArmed, SRC_ENGAGE_HOLD_MS, now);
+    if (socHit || voltHit) {
       cebOn    = true;
       cebSince = now;
       pEngage.reset();
-      Serial.printf("[ceb] ON  soc=%d%% (<=%d, held %lus) wx=%s release=%02d:%02d\n",
-                    soc, SOC_CEB_ON, (unsigned long)(SRC_ENGAGE_HOLD_MS / 1000),
-                    wxName(wx), cebRelMin / 60, cebRelMin % 60);
+      pVoltLow.reset();
+      // Voltage is reported as the reason only when it is the one
+      // that actually fired, so the NVS record stays truthful.
+      if (voltHit && !socHit) {
+        srcLastReason = SR_VOLT_LOW;
+        Serial.printf("[ceb] ON  pack %.2fV (<=%.2f, held %lus) soc=%d%% wx=%s release=%02d:%02d\n",
+                      packVFilt, PACK_V_CEB_ON, (unsigned long)(SRC_ENGAGE_HOLD_MS / 1000),
+                      soc, wxName(wx), cebRelMin / 60, cebRelMin % 60);
+      } else {
+        Serial.printf("[ceb] ON  soc=%d%% (<=%d, held %lus) wx=%s release=%02d:%02d\n",
+                      soc, SOC_CEB_ON, (unsigned long)(SRC_ENGAGE_HOLD_MS / 1000),
+                      wxName(wx), cebRelMin / 60, cebRelMin % 60);
+      }
     } else if (low) {
       srcLogReject(now, "SoC at the CEB floor but not yet persistent");
+    } else if (cebVoltArmed) {
+      srcLogReject(now, "pack voltage at the floor but not yet persistent");
     }
   } else {
     pEngage.reset();
+    pVoltLow.reset();
   }
 
   // 5. RELEASE. Hysteresis (SOC_CEB_OFF is 7 points above
@@ -2870,10 +3154,39 @@ static Source decideSource() {
     bool deadline = pastDue && (charging || soc >= SOC_CEB_SAFE);
     bool want     = socOk && (earlyOut || deadline);
 
+    // PART B. The voltage floor also has to be clear before CEB
+    // hands back, with its own hysteresis -- otherwise a pack whose
+    // SoC has recovered on paper but whose terminals are still sagging
+    // would be handed the house straight back. Persisted, like
+    // everything else here.
+    bool voltClear = !packVOk ||
+                     pVoltOk.hold(packVFilt >= PACK_V_CEB_OFF, SRC_RELEASE_HOLD_MS, now);
+    if (want && !voltClear) srcLogReject(now, "pack voltage has not recovered past the release band");
+    want = want && voltClear;
+
+    // PART C. THE SOLAR-MAXIMISING HOLD. This can only ever turn a
+    // release OFF -- it never turns one on, never engages CEB, and
+    // adds no new transfer path, so it cannot cause an extra relay
+    // operation. It is an optimisation and is therefore evaluated
+    // LAST, after every protection term above has had its say.
+    //
+    // On a genuinely poor day the array cannot refill the pack, so
+    // handing back at the morning deadline just drains it and CEB is
+    // needed again by evening -- two transfers instead of none.
+    cebSolarHold = false;
+    if (want && poorSolarDay && haveTime && !earlyOut) {
+      int holdUntil = cebHoldDeadlineMin();
+      if (nowMin < holdUntil) {
+        cebSolarHold = true;
+        want = false;
+        srcLogReject(now, "poor solar day, holding CEB so the array can charge the pack");
+      }
+    }
+
     if (dwellOk && pRelease.hold(want, SRC_RELEASE_HOLD_MS, now)) {
       cebOn = false;
       pRelease.reset();
-      Serial.printf("[ceb] OFF soc=%d%% %s (wx=%s, held %lus)\n", soc,
+      Serial.printf("[ceb] OFF soc=%d%% %.2fV %s (wx=%s, held %lus)\n", soc, packVFilt,
                     earlyOut ? "pack recovered, early handover" : "release window reached",
                     wxName(wx), (unsigned long)(SRC_RELEASE_HOLD_MS / 1000));
     } else if (want && !dwellOk) {
@@ -2881,6 +3194,8 @@ static Source decideSource() {
     }
   } else {
     pRelease.reset();
+    pVoltOk.reset();
+    cebSolarHold = false;
   }
 
   // 6. Deep-discharge backstop, independent of every schedule and
@@ -2900,7 +3215,9 @@ static Source decideSource() {
   }
 
   if (cebOn) {
-    srcReason = (soc <= SOC_CEB_ON) ? "pack at the CEB floor"
+    srcReason = (packVOk && packVFilt <= PACK_V_CEB_ON) ? "pack voltage at the floor"
+              : cebSolarHold      ? "poor solar day, holding CEB to charge the pack"
+              : (soc <= SOC_CEB_ON) ? "pack at the CEB floor"
               : (wx == WX_HEAVY)    ? "low-solar day, holding CEB to the evening handover"
                                     : "waiting for the morning handover";
     return SRC_UTILITY;
@@ -3038,6 +3355,13 @@ static const Note MELODY_ALARM[] = {
 // three-beep alarm above. Different rhythm, different pitch
 // contour, so "battery is being eaten alive" cannot be confused
 // with "load has been shed".
+// Night low-pack warning (config.h 8r). Three short mid-pitch
+// chirps: brief enough not to be punishing on a 10-minute repeat,
+// and rhythmically nothing like the emergency's two-tone siren.
+static const Note MELODY_NIGHT[] = {
+  {1760, 90}, {0, 70}, {1760, 90}, {0, 70}, {1760, 90}, {0, 0},
+};
+
 static const Note MELODY_EMERG[] = {
   {2093, 170 }, {1568, 170 },
   {2093, 170 }, {1568, 170 },
@@ -3138,9 +3462,55 @@ static void protectionUpdate() {
                   soc, -b.packW);
   }
 
+  // ---- PART D: the 23:00 low-pack alarm ------------------------
+  //
+  // DISPLAY AND BUZZER ONLY. Nothing below is read by decideSource()
+  // or by any relay path; it sets nightAlarm and nothing else.
+  //
+  // Arms once per calendar day at NIGHT_CHECK_HOUR if the VALIDATED
+  // SoC is under the threshold, and clears on any of: the pack
+  // recovering past the hysteresis band, an acknowledge from the
+  // dashboard, or NIGHT_ALARM_END_HOUR.
+  {
+    struct tm t;
+    if (localNow(&t)) {
+      int32_t today = dateStamp(nowEpoch());
+      int nowMin = t.tm_hour * 60 + t.tm_min;
+      int armMin = NIGHT_CHECK_HOUR * 60 + NIGHT_CHECK_MIN;
+      int endMin = NIGHT_ALARM_END_HOUR * 60;
+      // The window wraps midnight, so "inside" is >= arm OR < end.
+      bool inWindow = (nowMin >= armMin) || (nowMin < endMin);
+
+      if (nightAlarm) {
+        if (!inWindow) {
+          nightAlarm = false;
+          Serial.println("[night] window closed, alarm cleared");
+        } else if (soc >= NIGHT_SOC_WARN + NIGHT_SOC_HYST) {
+          nightAlarm = false;
+          Serial.printf("[night] pack recovered to %d%%, alarm cleared\n", soc);
+        } else if (nightAcked) {
+          nightAlarm = false;
+          Serial.println("[night] acknowledged from the dashboard");
+        }
+      } else if (inWindow && nowMin >= armMin && nightArmDay != today &&
+                 !nightAcked && soc < NIGHT_SOC_WARN) {
+        nightAlarm  = true;
+        nightArmDay = today;
+        nightNextMs = 0;
+        Serial.printf("[night] %02d:%02d pack at %d%% (below %d%%) - TURN OFF INVERTER\n",
+                      t.tm_hour, t.tm_min, soc, NIGHT_SOC_WARN);
+      }
+      // A new day re-arms the acknowledge.
+      if (nowMin >= endMin && nowMin < armMin) nightAcked = false;
+    }
+  }
+
   BuzzTone want;
   if (emergAlarm)                    want = BUZZ_EMERG;
   else if (loadCutoff)               want = BUZZ_ALARM;
+  // Below the two protection tones on purpose: a disconnected load
+  // is a louder fact than a forecast about tonight.
+  else if (nightAlarm)               want = BUZZ_NIGHT;
   else if (soc <= SOC_BUZZER_WARN)   want = BUZZ_WARN;
   else if (buzzMode != BUZZ_SILENT && buzzMode != BUZZ_EMERG &&
            soc < SOC_BUZZER_WARN + SOC_ALARM_HYST) want = buzzMode;
@@ -3152,6 +3522,7 @@ static void protectionUpdate() {
     if (want == BUZZ_SILENT) { melody = nullptr; buzzerOutput(0); }
     Serial.printf("[buzz] %s (soc %d%%)\n",
                   want == BUZZ_EMERG ? "EMERGENCY" :
+                  want == BUZZ_NIGHT ? "night low pack" :
                   want == BUZZ_ALARM ? "ALARM" :
                   want == BUZZ_WARN  ? "warn" : "silent", soc);
   }
@@ -3168,11 +3539,14 @@ static void buzzerTick() {
   // start the next repetition when the gap has elapsed
   if (buzzMode != BUZZ_SILENT && !melody) {
     uint32_t period = (buzzMode == BUZZ_EMERG) ? BUZZER_EMERG_PERIOD_MS
+                    : (buzzMode == BUZZ_NIGHT) ? NIGHT_ALARM_REPEAT_MS
                     : (buzzMode == BUZZ_ALARM) ? BUZZER_ALARM_PERIOD_MS
                                               : BUZZER_WARN_PERIOD_MS;
     if (now - lastMelody >= period) {
       if (buzzMode == BUZZ_EMERG)
         melodyStart(MELODY_EMERG, sizeof(MELODY_EMERG) / sizeof(Note));
+      else if (buzzMode == BUZZ_NIGHT)
+        melodyStart(MELODY_NIGHT, sizeof(MELODY_NIGHT) / sizeof(Note));
       else if (buzzMode == BUZZ_ALARM)
         melodyStart(MELODY_ALARM, sizeof(MELODY_ALARM) / sizeof(Note));
       else
@@ -3728,6 +4102,34 @@ static void oledScreenSoc() {
     return;
   }
 
+  // PART D. During the night alarm the percentage blinks at ~2 Hz
+  // and the instruction sits under it. Same font, same geometry,
+  // same top area -- only the visibility of the digits changes, and
+  // the power row and arrow lane are untouched.
+  if (nightAlarm) {
+    bool on = ((millis() / NIGHT_BLINK_MS) & 1) == 0;
+    if (on) {
+      char d[6];
+      snprintf(d, sizeof(d), "%d", soc);
+      u8g2.setFont(FONT_PCT);
+      const int16_t pw = (int16_t)u8g2.getStrWidth("%");
+      u8g2.setFont(FONT_SOC_SM);
+      int16_t dw = (int16_t)u8g2.getStrWidth(d);
+      int16_t total = dw + OLED_SOC_GAP + pw;
+      int16_t x = OLED_A_X0 + (OLED_A_W - total) / 2;
+      if (x < OLED_A_X0) x = OLED_A_X0;
+      u8g2.drawStr(x, 34, d);
+      u8g2.setFont(FONT_PCT);
+      u8g2.drawStr(x + dw + OLED_SOC_GAP, 34, "%");
+    }
+    u8g2.setFont(FONT_TXT);
+    const char* m = "TURN OFF INVERTER";
+    int16_t w = (int16_t)u8g2.getStrWidth(m);
+    if (w > OLED_A_W) { u8g2.setFont(FONT_SMALL); w = (int16_t)u8g2.getStrWidth(m); }
+    u8g2.drawStr(OLED_A_X0 + (OLED_A_W - w) / 2, 47, m);
+    return;
+  }
+
   char d[6];
   snprintf(d, sizeof(d), "%d", soc);
 
@@ -4145,7 +4547,7 @@ static void addCors(AsyncWebServerResponse* r) {
 static void setupWebServer() {
   server.on("/api/live", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (!authOk(req)) return;
-    char buf[3200];
+    char buf[3800];
     buildLiveJson(buf, sizeof(buf));
     AsyncWebServerResponse* r = req->beginResponse(200, "application/json", buf);
     addCors(r);
@@ -4223,6 +4625,13 @@ static void setupWebServer() {
       else if (v == "off")  lightMode = LIGHT_OFF;
       else                  lightMode = v.toInt() != 0 ? LIGHT_ON : LIGHT_OFF;
       Serial.printf("[web] lights request: %s\n", lightModeName());
+    }
+    if (req->hasParam("ackNight")) {
+      // Part D: acknowledge clears the alarm for the rest of tonight.
+      // It is a DISPLAY acknowledgement -- it changes no source state.
+      nightAcked = true;
+      nightAlarm = false;
+      Serial.println("[night] acknowledged from the dashboard");
     }
     req->send(200, "application/json",
       String("{\"src\":\"") + srcName(srcActual) + "\",\"manual\":" +
@@ -4407,8 +4816,6 @@ static void netTask(void*) {
 //  counter. It exists so the next unexplained reset comes with
 //  evidence instead of a guess.
 // ============================================================
-static TaskHandle_t hBle = nullptr, hNet = nullptr;
-
 static void diagTick(uint32_t now) {
   // Soft watchdog: notice a stalled loop and SAY so, before the
   // hardware watchdog resets the board and takes the reason with it.
@@ -4497,6 +4904,8 @@ void setup() {
   if (nvsOk) {
     loadCounters();        // may restore an approximate clock
     resetLogLoad();
+    panicLoad();           // last decoded panic, if any
+    panicCapture();        // a NEW dump overrides it, then is erased
     sourceRestore();       // <-- relays re-applied within ms of boot
     resetLogPush((uint8_t)bootReason,
                  timeReady() ? dateStamp(nowEpoch()) : 0,
@@ -4518,6 +4927,14 @@ void setup() {
                    "fault - relay coil or buzzer inrush, or an undersized supply. "
                    "Software cannot fix it; see WIRING.md.");
   Serial.println(srcRestoreMsg);
+  if (panicPc) {
+    Serial.printf("A: last panic in task '%s' at PC 0x%08lX\n",
+                  panicTask, (unsigned long)panicPc);
+    Serial.print("A: backtrace");
+    for (uint8_t i = 0; i < panicBtN; i++) Serial.printf(" 0x%08lX", (unsigned long)panicBt[i]);
+    Serial.println();
+    Serial.println("A: decode with:  xtensa-esp32-elf-addr2line -pfiaC -e SolarPulse.ino.elf <addrs>");
+  }
   Serial.println(nvsOk ? "B: NVS open" : "B: NVS failed, counters not saved");
 
   dataMux = xSemaphoreCreateMutex();
@@ -4606,6 +5023,7 @@ void loop() {
     integrateEnergy(b);     // also updates the PV/load low-pass filters
     socUpdate(b, now);      // validates SoC BEFORE anything acts on it
     etaUpdate(now);         // display-only rolling mean, no vote in anything
+    solarDayUpdate(now);    // 8q: poor/normal day, input to the CEB hold only
     protectionUpdate();     // sets loadCutoff / buzzMode from SoC
     travelTask();           // applies loadCutoff to the load relay
     relayTask();

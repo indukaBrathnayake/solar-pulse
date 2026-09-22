@@ -111,6 +111,31 @@ struct WxDay {
                            0 = not supplied. Section 8n.           */
 };
 
+/* Why the source last changed. Stored in NVS with the state, so a
+ * boot can report not just WHAT it restored but WHY that state was
+ * entered. Section 8o. */
+enum SrcReason : uint8_t {
+  SR_NONE = 0,
+  SR_SOC_LOW,        /* pack reached the CEB floor            */
+  SR_CRITICAL,       /* deep-discharge backstop               */
+  SR_BMS_LOST,       /* telemetry gone, failsafe to mains     */
+  SR_RECOVERED,      /* pack recovered, early handover        */
+  SR_DEADLINE,       /* release window reached                */
+  SR_MANUAL,         /* web override                          */
+  SR_RESTORE,        /* re-applied from NVS at boot           */
+  SR_VOLT_LOW        /* pack VOLTAGE floor, section 8p        */
+};
+
+/* One entry in the boot-reason ring (section 8o). 8 bytes. */
+struct ResetRec {
+  int32_t  stamp;    /* epoch of the boot, 0 if the clock was unset */
+  uint16_t upMin;    /* uptime of the PREVIOUS run, minutes         */
+  uint8_t  reason;   /* esp_reset_reason()                          */
+  uint8_t  pad;
+  char     task[12]; /* task that faulted, from the core dump       */
+  uint32_t pc;       /* faulting program counter, 0 if none         */
+};
+
 /* Lights control mode (section 8n). AUTO is the default and the
  * only mode that looks at the clock. Lives here for the prototype
  * reason described above Source. */
@@ -207,9 +232,15 @@ enum BuzzTone : uint8_t {
   BUZZ_SILENT = 0,  /* SoC healthy                                  */
   BUZZ_WARN,        /* SoC <= SOC_BUZZER_WARN, shutdown approaching */
   BUZZ_ALARM,       /* SoC <= SOC_LOAD_CUTOFF, load disconnected    */
-  BUZZ_EMERG        /* SoC <= SOC_EMERGENCY while ON PACK: the
+  BUZZ_EMERG,       /* SoC <= SOC_EMERGENCY while ON PACK: the
                      * inverter is draining a nearly flat pack,
                      * e.g. a CEB cut at midnight. Distinct pattern. */
+  BUZZ_NIGHT        /* 23:00 and the pack will not last the night.
+                     * A short triple chirp on a 10-minute repeat --
+                     * deliberately nothing like the emergency siren,
+                     * because the two mean different things and
+                     * nobody should have to guess which is sounding.
+                     * Section 8r. Display and buzzer ONLY. */
 };
 
 /* One BMS telemetry snapshot. Written only by the NimBLE notify
@@ -949,6 +980,212 @@ struct Note { uint16_t freq; uint16_t ms; };
 #define LIGHTS_FALLBACK_ON_MIN 30
 
 /* ------------------------------------------------------------
+ *  8o. BOOT DIAGNOSTICS + SOURCE PERSISTENCE
+ *
+ *  THE FAULT THIS FIXES. srcActual lived only in RAM. Any reset --
+ *  a watchdog, a panic, a brownout, a power blink -- lost it, and
+ *  setup() left the changeover de-energised, which on this board IS
+ *  the inverter. So a reboot that happened while CEB was carrying
+ *  the house produced: come up on Pack, then transfer back to CEB
+ *  once the machine re-derived the decision. ONE reset, TWO relay
+ *  operations, and an unnecessary transfer through the inverter.
+ *
+ *  THE FIX. The committed source is written to NVS on every change
+ *  -- and only on a change -- together with when it happened, why,
+ *  and the SoC at the time. setup() reads it back and re-applies it
+ *  within milliseconds of boot, before Serial, before LittleFS,
+ *  before WiFi, before BLE and before the weather fetch.
+ *
+ *  WHY "CEB IS THE SAFE DIRECTION TO RESTORE". Restoring mains when
+ *  it was not needed costs a little grid energy for one dwell
+ *  period. Restoring the pack when it was NOT safe can flatten the
+ *  battery. The asymmetry is what makes an immediate restore the
+ *  conservative choice rather than a gamble.
+ *
+ *  THE CLOCK PROBLEM, and it is the interesting part. The age test
+ *  the requirement asks for needs to know how long the device was
+ *  DOWN, and after a power cut it cannot:
+ *
+ *    - soft reset (SW / PANIC / INT_WDT / TASK_WDT): the RTC keeps
+ *      running across the reset, so nowEpoch() is still true and
+ *      the age is exact.
+ *    - POWERON / BROWNOUT: the RTC is dead. The clock restored from
+ *      NVS is the time of the last counter save, so "now minus
+ *      stored" measures the gap between two writes, NOT the outage.
+ *      A three-hour power cut would compute as seconds old.
+ *
+ *  So the age test is applied ONLY when the clock is trustworthy.
+ *  After a power cut the restore is PROVISIONAL: CEB is re-applied
+ *  immediately (the safe direction), the dwell timer is armed, and
+ *  the normal state machine then decides on real data as soon as
+ *  the BMS produces a validated SoC. Battery protection is never
+ *  suppressed -- a genuine low SoC still engages CEB, and a genuine
+ *  healthy pack still releases it once the ordinary CEB policy
+ *  allows, which is CEB_MIN_ON_MS after the restore.
+ *
+ *  NVS WEAR. Writes happen on source CHANGES only. This system
+ *  changes source roughly twice a day, so about 700 writes a year
+ *  against a part rated for 100k cycles per sector with wear
+ *  levelling -- three orders of magnitude of margin. Nothing here
+ *  writes on a timer or from the control loop.
+ * ---------------------------------------------------------- */
+#define SRC_NVS_STATE      "srcs"     /* last committed Source          */
+#define SRC_NVS_EPOCH      "srct"     /* epoch when it was committed    */
+#define SRC_NVS_REASON     "srcr"     /* SrcReason                      */
+#define SRC_NVS_SOC        "srcq"     /* validated SoC at the change    */
+#define SRC_NVS_OPS        "srco"     /* lifetime relay operations      */
+#define RESET_LOG_NVS      "rstlog"   /* ring of ResetRec               */
+#define RESET_LOG_N            10     /* boots remembered               */
+
+/* How old a stored record may be and still be re-applied, when the
+ * clock can be trusted at all. See the note above. */
+#define SOURCE_RESTORE_MAX_AGE_S  1800UL   /* 30 minutes */
+
+/* Diagnostics cadence. Reporting only -- none of these can move a
+ * relay or change a decision. */
+#define HEAP_LOG_MS         60000UL   /* heap + stack watermark line    */
+#define LOOP_STALL_MS       30000UL   /* soft-watchdog complaint        */
+
+/* Transfer-rate diagnostic (section E). Counting only: exceeding it
+ * logs a warning and holds the EXISTING dwell at its maximum. It
+ * introduces no new threshold into the decision itself. */
+#define XFER_BURST_N            3     /* transfers ...                  */
+#define XFER_BURST_WINDOW_MS 600000UL /* ... within 10 minutes          */
+
+/* ------------------------------------------------------------
+ *  8p. PACK VOLTAGE CUTOFF  (a second, parallel CEB trigger)
+ *
+ *  Every existing SoC trigger is untouched. This adds one more in
+ *  PARALLEL: a pack that is genuinely sagging engages CEB even if
+ *  the reported SoC still looks comfortable.
+ *
+ *  WHY IT IS WORTH HAVING. SoC on a LiFePO4 pack is a coulomb count
+ *  that drifts, and the JK only recalibrates it at the extremes. A
+ *  pack whose SoC reads 30% but whose terminals are at 11.5 V under
+ *  load is not at 30%. Voltage is the independent check.
+ *
+ *  A WARNING ABOUT THIS NUMBER, and it belongs in the report.
+ *  11.5 V across 4S is 2.875 V per cell. Any sane JK cell
+ *  under-voltage protection sits at 2.5-2.8 V per cell, i.e.
+ *  10.0-11.2 V pack. So on a BALANCED pack the BMS would NOT
+ *  disconnect first -- this rule fires before it, which is the
+ *  intent. On an UNBALANCED pack one cell can hit its own floor
+ *  while the pack total is still above 11.5 V, and then the BMS
+ *  disconnects first and this rule never gets a chance. That is a
+ *  balance problem, not a threshold problem.
+ *
+ *  The comparison uses the SAME discipline as the SoC path: a
+ *  low-passed value, then a Persist gate, then the ordinary dwell
+ *  and break-before-make. It cannot bypass any of them.
+ * ---------------------------------------------------------- */
+/* Stated in MILLIVOLTS and derived as floats. The preprocessor
+ * cannot compare floating constants, so a float #define here makes
+ * the #if guards below silently unbuildable -- integers keep the
+ * guards real and cost nothing at runtime. */
+#define PACK_V_CEB_ON_MV     11500  /* engage at or below            */
+#define PACK_V_CEB_OFF_MV    12200  /* release hysteresis            */
+#define PACK_V_VALID_MIN_MV   8000  /* outside this the sample is    */
+#define PACK_V_VALID_MAX_MV  16000  /* nonsense for a 4S pack        */
+
+#define PACK_V_CEB_ON     (PACK_V_CEB_ON_MV    / 1000.0f)
+#define PACK_V_CEB_OFF    (PACK_V_CEB_OFF_MV   / 1000.0f)
+#define PACK_V_VALID_MIN  (PACK_V_VALID_MIN_MV / 1000.0f)
+#define PACK_V_VALID_MAX  (PACK_V_VALID_MAX_MV / 1000.0f)
+#define PACK_V_FILTER_TC_S  30.0f   /* same constant class as PV     */
+
+/* ------------------------------------------------------------
+ *  8q. SOLAR-MAXIMISING CEB HOLD
+ *
+ *  THE ARGUMENT. On a genuinely poor solar day the array cannot
+ *  refill the pack. Releasing to Pack at the normal morning
+ *  handover then just drains it, and CEB is needed again by
+ *  evening -- two transfers and a flatter battery than if CEB had
+ *  simply stayed on while the little PV there was went into the
+ *  pack. So: on a poor day, HOLD CEB and let the array charge.
+ *
+ *  THIS IS AN OPTIMISATION, NOT A PROTECTION. It can only DELAY a
+ *  release that the existing logic already wanted to make. It
+ *  cannot engage CEB, it cannot keep CEB on when protection wants
+ *  otherwise, and it adds no new transfer path -- so it cannot
+ *  cause an extra relay operation. Proven in the test suite.
+ *
+ *  DETECTION reuses the existing hybrid model: observed PV energy
+ *  so far against what this site's own history says to expect by
+ *  this hour. Measured PV outranks the forecast label, as already
+ *  designed in section 8k.
+ * ---------------------------------------------------------- */
+#define POOR_DAY_RATIO        45    /* observed/expected %, below -> poor */
+#define GOOD_SOLAR_RATIO      75    /* ... above this -> recovered        */
+#define POOR_DAY_HOLD_MIN     45    /* sustained minutes to declare poor  */
+#define GOOD_DAY_HOLD_MIN     30    /* sustained minutes to declare good  */
+#define CEB_HOLD_DEADLINE_H   17    /* release by this hour               */
+#define CEB_HOLD_DEADLINE_M    0
+#define CEB_HOLD_BAD_H        18    /* ... extended to here if still poor */
+#define CEB_HOLD_BAD_M         0
+
+/* ------------------------------------------------------------
+ *  8r. NIGHT LOW-PACK ALARM   (display + buzzer ONLY)
+ *
+ *  ###############################################################
+ *  #  NOTHING HERE TOUCHES SOURCE CONTROL. It drives the OLED    #
+ *  #  and the buzzer and sets one reported flag. decideSource()  #
+ *  #  never reads any of it.                                     #
+ *  ###############################################################
+ *
+ *  At NIGHT_CHECK_HOUR, a pack below NIGHT_SOC_WARN will not last
+ *  the night on the inverter. The useful action is a human one --
+ *  switch the inverter off and save what is left -- so the alarm
+ *  says exactly that and then gets out of the way.
+ *
+ *  Deliberately distinct from the 10% emergency: that one is a
+ *  two-tone siren, this is a short triple chirp on a 10-minute
+ *  repeat. Nobody should have to guess which is which.
+ * ---------------------------------------------------------- */
+#define NIGHT_CHECK_HOUR      23
+#define NIGHT_CHECK_MIN        0
+#define NIGHT_SOC_WARN        38    /* below this at 23:00 -> alarm       */
+#define NIGHT_SOC_HYST         3    /* clears at WARN + this              */
+#define NIGHT_ALARM_REPEAT_MS 600000UL  /* 10 minutes between chirps      */
+#define NIGHT_ALARM_END_HOUR   1    /* stops at 01:00 regardless          */
+#define NIGHT_BLINK_MS       250UL  /* SoC blink half-period, ~2 Hz       */
+
+/* ------------------------------------------------------------
+ *  8s. BMS ALARM FILTER
+ *
+ *  JK frame byte 166 is a 32-bit alarm word. On THIS unit bit 19
+ *  is set permanently while the pack is demonstrably healthy, so
+ *  the dashboard banner fired on every single load and taught
+ *  people to ignore it. Suppressing the whole banner would hide
+ *  real faults, so exactly one bit is masked and the other 31 keep
+ *  reporting. See the report for the evidence.
+ * ---------------------------------------------------------- */
+#define BMS_ERR_IGNORE_MASK  0x00080000UL   /* bit 19 only */
+
+/* ------------------------------------------------------------
+ *  8t. WEATHER FETCH MEMORY SAFETY  (patch 5 part A fix)
+ *
+ *  The fetch allocated a SECOND TLS session while the persistent
+ *  Firebase one was alive. Two mbedTLS contexts on this part is
+ *  roughly 90 kB against a free heap that idles near 80 kB, and
+ *  the observed minimum-ever free heap was 20.8 kB. Anything else
+ *  allocating at that moment -- a NimBLE notification, an AsyncTCP
+ *  connection, a LittleFS write -- got a null and panicked.
+ *
+ *  Worse, wxNextTry lived only in RAM, so EVERY boot re-ran the
+ *  fetch immediately. Crash, reboot, fetch, crash: the loop that
+ *  produced ~890 reboots.
+ *
+ *  Three changes, all here: the schedule survives a reboot, the
+ *  Firebase session is released for the duration of the fetch
+ *  (tlsEnsure rebuilds it on the next push, which is its existing
+ *  designed behaviour), and the headroom required is stated in
+ *  terms of what a second session actually costs.
+ * ---------------------------------------------------------- */
+#define WX_NVS_NEXT        "wxnext"  /* epoch of the next fetch       */
+#define WX_TLS_HEADROOM    90000UL   /* free heap needed to even try  */
+#define WX_BOOT_DEFER_MS   120000UL  /* never fetch in the first 2 min*/
+
+/* ------------------------------------------------------------
  *  8h. EMERGENCY BATTERY ALARM  (new in v6)
  *
  *  Scenario this exists for: the grid fails at midnight while the
@@ -1383,6 +1620,38 @@ struct Note { uint16_t freq; uint16_t ms; };
 #endif
 #if LIGHTS_OFF_HOUR > 23 || LIGHTS_FALLBACK_ON_HOUR > 23
   #error "Lights schedule hours must be 0-23."
+#endif
+#if RESET_LOG_N < 1 || RESET_LOG_N > 32
+  #error "RESET_LOG_N outside a sane range for an NVS blob."
+#endif
+#if PACK_V_CEB_OFF_MV <= PACK_V_CEB_ON_MV
+  #error "The pack-voltage release must sit ABOVE the engage threshold, or the rule has no hysteresis."
+#endif
+#if PACK_V_CEB_ON_MV <= PACK_V_VALID_MIN_MV || PACK_V_CEB_OFF_MV >= PACK_V_VALID_MAX_MV
+  #error "The voltage thresholds must lie inside the plausible-sample window."
+#endif
+#if GOOD_SOLAR_RATIO <= POOR_DAY_RATIO
+  #error "The solar recovery ratio must sit above the poor-day ratio, or the day can be both at once."
+#endif
+#if CEB_HOLD_BAD_H < CEB_HOLD_DEADLINE_H
+  #error "The extended hold deadline cannot be earlier than the normal one."
+#endif
+#if NIGHT_SOC_WARN <= SOC_LOAD_CUTOFF
+  #error "The night warning must sit above the load cutoff, or protection fires first and the warning is never useful."
+#endif
+#if NIGHT_SOC_WARN >= 100 || NIGHT_SOC_WARN + NIGHT_SOC_HYST > 100
+  #error "The night warning can never clear."
+#endif
+#if NIGHT_CHECK_HOUR > 23 || NIGHT_ALARM_END_HOUR > 23
+  #error "Night alarm hours must be 0-23."
+#endif
+#if SOURCE_RESTORE_MAX_AGE_S < 60
+  #error "A restore window under a minute defeats the purpose of persisting the source."
+#endif
+/* The restore arms the ordinary dwell; it must not be able to hold
+ * the house on mains longer than the CEB policy itself would. */
+#if SOURCE_RESTORE_MAX_AGE_S > 86400UL
+  #error "SOURCE_RESTORE_MAX_AGE_S longer than a day is not a reboot, it is a new deployment."
 #endif
 #if OLED_ARROW_CX - OLED_ARROW_HEAD_W / 2 < OLED_C_X0 || \
     OLED_ARROW_CX + OLED_ARROW_HEAD_W / 2 > OLED_C_X1
