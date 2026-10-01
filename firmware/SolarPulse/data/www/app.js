@@ -126,19 +126,25 @@ async function poll() {
     b.classList.toggle("sel", b.dataset.light === lm));
 
   const lw = $("lightWhy");
+  const travelling = !!d.travel;
   if (lw) {
-    if (d.lightsLow) {
-      lw.textContent = "lights off · low battery";
-    } else if (lm === "auto") {
-      lw.textContent = `lights auto · on at ${d.lightOn ?? "--:--"}` +
-        `${d.lightSunset === false ? " (no sunset cached)" : ""}` +
-        ` · off at ${d.lightOff ?? "--:--"}` +
-        (d.lightMin != null ? ` · ${d.lightMin} min today` : "");
+    const mins = d.lightMin != null ? ` · ${d.lightMin} min today` : "";
+    if (d.loadCut) {
+      lw.textContent = `lights cut, pack below ${d.loadCutSoc ?? 10}%` + mins;
+    } else if (travelling) {
+      lw.textContent = `TRAVEL MODE · lights ${d.lightOn ?? "--:--"} to ` +
+                       `${d.lightOff ?? "--:--"} · switch closed` + mins;
     } else {
-      lw.textContent = `lights forced ${lm}` +
-        (d.lightMin != null ? ` · ${d.lightMin} min today` : "");
+      lw.textContent = `travel off · manual control available` +
+                       (lm === "auto" ? "" : ` · forced ${lm}`) + mins;
     }
   }
+  // The physical switch owns the lights in travel mode; the buttons
+  // say so rather than silently doing nothing.
+  document.querySelectorAll("[data-light]").forEach((b) => {
+    b.disabled = travelling;
+    b.title = travelling ? "held by the travel switch" : "";
+  });
 }
 
 function setRelay(id, on, warn) {

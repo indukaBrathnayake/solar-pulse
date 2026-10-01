@@ -231,7 +231,7 @@ enum BleState : uint8_t {
 enum BuzzTone : uint8_t {
   BUZZ_SILENT = 0,  /* SoC healthy                                  */
   BUZZ_WARN,        /* SoC <= SOC_BUZZER_WARN, shutdown approaching */
-  BUZZ_ALARM,       /* SoC <= SOC_LOAD_CUTOFF, load disconnected    */
+  BUZZ_ALARM,       /* SoC <= LOAD_CUT_SOC, load shed               */
   BUZZ_EMERG,       /* SoC <= SOC_EMERGENCY while ON PACK: the
                      * inverter is draining a nearly flat pack,
                      * e.g. a CEB cut at midnight. Distinct pattern. */
@@ -405,25 +405,29 @@ struct Note { uint16_t freq; uint16_t ms; };
 #define PACK_CAPACITY_AH   100.0f
 
 /* ------------------------------------------------------------
- *  6. OPTIONAL PV-SIDE METERING
+ *  6. PV METERING  -- ADC INPUTS REMOVED (patch 6 part I)
  *
- *  There is no PV sensor on this rig today: "harvest" is the
- *  power flowing INTO the battery, measured by the BMS. Loads
- *  fed straight from the array during the day never pass the
- *  shunt, so harvest is an undercount.
+ *  GPIO34 and GPIO35 carried a pack-voltage divider and a current
+ *  sensor. Both dividers have been removed from the hardware, and
+ *  with them the only reason to read an ADC on this board.
  *
- *  Set PV_ADC_ENABLE to 1 once a divider + current sensor are
- *  wired to the two ADC1 pins below, and harvest switches to a
- *  true V_solar x I_solar integration.
+ *  Nothing is lost. The JK BMS already supplies pack voltage, every
+ *  cell voltage and pack current over BLE, factory-calibrated and
+ *  on the far side of the shunt -- which is strictly better than a
+ *  resistor divider read through an ESP32 ADC whose non-linearity
+ *  needs per-chip eFuse correction. The ESP32 sits beside the pack,
+ *  so the BLE hop is short.
+ *
+ *  "Harvest" therefore means power flowing INTO the battery, as
+ *  measured by the BMS. Loads fed straight from the array during
+ *  the day never pass the shunt, so harvest remains an undercount.
+ *  That was already true and is unchanged.
+ *
+ *  GPIO34 and GPIO35 are now UNUSED. They are input-only pins with
+ *  no internal pull-ups, so leaving them floating is harmless.
  * ---------------------------------------------------------- */
-#define PV_ADC_ENABLE      0
-#define PV_VOLT_PIN        34        /* ADC1, input-only pin            */
-#define PV_CURR_PIN        35        /* ADC1, input-only pin            */
-#define PV_VOLT_DIVIDER    11.0f     /* (R1+R2)/R2 of the divider       */
-#define PV_CURR_MV_PER_A   66.0f     /* ACS712-30A = 66 mV/A            */
-#define PV_CURR_ZERO_MV    1650.0f   /* sensor output at 0 A            */
-/* No ADC reference constant is needed: analogReadMilliVolts() already
- * applies the per-chip eFuse calibration and returns millivolts. */
+#define GPIO34_UNUSED       34       /* was the pack-voltage divider    */
+#define GPIO35_UNUSED       35       /* was the PV current sensor       */
 
 /* ------------------------------------------------------------
  *  7. RELAY OUTPUTS  -- SPDT CHANGEOVER, LIVE ONLY
@@ -454,7 +458,7 @@ struct Note { uint16_t freq; uint16_t ms; };
  *  Consequences:
  *   - There is no separate solar relay any more, so
  *     RELAY_SOLAR_PIN is -1 (disabled). setSourceRelays() still
- *     takes ONE source and relayDrive() ignores a negative pin,
+ *     takes ONE source and relayCoil() ignores a negative pin,
  *     so the interlock code is unchanged and still correct: with
  *     the solar pin disabled, "utility off" IS "solar on".
  *   - SRC_NONE is no longer an isolated state. De-energised means
@@ -483,7 +487,39 @@ struct Note { uint16_t freq; uint16_t ms; };
 /* Most blue relay boards are ACTIVE LOW: the coil pulls in when
  * the input is driven to 0 V. Set to 0 for active-high boards.
  * Getting this wrong inverts solar and CEB. */
-#define RELAY_ACTIVE_LOW    1
+/* ------------------------------------------------------------
+ *  PART A. TWO SEPARATE FACTS, AND THE BUG THAT CAME FROM
+ *  CONFLATING THEM.
+ *
+ *  (1) COIL DRIVE SENSE -- a property of the relay MODULE and its
+ *      trigger-level jumper. Both relays sit on the same module, so
+ *      one setting covers both. RELAY_ACTIVE_LOW says a LOW on the
+ *      GPIO energises the coil.
+ *
+ *  (2) CONTACT ARRANGEMENT -- a property of how each relay is WIRED
+ *      into the AC side, and it differs between the two:
+ *
+ *        CEB changeover : NORMALLY OPEN
+ *          de-energised -> CEB disconnected, house on the pack
+ *          energised    -> CEB connected
+ *
+ *        Load / lights  : NORMALLY CLOSED
+ *          de-energised -> load connected, lights ON
+ *          energised    -> load disconnected, lights OFF
+ *
+ *  Before this patch there was only (1). travelTask() called
+ *  relayDrive(RELAY_LOAD_PIN, lightOn) -- energise to turn the
+ *  lights ON -- which on a normally-closed contact CUTS them. The
+ *  lights ran inverted.
+ *
+ *  The two constants below name the arrangement per relay so a
+ *  future edit cannot silently invert it again, and setLoad() /
+ *  setSourceRelays() are now the only things that convert a desired
+ *  CONTACT state into a coil command.
+ * ---------------------------------------------------------- */
+#define RELAY_ACTIVE_LOW    1        /* LOW on the GPIO energises       */
+#define CEB_RELAY_ENERGISE_TO_CONNECT 1  /* NO  contact                 */
+#define LOAD_RELAY_ENERGISE_TO_CUT    1  /* NC  contact                 */
 
 /* Settle time between leaving one source and taking the next.
  * See the note above: with a changeover relay this is anti-flap
@@ -589,7 +625,6 @@ struct Note { uint16_t freq; uint16_t ms; };
  *  cannot chatter the relay or stutter the buzzer.
  * ---------------------------------------------------------- */
 #define SOC_BUZZER_WARN     38   /* start warning the user here        */
-#define SOC_LOAD_CUTOFF     35   /* disconnect the load relay here     */
 #define SOC_ALARM_HYST       2   /* SoC must rise this much to clear   */
 
 /* ------------------------------------------------------------
@@ -940,44 +975,51 @@ struct Note { uint16_t freq; uint16_t ms; };
 #define PRED_WEAK             400
 
 /* ------------------------------------------------------------
- *  8n. LIGHTS  (switched load circuit)
+ *  8n. LOAD RELAY + TRAVEL MODE   (patch 6 parts D and E)
  *
  *  ###############################################################
- *  #  THIS IS LOAD CONTROL ONLY. It drives RELAY_LOAD_PIN and    #
- *  #  nothing else. It cannot reach the source state machine,    #
- *  #  the CEB relay, or any decision in section 12.              #
+ *  #  LOAD CONTROL ONLY. Everything here drives RELAY_LOAD_PIN    #
+ *  #  and nothing else. Travel mode in particular CANNOT reach    #
+ *  #  the source state machine: CEB keeps exactly the two         #
+ *  #  triggers in section 8b/8p, in travel mode and out of it.    #
  *  ###############################################################
  *
- *  ONE OWNER. travelTask() already owned RELAY_LOAD_PIN, so the
- *  modes below are inputs to that function rather than a second
- *  controller for the same GPIO. The precedence there, highest
- *  first, is unchanged at the top and extended at the bottom:
+ *  ONE OWNER. travelTask() is the only writer of RELAY_LOAD_PIN.
+ *  Everything below is an INPUT to it, never a second controller.
  *
- *    1. loadCutoff        battery protection, SOC_LOAD_CUTOFF
- *    2. lights low-batt   LIGHTS_CUTOFF_SOC, this section
- *    3. travel mode       the physical switch and its schedule
- *    4. LIGHT_ON / OFF    the web override
- *    5. LIGHT_AUTO        sunset -> LIGHTS_OFF_*
+ *  PRECEDENCE, highest first:
  *
- *  AUTO uses the sunset time that comes back with the forecast
- *  that section 8k already fetches -- no new request, no new
- *  service, one extra field on a response we were parsing anyway.
- *  With no cached sunset it falls back to a fixed clock time, so
- *  the lights still work with the internet down.
+ *    1. LOAD_CUT_SOC      the one automatic trip, both modes
+ *    2. travel schedule   when the physical switch is closed
+ *    3. LIGHT_ON / OFF    the dashboard override
+ *    4. LIGHT_AUTO        normal mode: lights simply available
  *
- *  THE LOW-BATTERY GUARD is latched with hysteresis. Lighting is
- *  the one load a person notices flicking on and off, and an
- *  unlatched threshold at a SoC hovering on the boundary would do
- *  exactly that. It re-arms LIGHTS_CUTOFF_HYST points higher.
- *  It reads socStableVal -- the validated SoC, same as everything
- *  else -- and writes only the lights.
+ *  WHAT WAS REMOVED. The sunset-to-23:00 schedule that used to run
+ *  in normal mode is gone, with the cached-sunset lookup and the
+ *  fixed fallback time behind it. Someone is home in normal mode;
+ *  they can reach a switch. A schedule that turns the lights off at
+ *  23:00 while people are using them is an annoyance, not a
+ *  feature. Scheduling now exists ONLY in travel mode, where its
+ *  entire purpose is to make an empty house look occupied.
+ *
+ *  THE DEEP TRIP. LOAD_CUT_SOC is not an optimisation and not a
+ *  convenience. It is for one specific failure: the pack has
+ *  drained, CEB is already engaged, but the utility itself is
+ *  absent -- a brownout or an area outage -- so the inverter is
+ *  carrying the whole house off a nearly flat battery. At that
+ *  point the discretionary load has to go. It applies in BOTH
+ *  modes and overrides the travel schedule and any manual choice.
  * ---------------------------------------------------------- */
-#define LIGHTS_CUTOFF_SOC      25     /* below this, lights forced off   */
-#define LIGHTS_CUTOFF_HYST      5     /* ... and back on at 30%          */
-#define LIGHTS_OFF_HOUR        23     /* AUTO switch-off time            */
-#define LIGHTS_OFF_MIN          0
-#define LIGHTS_FALLBACK_ON_HOUR 18    /* used when no sunset is cached   */
-#define LIGHTS_FALLBACK_ON_MIN 30
+#define LOAD_CUT_SOC           10     /* energise the coil, cut the load */
+#define LOAD_CUT_HYST           5     /* ... restore above 15%           */
+
+/* Travel mode. The schedule needs only the RTC -- no WiFi, no
+ * Firebase, no forecast -- because the whole point is that it keeps
+ * running while nobody is there to notice it has stopped. */
+#define TRAVEL_LIGHTS_ON_H     18
+#define TRAVEL_LIGHTS_ON_M     15     /* lights on  18:15 */
+#define TRAVEL_LIGHTS_OFF_H    23
+#define TRAVEL_LIGHTS_OFF_M    30     /* lights off 23:30 */
 
 /* ------------------------------------------------------------
  *  8o. BOOT DIAGNOSTICS + SOURCE PERSISTENCE
@@ -1082,6 +1124,27 @@ struct Note { uint16_t freq; uint16_t ms; };
  * cannot compare floating constants, so a float #define here makes
  * the #if guards below silently unbuildable -- integers keep the
  * guards real and cost nothing at runtime. */
+/* PART B. A THIRD AUTOMATIC CEB PATH EXISTS, AND IT IS DELIBERATE.
+ *
+ * The brief says CEB turns on for exactly two reasons. There is a
+ * third in the code: a debounced BMS-link failsafe. I have kept it,
+ * behind this switch, and the reasoning belongs in the open:
+ *
+ *   With the BLE link down, socStableVal is -1 and packVOk is
+ *   false. BOTH triggers below are therefore blind. Nothing else
+ *   protects the pack -- it would discharge to whatever the JK's
+ *   own cell cutoff allows, with no warning and no record.
+ *
+ *   Part I of the same brief then says "the existing BMS_LOST
+ *   handling covers this case", which reads as expecting it to
+ *   remain. So it remains, debounced by SRC_ENGAGE_HOLD_MS exactly
+ *   as before.
+ *
+ * Set this to 0 for literally two triggers and nothing else. The
+ * cost of doing so is stated above; it is not a safe default.
+ */
+#define CEB_FAILSAFE_ON_BMS_LOST 1
+
 #define PACK_V_CEB_ON_MV     11500  /* engage at or below            */
 #define PACK_V_CEB_OFF_MV    12200  /* release hysteresis            */
 #define PACK_V_VALID_MIN_MV   8000  /* outside this the sample is    */
@@ -1257,6 +1320,13 @@ struct Note { uint16_t freq; uint16_t ms; };
 #define OLED_B_Y1              63
 #define OLED_B_BASELINE        62
 #define OLED_B_X                2     /* left aligned               */
+/* PART F. A short vertical rule between the watts and the amps,
+ * with OLED_B_SEP_PAD of clear space each side. The two values are
+ * measured at runtime and the total is asserted against OLED_A_W,
+ * so nothing can grow into the arrow lane. */
+#define OLED_B_SEP_H            8     /* rule height, px            */
+#define OLED_B_SEP_PAD          4     /* clear space each side      */
+#define OLED_B_IDLE_A        0.2f     /* |A| below this reads as 0  */
 #define OLED_IDLE_W           5.0f    /* |W| below this reads as 0   */
 
 /* Arrow lane. Reserved x 112..127, full height, no divider drawn.
@@ -1439,6 +1509,12 @@ struct Note { uint16_t freq; uint16_t ms; };
 #define OLED_WIDTH          128
 #define OLED_HEIGHT         64
 #define OLED_I2C_HZ         400000UL /* fast mode; short wires only  */
+/* PART G. The panel is mounted upside down, so the buffer is
+ * rotated 180 degrees before it is sent. The region map below is
+ * unchanged -- u8g2 rotates the finished frame, so every coordinate
+ * in this file still means what it says. See the report for what
+ * this does to the physical position of the arrow lane. */
+#define OLED_ROTATION       U8G2_R2
 
 /* ------------------------------------------------------------
  *  9. TRAVEL MODE
@@ -1458,12 +1534,9 @@ struct Note { uint16_t freq; uint16_t ms; };
 #endif
 
 #define TRAVEL_SWITCH_ACTIVE_LOW 1   /* switch shorts the pin to GND    */
-#define TRAVEL_DEBOUNCE_MS       500UL
+#define TRAVEL_DEBOUNCE_MS        50UL  /* part E: 50 ms, millis() based */
 
-#define TRAVEL_ON_HOUR    18         /* lights on  18:00                */
-#define TRAVEL_ON_MIN      0
-#define TRAVEL_OFF_HOUR   23         /* lights off 23:30                */
-#define TRAVEL_OFF_MIN    30
+/* The travel schedule itself lives in section 8n. */
 
 /* ------------------------------------------------------------
  *  10. SAFETY CHECKS - do not edit below
@@ -1497,8 +1570,8 @@ struct Note { uint16_t freq; uint16_t ms; };
 #if (RELAY_LOAD_PIN >= 0) && ((RELAY_LOAD_PIN == RELAY_UTILITY_PIN) || (RELAY_LOAD_PIN == RELAY_SOLAR_PIN))
   #error "RELAY_LOAD_PIN collides with a source relay."
 #endif
-#if SOC_LOAD_CUTOFF >= SOC_BUZZER_WARN
-  #error "SOC_BUZZER_WARN must be above SOC_LOAD_CUTOFF or the buzzer never warns before shutdown."
+#if LOAD_CUT_SOC >= SOC_BUZZER_WARN
+  #error "SOC_BUZZER_WARN must sit above LOAD_CUT_SOC or the buzzer never warns before the load is shed."
 #endif
 
 /* ---- v5 additions ---- */
@@ -1514,20 +1587,19 @@ struct Note { uint16_t freq; uint16_t ms; };
 #if SOC_CRITICAL > SOC_CEB_ON
   #error "SOC_CRITICAL is the last-resort backstop and must be at or below SOC_CEB_ON."
 #endif
-/* SOC_LOAD_CUTOFF (35%) and SOC_CEB_ON (18%) are NOT in conflict --
- * they are two stages of the same escalation, on two different
- * relays, and both were specified deliberately:
+/* PATCH 6 PART C. The 35% load cutoff is GONE, not reduced.
  *
- *   38%  buzzer warns
- *   35%  RELAY_LOAD_PIN opens -> the discretionary circuit is shed,
- *        which slows the drain without touching the rest of the house
- *   18%  SOURCE relay -> CEB, the whole house moves to mains
+ * It shed the house's discretionary circuit at 35% -- a pack that
+ * is two thirds full -- while CEB was not due until 18%. In
+ * practice that meant the lights went out every evening on a pack
+ * with plenty left, for no benefit: CEB picks the house up at 18%
+ * anyway, so the shed bought nothing.
  *
- * So the pack is defended twice before mains is ever used, which is
- * exactly the solar-first behaviour this system is for. The only
- * orderings that would actually be unsafe are guarded above
- * (SOC_CEB_OFF > SOC_CEB_ON > SOC_CRITICAL). */
-
+ * What replaces it is LOAD_CUT_SOC (section 8u): a single deep
+ * emergency trip at 10%, for the case where CEB is already on but
+ * the utility ITSELF is absent -- a brownout or an outage -- so the
+ * pack is carrying everything and the load genuinely must go.
+ */
 #if OLED_ENABLE
   #if defined(CONFIG_IDF_TARGET_ESP32)
     #if (OLED_SDA_PIN >= 6) && (OLED_SDA_PIN <= 11)
@@ -1552,8 +1624,8 @@ struct Note { uint16_t freq; uint16_t ms; };
 #endif
 
 /* ---- v6 guards ---- */
-#if SOC_EMERGENCY > SOC_LOAD_CUTOFF
-  #error "SOC_EMERGENCY must be at or below SOC_LOAD_CUTOFF: the load is shed first, the emergency alarm is the last-resort shout."
+#if SOC_EMERGENCY < LOAD_CUT_SOC
+  #error "SOC_EMERGENCY must sit at or above LOAD_CUT_SOC: the alarm warns before the load is shed, not after."
 #endif
 #if PV_POOR_MINUTES >= PV_GOOD_MINUTES
   #error "PV_POOR_MINUTES must be below PV_GOOD_MINUTES or the PV verdict is ambiguous."
@@ -1606,21 +1678,16 @@ struct Note { uint16_t freq; uint16_t ms; };
 #if OLED_SOC_BASELINE > OLED_A_Y1
   #error "The SoC baseline sits below the top area."
 #endif
-/* NOTE, not an error. On this build the lights share
- * RELAY_LOAD_PIN with the protected load circuit, and loadCutoff
- * already opens that relay at SOC_LOAD_CUTOFF (35%). So with
- * LIGHTS_CUTOFF_SOC at the requested 25% the lights are ALREADY
- * off by the time this guard would fire -- it is a backstop, and
- * it only becomes the operative rule if SOC_LOAD_CUTOFF is ever
- * lowered below it, or if the lights are moved to their own relay.
- * Raise LIGHTS_CUTOFF_SOC above SOC_LOAD_CUTOFF to shed lighting
- * BEFORE the rest of the load circuit. Flagged in the report. */
-#if LIGHTS_CUTOFF_SOC + LIGHTS_CUTOFF_HYST > 100
-  #error "The lights cutoff can never re-arm."
+#if LOAD_CUT_SOC + LOAD_CUT_HYST > 100
+  #error "The load cut can never release."
 #endif
-#if LIGHTS_OFF_HOUR > 23 || LIGHTS_FALLBACK_ON_HOUR > 23
-  #error "Lights schedule hours must be 0-23."
+#if LOAD_CUT_SOC >= SOC_CEB_ON
+  #error "LOAD_CUT_SOC must sit BELOW SOC_CEB_ON: CEB is the first response to a low pack, shedding the load is the last."
 #endif
+#if TRAVEL_LIGHTS_ON_H > 23 || TRAVEL_LIGHTS_OFF_H > 23
+  #error "Travel schedule hours must be 0-23."
+#endif
+
 #if RESET_LOG_N < 1 || RESET_LOG_N > 32
   #error "RESET_LOG_N outside a sane range for an NVS blob."
 #endif
@@ -1636,8 +1703,8 @@ struct Note { uint16_t freq; uint16_t ms; };
 #if CEB_HOLD_BAD_H < CEB_HOLD_DEADLINE_H
   #error "The extended hold deadline cannot be earlier than the normal one."
 #endif
-#if NIGHT_SOC_WARN <= SOC_LOAD_CUTOFF
-  #error "The night warning must sit above the load cutoff, or protection fires first and the warning is never useful."
+#if NIGHT_SOC_WARN <= LOAD_CUT_SOC
+  #error "The night warning must sit above the load cut, or the load sheds before the warning is ever useful."
 #endif
 #if NIGHT_SOC_WARN >= 100 || NIGHT_SOC_WARN + NIGHT_SOC_HYST > 100
   #error "The night warning can never clear."

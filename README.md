@@ -172,7 +172,7 @@ frame handler, so midnight is not missed if the Bluetooth link happens to be
 down at the time.
 
 `harvestWh` is the same number as `chgWh` unless a PV-side meter is fitted
-(`PV_ADC_ENABLE`), because without one the only place power can be measured is
+(a PV-side meter), because without one the only place power can be measured is
 the battery. See "Known limits" below.
 
 ## Monthly tab
@@ -299,7 +299,8 @@ of it. It is off by default.
 1. **Battery-side measurement only.** Daytime loads fed straight from PV never
    pass through the battery, so "harvested" undercounts true generation. Fix:
    a DC meter (PZEM-017) on the PV input, or a divider + hall sensor into ADC1
-   — the firmware already supports the second option, set `PV_ADC_ENABLE 1`.
+   — note the GPIO34/35 dividers were removed in patch 6; a PV-side meter
+     would need its own input added back.
 2. **Utility power is not metered.** `gridW` on the dashboard is the house load
    at the moment utility is carrying it, not a real energy meter reading. A
    PZEM-004T on the CEB feed would make it real.

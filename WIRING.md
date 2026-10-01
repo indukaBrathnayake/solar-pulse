@@ -94,17 +94,45 @@ Two conditions:
 
 | Function | Default pin | Notes |
 |---|---|---|
-| **Source changeover relay** | **`GPIO 25`** | `RELAY_UTILITY_PIN`. Coil OFF = solar (NC), ON = CEB (NO) |
+| **Source changeover relay** | **`GPIO 25`** | `RELAY_UTILITY_PIN`. **NORMALLY OPEN**: coil OFF = CEB disconnected (house on pack), coil ON = CEB connected |
 | Separate solar relay | *(none)* | `RELAY_SOLAR_PIN = -1` — see §0 |
-| Switched load relay | `GPIO 27` | `RELAY_LOAD_PIN`, set `-1` if unused |
-| Travel-mode switch | `GPIO 32` | `TRAVEL_SWITCH_PIN`, see below |
+| **Switched load relay** | **`GPIO 27`** | `RELAY_LOAD_PIN`. **NORMALLY CLOSED**: coil OFF = lights ON, coil ON = lights CUT |
+| Travel-mode switch | `GPIO 32` | `TRAVEL_SWITCH_PIN`, `INPUT_PULLUP`, switch to GND, see §4 |
 | Passive buzzer | `GPIO 33` | `BUZZER_PIN`, LEDC ch 0, see §5 |
 | **OLED SDA** | **`GPIO 21`** | `OLED_SDA_PIN`, I2C, see §5b |
 | **OLED SCL** | **`GPIO 22`** | `OLED_SCL_PIN`, I2C, see §5b |
-| PV voltage sense (optional) | `GPIO 34` | ADC1, input-only |
-| PV current sense (optional) | `GPIO 35` | ADC1, input-only |
+| ~~PV voltage sense~~ | `GPIO 34` | **UNUSED** — divider removed, see §6 |
+| ~~PV current sense~~ | `GPIO 35` | **UNUSED** — sensor removed, see §6 |
 
-GPIO 26 is now free (it was the old solar relay).
+GPIO 26 is free (it was the old solar relay). GPIO 34 and 35 are now
+free too; both are input-only with no internal pull-up, so leaving
+them unconnected is harmless.
+
+### The two relays are wired OPPOSITE ways round
+
+This is the single most important thing on this page.
+
+| | Coil de-energised | Coil energised |
+|---|---|---|
+| **CEB changeover** (NO) | CEB disconnected, house on the pack | CEB connected |
+| **Load / lights** (NC) | **lights ON** | **lights CUT** |
+
+So a reset, a power loss or a flat 3.3 V rail leaves the house on
+the pack *and* the lights on. Both are the correct fail-safe, and
+they are only correct because the two relays are wired oppositely.
+
+The firmware keeps these as **two separate facts**:
+
+- `RELAY_ACTIVE_LOW` — a property of the relay MODULE and its
+  trigger-level jumper. One setting, both relays.
+- `CEB_RELAY_ENERGISE_TO_CONNECT` / `LOAD_RELAY_ENERGISE_TO_CUT` —
+  a property of how each relay is WIRED into the AC side.
+
+`relayCoil()` only ever speaks in coil terms. `setSourceRelays()`
+and `setLoad()` are the only two places that convert a wanted
+*contact* state into a coil command. If you change a jumper, change
+`RELAY_ACTIVE_LOW`. If you rewire a contact, change that relay's
+arrangement constant. Never both for one change.
 
 Nothing on the BLE/BMS side changed. The BMS is Bluetooth only — no wires.
 
@@ -177,41 +205,71 @@ One SPDT changeover on the LIVE conductor. The neutrals are commoned
 ### Switched load relay
 
 ```
-   LOAD BUS Live ───┤ COM ── NO ├─── load circuit Live
+   LOAD BUS Live ───┤ COM ── NC ├─── load circuit Live
    LOAD BUS Neutral ──────────────── load circuit Neutral
 ```
+
+**Use the NC contact, not NO.** This relay is wired normally closed, so the
+lights are connected when the coil is dead. A reset, a power loss or a flat
+3.3 V rail therefore restores the lighting rather than killing it — which is
+the correct fail-safe for a lighting circuit, and the opposite of what the
+source changeover wants. See the table in §2.
 
 Feed it from the load bus, not from a source directly, so the circuit follows
 whichever source is active.
 
-This relay is also the **battery protection cutoff**: the firmware opens it at
-`SOC_LOAD_CUTOFF` (35%) regardless of the travel schedule or the web toggle,
-and closes it again at 37%. Put the discretionary loads on it — lighting,
-entertainment — not the fridge or anything that must never lose power.
+This relay carries exactly **one automatic trip**: the firmware energises the
+coil and cuts the circuit at `LOAD_CUT_SOC` (10%), restoring it above 15%.
+That trip overrides the travel schedule and any manual selection. Nothing else
+switches it automatically — there is no evening schedule in normal mode and no
+35% cutoff any more. See §5c.
+
+Put the discretionary loads on it — lighting, entertainment — not the fridge
+or anything that must never lose power.
 
 ---
 
 ## 4. Travel-mode switch
 
-A plain SPST toggle, no power of its own:
-
 ```
    GPIO 32 ──┬── switch ── GND
              │
-             └── internal pull-up (enabled in firmware)
+         (internal pull-up, no external resistor)
 ```
 
-- Closed (shorted to GND) = **travel mode on**
-- Open = normal operation
+`INPUT_PULLUP`, so an open switch reads HIGH and a closed switch
+reads LOW. Debounced in software over 50 ms on a `millis()` edge
+timer — no interrupt, no `delay()`.
 
-`pinMode(TRAVEL_SWITCH_PIN, INPUT_PULLUP)` is set in `setup()`, so no external
-resistor is needed on GPIO 32. Add a 100 nF cap across the switch if it runs
-more than a metre or two; the firmware also debounces it for 500 ms.
+| Switch | Reads | Mode |
+|---|---|---|
+| OPEN | HIGH | normal — the occupant controls the lights |
+| CLOSED | LOW | **travel** — the lights run the evening schedule |
 
-If you prefer switch-to-3V3 wiring, set `TRAVEL_SWITCH_ACTIVE_LOW 0` in
-`config.h` and add a 10 kΩ pull-down.
+**Travel mode controls the LIGHTS ONLY.** It cannot reach the source
+state machine: CEB keeps exactly its two triggers (§0 and the
+firmware's section 8p) whether the switch is open or closed.
 
----
+**What it does when closed**
+
+- Lights ON at **18:15**, OFF at **23:30** (`TRAVEL_LIGHTS_ON_H/M`,
+  `TRAVEL_LIGHTS_OFF_H/M`). Outside that window the coil stays
+  energised and the lights are off.
+- The schedule needs **only the RTC**. No WiFi, no Firebase, no
+  forecast — the whole point is that it keeps running while nobody
+  is there to notice it has stopped.
+- If the clock is not valid the lights are held **off** and it is
+  logged. No guess, no sunset estimate: an empty house lit at random
+  hours is worse than a dark one.
+- The dashboard's ON/OFF/AUTO buttons are disabled with the reason
+  written beside them. The physical switch is the only way in or out.
+- Whatever manual mode was selected before is restored when the
+  switch opens again.
+
+**What still overrides it:** the 10% load cut in §5c. Nothing else.
+
+The switch is read once in `setup()`, so the correct mode is active
+from the first second after boot — no transient, no lights flicker.
 
 ## 5. Passive buzzer (GPIO 33)
 
@@ -338,93 +396,71 @@ the glyph.
 
 ## 5c. Lighting circuit modes
 
-The lights are the **switched load relay** (`RELAY_LOAD_PIN`), and
-`travelTask()` remains its only writer — the modes below are inputs
-to that one function, not a second controller for the same GPIO.
+The lights are the switched load relay (`RELAY_LOAD_PIN`, normally
+closed), and `travelTask()` is its only writer.
 
 Precedence, highest first:
 
-| # | Rule | Source |
+| # | Rule | Effect |
 |---|---|---|
-| 1 | `loadCutoff` — battery protection at `SOC_LOAD_CUTOFF` (35%) | existing |
-| 2 | lights low-battery lockout at `LIGHTS_CUTOFF_SOC` (25%), latched, re-arms +5% | new |
-| 3 | travel mode switch and its schedule | existing |
-| 4 | `ON` / `OFF` from the dashboard | new |
-| 5 | `AUTO` — sunset to `LIGHTS_OFF_HOUR` (23:00) | new |
+| 1 | **`LOAD_CUT_SOC` (10%)** | energise the coil, cut the lights. Releases above **15%** (`+LOAD_CUT_HYST`) |
+| 2 | travel schedule | 18:15–23:30 while the switch is closed |
+| 3 | `ON` / `OFF` | the dashboard override |
+| 4 | `AUTO` | normal mode: lights simply available |
 
-**AUTO** takes sunset from the daily forecast section 8k already
-fetches — one extra field on a response that was being parsed
-anyway, no new request and no new service. With no cached sunset it
-falls back to `LIGHTS_FALLBACK_ON_HOUR` (18:30), so the lights still
-work with the internet down.
+### The one automatic trip
 
-> **Note.** On this build the lights share the protected load relay,
-> and that relay already opens at 35%. So the 25% lights cutoff is a
-> **backstop** — it only becomes the operative rule if
-> `SOC_LOAD_CUTOFF` is lowered below it, or if the lights are moved
-> to their own relay. Raise `LIGHTS_CUTOFF_SOC` above 35% to shed
-> lighting *before* the rest of the load circuit.
+`LOAD_CUT_SOC` is **not** a convenience and **not** an optimisation.
+It exists for one specific failure: the pack has drained, CEB
+engaged long ago at 18%, but **the utility itself is absent** — a
+brownout or an area outage — so the inverter is carrying the whole
+house off a nearly flat battery. At that point the discretionary
+circuit has to go.
 
-The ON/OFF/AUTO buttons live on the **on-device** dashboard, which is
-the only page with a route to the relay. The cloud dashboard reads
-Firebase and cannot reach the ESP, so it reports the mode, the
-reason and the daily runtime instead.
+It applies in **both** modes and overrides the travel schedule and
+any manual choice. It is latched with 5 points of hysteresis, so a
+pack sitting on the boundary cannot flick the lights.
 
-```
-   ESP32 3V3 ──── VCC
-   ESP32 GND ──── GND
-   GPIO 21   ──── SDA
-   GPIO 22   ──── SCL
-```
+### What was removed
 
-- **Address:** `0x3C` (most 0.96" panels). A few are `0x3D` — change
-  `OLED_ADDR` in `config.h` if `begin()` reports "not found" at boot.
-- **Pull-ups:** nearly every SSD1306 breakout has 4.7 kΩ pull-ups on board,
-  so you do not need to add any. If you daisy-chain several I2C devices,
-  remove the duplicates.
-- **Why 21/22:** they are the ESP32's default I2C pair and the only fully
-  unencumbered pins left here — not strapping pins, not bonded to the SPI
-  flash, not ADC2 (which WiFi disables), and nothing else in this project
-  uses them.
-- **3.3 V only.** Do not feed the module 5 V; the SSD1306 logic is 3.3 V.
-- Keep the wires short (< 20 cm) at the 400 kHz default, or drop
-  `OLED_I2C_HZ` to 100000.
+The old **35% load cutoff** is gone, not reduced. It shed the
+house's lighting at a pack that was two-thirds full, while CEB was
+not due until 18% — so the lights went out every evening for no
+benefit, because CEB picks the house up at 18% anyway.
 
-**It is entirely optional.** If the panel is missing, unplugged, or fails to
-initialise, the firmware logs it once, sets `oledOk = false`, and every later
-display call becomes a no-op. The controller, relays, BLE link and watchdog
-are unaffected. Set `OLED_ENABLE 0` to compile it out completely.
+The **normal-mode evening schedule** is gone too: the cached-sunset
+lookup, the fixed fallback on-time and the 23:00 off-time. Someone
+is home in normal mode and can reach a switch. Scheduling now exists
+only in travel mode, where its entire purpose is to make an empty
+house look occupied.
 
-The display also never shows a stale number: if the BMS link goes quiet it
-prints `--%` and "BMS link lost" rather than a value that is no longer true.
+## 6. PV metering — the dividers are removed
 
----
+**GPIO 34 and GPIO 35 are no longer used.** The pack-voltage divider
+and the PV current sensor have both been removed from the hardware,
+and the firmware contains no `analogRead` of any kind.
 
-## 6. Optional PV meter
+Nothing is lost. The JK BMS already supplies, over BLE:
 
-The rig has no PV-side sensor today, so "harvested" is measured at the battery:
-loads fed straight from the array during the day never pass the BMS shunt and
-are not counted. To fix it properly, wire a divider and a current sensor into
-ADC1 and set `PV_ADC_ENABLE 1`:
+- pack voltage, factory calibrated
+- every individual cell voltage
+- pack current, measured on the far side of the shunt
 
-```
-   PV +  ──┬── R1 100k ──┬── GPIO 34
-           │             │
-           │            R2 10k
-           │             │
-   PV −  ──┴─────────────┴── GND (common with ESP32 GND)
-```
+All three are better than a resistor divider read through an ESP32
+ADC, whose non-linearity needs per-chip eFuse correction to be
+trustworthy at all. The ESP32 sits beside the pack, so the BLE hop
+is short.
 
-`PV_VOLT_DIVIDER` must equal `(R1+R2)/R2` — 11.0 for the values above, giving
-about 36 V full scale. Add a 3.3 V zener across R2 as protection.
+**"Harvest" therefore means power flowing INTO the battery**, as the
+BMS measures it. Loads fed straight from the array during the day
+never pass the shunt, so harvest remains an undercount. That was
+already true before the dividers were removed and is unchanged.
 
-For current, an ACS712-30A in the array positive lead, output to GPIO 34's
-sibling GPIO 35, with `PV_CURR_MV_PER_A 66.0`. A hall sensor is simpler than a
-shunt here because it needs no isolation.
-
-Use **ADC1 pins only** (32–39). ADC2 stops working the moment WiFi is on.
-
----
+**One consequence worth knowing.** The 11.5 V CEB trigger now
+depends entirely on the BLE link. If the link drops, the filtered
+voltage is marked invalid and the voltage trigger neither fires nor
+clears — it simply has no opinion. The debounced BMS-lost failsafe
+covers that case instead. See §0 and the firmware's section 8p.
 
 ## 7. Powering the ESP32
 

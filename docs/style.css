@@ -824,3 +824,22 @@ body { padding-bottom: 96px; }
 /* Reset history table reuses the monthly table styling. */
 #reset-table td:nth-child(2) { font-weight: 600; }
 #reset-table tr.fault td:nth-child(2) { color: var(--gold-text); }
+
+/* ============================================================
+   LIGHTS CONTROL  (patch 6 part J)
+   Reuses .relay-chip so the buttons match the status chips above
+   them; only the disabled state is new.
+   ============================================================ */
+.light-ctl { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.light-ctl .relay-chip {
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  transition: opacity 0.2s ease;
+}
+.light-ctl .relay-chip.is-disabled,
+.light-ctl .relay-chip:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+}
+.travel-note { color: var(--gold-text); }

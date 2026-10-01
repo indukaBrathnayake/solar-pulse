@@ -274,34 +274,68 @@ function render() {
   const house = live.house || null;          // "CEB" | "Pack"
   const onCeb = house === "CEB";
   $("src-name").textContent = fresh && house ? house : "--";
-  $("src-why").textContent = live.why
+  /* PART J.4. CEB has exactly two automatic ways on, so name the
+     one that actually fired rather than echoing an internal phrase.
+     Manual selection is still labelled as manual. */
+  let whyTxt = live.why
     ? (live.manual ? "manual · " : "automatic · ") + live.why
     : "controller not reporting";
+  if (fresh && onCeb && !live.manual) {
+    const vOn = live.vCebOn ?? 11.5;
+    if (live.packVOk && live.packV != null && live.packV <= vOn) {
+      whyTxt = `automatic · pack voltage below ${vOn.toFixed(1)} V`;
+    } else if (live.soc != null && live.cebOn != null && live.soc <= live.cebOn) {
+      whyTxt = `automatic · SOC below ${live.cebOn}%`;
+    }
+  }
+  $("src-why").textContent = whyTxt;
   chip("chip-solar", fresh && house === "Pack", "on");
   chip("chip-util",  fresh && onCeb, "warn");
   chip("chip-light", fresh && live.light,  "gold");
 
-  /* Lights. The chip shows the OUTPUT; this line shows the MODE and
-     why it is where it is, which are different facts -- in AUTO at
-     noon the lamp is off and nothing is wrong. Firmware that
-     predates these keys omits them, so the line hides rather than
-     inventing a schedule. */
+  /* PART J. The lights line carries three separate facts, in
+     priority order, because they answer different questions:
+
+       1. the 10% load cut   -- why are the lights off right now
+       2. travel mode        -- who is in charge of them
+       3. the manual mode    -- what the occupant chose
+
+     The chip above shows the OUTPUT. In travel mode at noon the
+     lamp is off and nothing is wrong, so the output alone would be
+     misleading on its own. */
   const ll = $("lights-line");
+  const travel = !!live.travel;
   if (ll) {
     const lm = live.lightMode;
     if (!fresh || !lm) {
       ll.textContent = "lights --";
-    } else if (live.lightsLow) {
-      ll.textContent = "lights off · low battery";
-    } else if (lm === "auto") {
-      ll.textContent = `lights auto · on at ${live.lightOn || "--:--"}` +
-        (live.lightSunset === false ? " (fallback, no sunset cached)" : " (sunset)") +
-        ` · off at ${live.lightOff || "--:--"}`;
+    } else if (live.loadCut) {
+      ll.textContent = `lights cut, pack below ${live.loadCutSoc ?? 10}%`;
+    } else if (travel) {
+      ll.textContent = `TRAVEL MODE ACTIVE · lights ${live.lightOn || "--:--"} to ` +
+                       `${live.lightOff || "--:--"} · switch closed`;
     } else {
-      ll.textContent = `lights forced ${lm}`;
+      ll.textContent = `TRAVEL MODE OFF · manual control available` +
+                       (lm === "auto" ? "" : ` · forced ${lm}`);
     }
   }
   if ($("light-min")) $("light-min").textContent = live.lightMin ?? 0;
+  if ($("travel-min")) $("travel-min").textContent = live.travelMin ?? 0;
+
+  /* PART J.2. The manual buttons are disabled while the physical
+     switch holds travel mode, with the reason written beside them --
+     a greyed control with no explanation is just a broken control. */
+  const tnote = $("travel-note");
+  document.querySelectorAll("#light-ctl [data-light]").forEach((b) => {
+    b.disabled = travel;
+    b.classList.toggle("is-disabled", travel);
+  });
+  if (tnote) {
+    tnote.textContent = travel
+      ? "Manual control is held by the physical travel switch. Open the switch to take it back."
+      : "";
+    tnote.classList.toggle("hidden", !travel);
+  }
 
   /* PART C. The solar-day classification and, when it is holding a
      release back, the deadline it is holding to. */

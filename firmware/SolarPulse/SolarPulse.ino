@@ -63,7 +63,7 @@
  *   - 3 s dashboard latency: netTask keeps one TLS session open
  *     and reuses it instead of handshaking on every push.
  *   - Passive buzzer: warns at SOC_BUZZER_WARN, load relay opens
- *     at SOC_LOAD_CUTOFF. Non-blocking, LEDC hardware tone.
+ *     at LOAD_CUT_SOC. Non-blocking, LEDC hardware tone.
  *   - Relays are single pole / LIVE only; the neutral relays are
  *     gone and the interlock is now safety critical.
  *   - Task watchdog on all three tasks.
@@ -164,7 +164,7 @@ static BmsData bmsGet() {
 
 // ---- energy accounting (written only by the control task) ----
 static float   todayChgWh = 0, todayDisWh = 0, todayPeakW = 0;
-static float   todayPvWh  = 0;            // only used when PV_ADC_ENABLE
+static float   todayPvWh  = 0;            // retained for the stored schema
 static double  lifeChgWh  = 0, lifeDisWh  = 0;
 static int32_t dayStamp   = 0;            // YYYYMMDD of the day in progress
 static int32_t daySynced  = 0;            // last YYYYMMDD confirmed in Firebase
@@ -174,14 +174,13 @@ static bool    ntpSynced  = false;
 static float   pvW = 0;                   // instantaneous array power, W
 static float   loadW = 0;                 // instantaneous house draw, W
 
-// harvest = what actually went into storage, or true PV power when
-// a PV-side meter is fitted. See config.h section 6.
+// harvest = what actually went into storage, measured by the BMS.
+// See config.h section 6.
+// PART I. Was a choice between an ADC integration and the BMS
+// figure. There is no ADC any more, so it is simply the BMS figure.
+// todayPvWh survives only so the stored NVS schema is unchanged.
 static inline float harvestWhToday() {
-#if PV_ADC_ENABLE
-  return todayPvWh;
-#else
   return todayChgWh;
-#endif
 }
 
 // ---- link + control state ----
@@ -267,7 +266,8 @@ static uint16_t cebRelMin  = 0;           // today's release deadline, minutes
 
 // Persistence gates. Every engage/release condition passes through
 // one of these, so no transition can come from a single sample.
-static Persist  pEngage, pRelease, pCritical, pLostBms, pUrgent;
+// pCritical retired with the deep-discharge backstop (part B.5).
+static Persist  pEngage, pRelease, pLostBms, pUrgent;
 // Voltage floor (8p) and the solar-day classifier (8q). Both use the
 // same debounce discipline as everything else in section 12.
 static Persist  pVoltLow, pVoltOk, pPoorDay, pGoodDay;
@@ -319,9 +319,12 @@ static volatile bool bleBusy = false;
 static bool     travelMode  = false;
 static bool     lightOn     = false;      // switched load circuit state
 static LightMode lightMode  = LIGHT_AUTO; // web override, AUTO by default
-static bool     lightsLow   = false;      // latched low-battery lockout
+static LightMode lightModeBeforeTravel = LIGHT_AUTO;  // restored on exit
+static uint32_t travelSecToday = 0;       // travel-mode runtime today
 static uint32_t lightSecToday = 0;        // lights runtime today, seconds
-static bool     loadCutoff  = false;      // true = protection has opened the load
+// PART D. The one automatic load trip. Latched with hysteresis so a
+// SoC sitting on the boundary cannot flick the lights.
+static bool     loadCut     = false;      // true = load shed at LOAD_CUT_SOC
 static bool     emergAlarm  = false;      // latched 10% + discharging
 // Night alarm (config.h 8r). DISPLAY AND BUZZER ONLY -- no part of
 // section 12 reads any of these.
@@ -777,29 +780,19 @@ static void bleTask(void*) {
 // ============================================================
 //  SECTION 5 - PV METERING + ENERGY INTEGRATION
 // ============================================================
+// PART I. The GPIO34/35 dividers are gone from the hardware, and so
+// is the code that read them -- no analogRead survives anywhere in
+// this file. Harvest is what the BMS measures flowing INTO the pack,
+// which is the only calibrated number available and the one every
+// other consumer already used.
 static float readPvWatts(const BmsData& b) {
-#if PV_ADC_ENABLE
-  (void)b;
-  float mv = analogReadMilliVolts(PV_VOLT_PIN) * PV_VOLT_DIVIDER;
-  float v  = mv / 1000.0f;
-  float i  = (analogReadMilliVolts(PV_CURR_PIN) - PV_CURR_ZERO_MV) / PV_CURR_MV_PER_A;
-  if (i < 0) i = 0;
-  return v * i;
-#else
-  // no PV meter: everything that flows into the pack is harvest
   return b.packW > 0 ? b.packW : 0;
-#endif
 }
 
-// v7: reads the FILTERED array power, not the instantaneous value.
-// pvW crosses SOLAR_OK_W every time an appliance starts, which used
-// to be enough to flip the deep-discharge backstop.
-static bool solarProducing() {
-  struct tm tmv;
-  bool haveTime = localNow(&tmv);
-  bool daylight = !haveTime || (tmv.tm_hour >= PV_HOUR_START && tmv.tm_hour < PV_HOUR_END);
-  return bmsFresh() && daylight && pvFilt > SOLAR_OK_W;
-}
+// solarProducing() retired with the deep-discharge backstop that was
+// its only caller (patch 6 part B.5). Nothing else in the firmware
+// needed "is the array working right now" as a boolean -- the CEB
+// release path uses the filtered charge power directly.
 
 // ---- v7: measurement stabilisation (config.h section 8j) --------
 //
@@ -966,6 +959,7 @@ static void saveCounters() {
   prefs.putInt("adj", clockAdj);
   prefs.putUInt("us", utilitySecToday);
   prefs.putUInt("ls", lightSecToday);
+  prefs.putUInt("ts", travelSecToday);
   prefs.putInt("pvg", pvGoodMin);      // PV evidence survives a midday reboot
   prefs.putLong64("ep", (int64_t)nowEpoch());
 }
@@ -1058,6 +1052,7 @@ static void loadCounters() {
   clockAdj   = prefs.getInt("adj", 0);
   utilitySecToday = prefs.getUInt("us", 0);
   lightSecToday   = prefs.getUInt("ls", 0);
+  travelSecToday  = prefs.getUInt("ts", 0);
   pvGoodMin = prefs.getInt("pvg", 0);
   // Restore an approximate clock from NVS -- but ONLY if the RTC is
   // not already running. After a soft reset the RTC survived and is
@@ -1126,8 +1121,9 @@ static int buildLiveJson(char* out, size_t cap) {
     "\"solarDay\":\"%s\",\"solarRatio\":%d,\"cebHold\":%s,\"cebHoldTill\":\"%02d:%02d\","
     "\"nightAlarm\":%s,\"nightWarn\":%d,"
     "\"srcRestored\":%s,\"xferBurst\":%s,\"heapMin\":%lu,\"resets\":%s,"
-    "\"lightMode\":\"%s\",\"lightMin\":%lu,\"lightsLow\":%s,"
-    "\"lightOn\":\"%02d:%02d\",\"lightOff\":\"%02d:%02d\",\"lightSunset\":%s,"
+    "\"lightMode\":\"%s\",\"lightMin\":%lu,\"loadCut\":%s,"
+    "\"travel\":%s,\"travelMin\":%lu,\"loadCutSoc\":%d,"
+    "\"lightOn\":\"%02d:%02d\",\"lightOff\":\"%02d:%02d\","
     "\"tomCond\":\"%s\",\"tomText\":\"%s\",\"tomConf\":\"%s\","
     "\"tomWh\":%.0f,\"tomPct\":%d,"
     "\"pvGoodMin\":%d,\"pvVerdict\":\"%s\","
@@ -1178,10 +1174,10 @@ static int buildLiveJson(char* out, size_t cap) {
     srcRestored ? "true" : "false", xferBurst ? "true" : "false",
     (unsigned long)ESP.getMinFreeHeap(), resets,
     lightModeName(), (unsigned long)(lightSecToday / 60),
-    lightsLow ? "true" : "false",
-    lightsOnMinute() / 60, lightsOnMinute() % 60,
-    lightsOffMinute() / 60, lightsOffMinute() % 60,
-    lightsHaveSunset() ? "true" : "false",
+    loadCut ? "true" : "false",
+    travelMode ? "true" : "false", (unsigned long)(travelSecToday / 60), LOAD_CUT_SOC,
+    travelLightsOnMinute() / 60, travelLightsOnMinute() % 60,
+    travelLightsOffMinute() / 60, travelLightsOffMinute() % 60,
     wxCondKey((WxCond)predTomorrow().cond), predCondWord((WxCond)predTomorrow().cond),
     predConfWord(predTomorrow()),
     predTomorrow().predWh, predTomorrow().pct,
@@ -1190,7 +1186,7 @@ static int buildLiveJson(char* out, size_t cap) {
     srcPhase == SRCP_WAIT ? "starting" : "running",
     (unsigned long)((srcEverSet && millis() - srcSince < SOURCE_MIN_DWELL_MS)
                     ? (SOURCE_MIN_DWELL_MS - (millis() - srcSince)) / 1000UL : 0UL),
-    loadCutoff ? "true" : "false", (unsigned)buzzMode, emergAlarm ? "true" : "false",
+    loadCut ? "true" : "false", (unsigned)buzzMode, emergAlarm ? "true" : "false",
     bmsFresh() ? "true" : "false",
     bleStateName(bleState), (unsigned long)bleReconnects,
     WiFi.RSSI(), bufferedLines,
@@ -1533,6 +1529,7 @@ static void rolloverCheck() {
   todayMinSoc = 100;
   utilitySecToday = 0;
   lightSecToday = 0;
+  travelSecToday = 0;
   pvGoodMin = 0;                   // today's PV evidence starts empty
   pvAccumMs = 0;
   // CEB is NOT reset here. It is a live electrical decision:
@@ -2911,20 +2908,49 @@ static void sourceRestore() {
 //  to the source relays goes through setSourceRelays(), which
 //  cannot express "both on".
 // ============================================================
-static inline void relayDrive(int pin, bool on) {
+// COIL LEVEL ONLY. "energise" means current through the coil; it
+// says NOTHING about whether that connects or disconnects the load.
+// Every caller must go through setSourceRelays() or setLoad(), which
+// are the only two places that know each relay's contact
+// arrangement. See config.h part A for the bug this separation
+// exists to prevent.
+static inline void relayCoil(int pin, bool energise) {
   if (pin < 0) return;
 #if RELAY_ACTIVE_LOW
-  digitalWrite(pin, on ? LOW : HIGH);
+  digitalWrite(pin, energise ? LOW : HIGH);
 #else
-  digitalWrite(pin, on ? HIGH : LOW);
+  digitalWrite(pin, energise ? HIGH : LOW);
+#endif
+}
+
+// The load relay is NORMALLY CLOSED: de-energised passes the load.
+// So "connect the lights" means DE-energise, and cutting them means
+// energising. Expressed through LOAD_RELAY_ENERGISE_TO_CUT rather
+// than inverted by hand, so the intent survives a future edit.
+//
+// A reset or a power loss leaves the coil dead, which restores the
+// lights. That is the correct fail-safe for a lighting circuit.
+static inline void setLoad(bool connected) {
+#if LOAD_RELAY_ENERGISE_TO_CUT
+  relayCoil(RELAY_LOAD_PIN, !connected);
+#else
+  relayCoil(RELAY_LOAD_PIN, connected);
 #endif
 }
 
 // The interlock. One argument, so no caller can ever energise both
 // source relays; SRC_NONE opens both.
+// The CEB changeover is NORMALLY OPEN: de-energised leaves CEB
+// disconnected and the house on the pack, which is the safe boot
+// state and the correct behaviour after a reset.
 static void setSourceRelays(Source s) {
-  relayDrive(RELAY_UTILITY_PIN, s == SRC_UTILITY);
-  relayDrive(RELAY_SOLAR_PIN,   s == SRC_SOLAR);
+#if CEB_RELAY_ENERGISE_TO_CONNECT
+  relayCoil(RELAY_UTILITY_PIN, s == SRC_UTILITY);
+  relayCoil(RELAY_SOLAR_PIN,   s == SRC_SOLAR);
+#else
+  relayCoil(RELAY_UTILITY_PIN, s != SRC_UTILITY);
+  relayCoil(RELAY_SOLAR_PIN,   s != SRC_SOLAR);
+#endif
 }
 
 // ------------------------------------------------------------
@@ -3058,10 +3084,24 @@ static Source decideSource() {
   //    than flatten a pack we cannot see. Now debounced, so a brief
   //    BLE gap cannot move a mains relay. Deliberately does NOT
   //    touch cebOn, so the normal machine resumes cleanly.
+#if CEB_FAILSAFE_ON_BMS_LOST
+  // THE ONE PATH THAT IS NEITHER OF THE TWO TRIGGERS, kept
+  // deliberately and documented in config.h 8p.
+  //
+  // With the BLE link down socStableVal is -1 and packVOk is false,
+  // so BOTH triggers below are blind -- there is nothing left to
+  // protect the pack. It is debounced by SRC_ENGAGE_HOLD_MS, so it
+  // cannot fire on a momentary gap, and it CANNOT fire while the
+  // link is healthy: bmsLost() is false whenever a frame has
+  // arrived inside BMS_STALE_MS, and the gate resets on any false.
+  //
+  // Set CEB_FAILSAFE_ON_BMS_LOST to 0 for literally two triggers.
   if (pLostBms.hold(bmsLost(), SRC_ENGAGE_HOLD_MS, now)) {
     srcReason = "BMS link lost, failsafe to CEB";
+    srcLastReason = SR_BMS_LOST;
     return SRC_UTILITY;
   }
+#endif
   if (!haveSoc) {
     // Stale or unvalidated: hold position. Never substitute 0%.
     srcReason = "waiting for valid BMS data";
@@ -3198,21 +3238,22 @@ static Source decideSource() {
     cebSolarHold = false;
   }
 
-  // 6. Deep-discharge backstop, independent of every schedule and
-  //    debounced so a single sample cannot invoke it. solarProducing()
-  //    now reads the filtered array power, so an appliance starting
-  //    is no longer momentarily indistinguishable from nightfall.
-  if (!cebOn) {
-    bool critical = soc <= SOC_CRITICAL && !solarProducing();
-    if (pCritical.hold(critical, SRC_CRITICAL_HOLD_MS, now)) {
-      cebOn    = true;
-      cebSince = now;
-      pCritical.reset();
-      Serial.printf("[ceb] ON  soc=%d%% CRITICAL, no sun\n", soc);
-    }
-  } else {
-    pCritical.reset();
-  }
+  // 6. REMOVED IN PATCH 6 (part B.5): the SOC_CRITICAL deep-discharge
+  //    backstop. It set cebOn when the SoC reached SOC_CRITICAL (12%)
+  //    with no sun -- a THIRD automatic way in, and the brief allows
+  //    exactly two.
+  //
+  //    Nothing is lost by deleting it. SOC_CRITICAL is 12% and
+  //    SOC_CEB_ON is 18%, so any pack falling toward 12% has already
+  //    crossed the SoC floor and CEB is already on; the block could
+  //    only ever fire on a pack that jumped from above 18% to below
+  //    12% between two control ticks, which socUpdate()'s
+  //    SOC_MAX_JUMP validation rejects outright.
+  //
+  //    SOC_CRITICAL itself survives in relayTask(), where it still
+  //    lets an ALREADY-DECIDED transfer skip the dwell. That is
+  //    transfer protection, not a turn-on reason, and it is on the
+  //    locked list.
 
   if (cebOn) {
     srcReason = (packVOk && packVFilt <= PACK_V_CEB_ON) ? "pack voltage at the floor"
@@ -3424,14 +3465,23 @@ static void protectionUpdate() {
   if (socStableVal < 0) return;
   int soc = socStableVal;
 
-  if (loadCutoff) {
-    if (soc >= SOC_LOAD_CUTOFF + SOC_ALARM_HYST) {
-      loadCutoff = false;
-      Serial.printf("[prot] SoC %d%%, load reconnected\n", soc);
+  // PART D. The ONLY automatic load trip. No time of day, no
+  // schedule, no mode: it applies in normal operation and in travel
+  // mode alike, and it overrides both.
+  //
+  // This is the deep case -- the pack has drained, CEB engaged long
+  // ago at 18%, but the utility ITSELF is absent, so the inverter is
+  // carrying the house off a nearly flat battery. Shedding the
+  // discretionary circuit is the last thing left to do.
+  if (loadCut) {
+    if (soc >= LOAD_CUT_SOC + LOAD_CUT_HYST) {
+      loadCut = false;
+      Serial.printf("[prot] SoC %d%%, load restored (above %d%%)\n",
+                    soc, LOAD_CUT_SOC + LOAD_CUT_HYST);
     }
-  } else if (soc <= SOC_LOAD_CUTOFF) {
-    loadCutoff = true;
-    Serial.printf("[prot] SoC %d%%, LOAD DISCONNECTED\n", soc);
+  } else if (soc <= LOAD_CUT_SOC) {
+    loadCut = true;
+    Serial.printf("[prot] SoC %d%%, LOAD SHED (at or below %d%%)\n", soc, LOAD_CUT_SOC);
   }
 
   // ---- emergency: the pack is being drained while critically low ----
@@ -3507,7 +3557,7 @@ static void protectionUpdate() {
 
   BuzzTone want;
   if (emergAlarm)                    want = BUZZ_EMERG;
-  else if (loadCutoff)               want = BUZZ_ALARM;
+  else if (loadCut)                  want = BUZZ_ALARM;
   // Below the two protection tones on purpose: a disconnected load
   // is a louder fact than a forecast about tonight.
   else if (nightAlarm)               want = BUZZ_NIGHT;
@@ -3569,66 +3619,40 @@ static void buzzerTick() {
 }
 
 // ============================================================
-//  SECTION 14 - TRAVEL MODE + LOAD RELAY
+//  SECTION 14 - LOAD RELAY + TRAVEL MODE
 //
-//  The load relay serves two masters. Battery protection wins:
-//  below SOC_LOAD_CUTOFF the circuit is opened no matter what the
-//  schedule or the web toggle say.
+//  The load relay is NORMALLY CLOSED and travelTask() is its only
+//  writer. Precedence, highest first:
+//
+//    1. LOAD_CUT_SOC (10%)  the one automatic trip, both modes
+//    2. travel schedule     18:15-23:30 while the switch is closed
+//    3. LIGHT_ON / OFF      the dashboard override
+//    4. LIGHT_AUTO          normal mode: lights simply available
+//
+//  Travel mode controls the LIGHTS ONLY. It cannot reach the source
+//  state machine: nothing in this section writes srcActual, cebOn,
+//  manualSrc or either source relay pin.
 // ============================================================
-static bool inTravelWindow(const struct tm& tmv) {
-  int nowMin = tmv.tm_hour * 60 + tmv.tm_min;
-  int onMin  = TRAVEL_ON_HOUR  * 60 + TRAVEL_ON_MIN;
-  int offMin = TRAVEL_OFF_HOUR * 60 + TRAVEL_OFF_MIN;
-  if (onMin <= offMin) return nowMin >= onMin && nowMin < offMin;
-  return nowMin >= onMin || nowMin < offMin;
-}
-
-// ---- lights policy (config.h 8n) --------------------------------
+// ---- load / lights policy (config.h 8n) --------------------------
 //
-// These are INPUTS to travelTask(), which remains the only writer of
+// INPUTS to travelTask(), which remains the only writer of
 // RELAY_LOAD_PIN. Nothing here touches the source state machine.
+//
+// PART C removed the normal-mode schedule entirely: the cached
+// sunset lookup, the fixed fallback time and the 23:00 off-time are
+// all gone. Someone is home in normal mode and can reach a switch.
+// Scheduling now exists only in travel mode.
 
-// AUTO switch-on: today's cached sunset, or the fixed fallback.
-int lightsOnMinute() {
-  if (timeReady()) {
-    const WxDay* d = wxFind(dateStamp(nowEpoch()));
-    if (d && d->sunsetMin) return d->sunsetMin;
-  }
-  return LIGHTS_FALLBACK_ON_HOUR * 60 + LIGHTS_FALLBACK_ON_MIN;
-}
+// Travel-mode window, RTC only. No WiFi, no Firebase, no forecast --
+// the whole point is that it keeps running when nobody is there.
+int travelLightsOnMinute()  { return TRAVEL_LIGHTS_ON_H  * 60 + TRAVEL_LIGHTS_ON_M; }
+int travelLightsOffMinute() { return TRAVEL_LIGHTS_OFF_H * 60 + TRAVEL_LIGHTS_OFF_M; }
 
-int lightsOffMinute() { return LIGHTS_OFF_HOUR * 60 + LIGHTS_OFF_MIN; }
-
-// Is the cached sunset real, or are we on the fallback? Reported so
-// the dashboard can say which.
-bool lightsHaveSunset() {
-  if (!timeReady()) return false;
-  const WxDay* d = wxFind(dateStamp(nowEpoch()));
-  return d && d->sunsetMin;
-}
-
-static bool lightsAutoWindow(const struct tm& tmv) {
+static bool travelWindow(const struct tm& tmv) {
   int nowMin = tmv.tm_hour * 60 + tmv.tm_min;
-  int on = lightsOnMinute(), off = lightsOffMinute();
+  int on = travelLightsOnMinute(), off = travelLightsOffMinute();
   if (on <= off) return nowMin >= on && nowMin < off;
   return nowMin >= on || nowMin < off;          // window crosses midnight
-}
-
-// Latched, with hysteresis: lighting is the one load a person
-// notices flicking, and an unlatched threshold at a SoC sitting on
-// the boundary would do exactly that.
-static void lightsLowUpdate() {
-  int soc = socStableVal;
-  if (soc < 0) return;                          // unknown: hold the latch
-  if (lightsLow) {
-    if (soc >= LIGHTS_CUTOFF_SOC + LIGHTS_CUTOFF_HYST) {
-      lightsLow = false;
-      Serial.printf("[lights] battery recovered to %d%%, auto control resumed\n", soc);
-    }
-  } else if (soc < LIGHTS_CUTOFF_SOC) {
-    lightsLow = true;
-    Serial.printf("[lights] OFF, pack at %d%% (below %d%%)\n", soc, LIGHTS_CUTOFF_SOC);
-  }
 }
 
 const char* lightModeName() {
@@ -3649,44 +3673,102 @@ static void lightsAccounting() {
   last = now;
 }
 
+// Travel-mode runtime, same shape, persisted beside the lights one.
+static void travelAccounting() {
+  static uint32_t last = 0;
+  static uint32_t carryMs = 0;
+  uint32_t now = millis();
+  if (last && travelMode) {
+    carryMs += now - last;
+    travelSecToday += carryMs / 1000;
+    carryMs %= 1000;
+  }
+  last = now;
+}
+
+// The debounced switch read, factored out so setup() can use the
+// same code path and come up in the right mode from the first
+// second -- no transient, no lights flicker.
+//
+// GPIO32, INPUT_PULLUP, switch to GND. CLOSED (LOW) = travel ON.
+static bool travelSwitchClosed() {
+  int raw = digitalRead(TRAVEL_SWITCH_PIN);
+#if TRAVEL_SWITCH_ACTIVE_LOW
+  return raw == LOW;
+#else
+  return raw == HIGH;
+#endif
+}
+
 static void travelTask() {
+  // ---- PART E: the physical switch is the ONLY way in or out ----
   static int lastRaw = -1;
   static uint32_t lastEdge = 0;
   int raw = digitalRead(TRAVEL_SWITCH_PIN);
   if (raw != lastRaw) { lastRaw = raw; lastEdge = millis(); }
   else if (millis() - lastEdge > TRAVEL_DEBOUNCE_MS) {
-#if TRAVEL_SWITCH_ACTIVE_LOW
-    bool closed = (raw == LOW);
-#else
-    bool closed = (raw == HIGH);
-#endif
+    bool closed = travelSwitchClosed();
     if (closed != travelMode) {
+      struct tm t;
+      bool ht = localNow(&t);
+      if (closed) {
+        // Remember what the occupant had chosen, so leaving travel
+        // mode puts them back where they were rather than on AUTO.
+        lightModeBeforeTravel = lightMode;
+      } else {
+        lightMode = lightModeBeforeTravel;
+      }
       travelMode = closed;
-      Serial.printf("[travel] %s\n", travelMode ? "ON - schedule owns the load"
-                                                : "OFF - back to normal control");
+      Serial.printf("[travel] %s at %02d:%02d%s\n",
+                    travelMode ? "ON - lights follow the evening schedule"
+                               : "OFF - manual control restored",
+                    ht ? t.tm_hour : 0, ht ? t.tm_min : 0,
+                    travelMode ? "" : (lightMode == LIGHT_ON ? " (was ON)"
+                                     : lightMode == LIGHT_OFF ? " (was OFF)" : " (was AUTO)"));
     }
   }
-
-  lightsLowUpdate();
 
   struct tm tmv;
   bool haveTime = localNow(&tmv);
 
-  // Precedence, lowest first, so the guards below can only subtract.
+  // Precedence, lowest first, so each guard below can only subtract.
   bool want;
-  if (travelMode && haveTime)      want = inTravelWindow(tmv);   // unchanged
-  else if (lightMode == LIGHT_ON)  want = true;
-  else if (lightMode == LIGHT_OFF) want = false;
-  else                             want = haveTime && lightsAutoWindow(tmv);
-
   const char* why = "";
-  if (lightsLow) { want = false; why = " (low battery)"; }
-  if (loadCutoff) { want = false; why = " (battery protection)"; }
+  if (travelMode) {
+    if (haveTime) {
+      want = travelWindow(tmv);
+    } else {
+      // PART E. No guessing and no sunset estimate: without a valid
+      // clock the schedule is unknowable, so the lights stay off and
+      // it is logged. Guessing would leave an empty house lit at
+      // random hours, which is worse than dark.
+      want = false;
+      why = " (travel mode, no valid clock)";
+      static uint32_t lastGripe = 0;
+      if (millis() - lastGripe > 60000UL) {
+        lastGripe = millis();
+        Serial.println("[travel] RTC not valid - schedule unknown, lights held OFF");
+      }
+    }
+  } else if (lightMode == LIGHT_ON)  {
+    want = true;
+  } else if (lightMode == LIGHT_OFF) {
+    want = false;
+  } else {
+    // PART D. Normal-mode AUTO is simply "available". There is no
+    // evening on-time, no night off-time and no sunset rule any
+    // more -- someone is home, and they have a switch.
+    want = true;
+  }
+
+  // PART D. The one automatic trip, above everything including the
+  // travel schedule and any manual selection.
+  if (loadCut) { want = false; why = " (pack below 10%, load shed)"; }
 
   if (want != lightOn) {
     lightOn = want;
-    relayDrive(RELAY_LOAD_PIN, lightOn);
-    Serial.printf("[load] %s%s\n", lightOn ? "ON" : "OFF", why);
+    setLoad(lightOn);
+    Serial.printf("[load] lights %s%s\n", lightOn ? "ON" : "OFF", why);
   }
 }
 
@@ -4068,23 +4150,68 @@ static void oledDrawLane(float watts, bool fresh) {
 // signed pack power the controller and the dashboard use. There is
 // no second power calculation here, and no threshold of this
 // module's own beyond the idle deadband.
-// The wattage, and nothing else. v1 printed LOAD / PV / IDLE beside
-// it; the arrow lane already says which way the energy is moving, so
-// the word was the same fact twice and it cost the number its room.
-static void oledDrawPower(float watts, bool fresh) {
-  char val[12];
+// PART F. Watts and amps, separated by a short vertical rule:
+//
+//     124 W | 10.4 A
+//
+// Both values come from the SAME bmsGet() snapshot the controller
+// uses. Current is b.packI straight from the BMS -- it is NOT
+// derived from power, and there is no second calculation anywhere.
+// Magnitude only: the arrow lane already carries the direction.
+//
+// The layout is measured at runtime and must fit OLED_A_W. If it
+// does not, the amps lose their decimal first, then the separator
+// padding tightens. The font is never shrunk and the arrow lane is
+// never encroached on -- those are the two things that must not
+// degrade, so they are the two things this will not trade away.
+static void oledDrawPower(float watts, float amps, bool fresh) {
+  char vw[12], va[12];
+
   if (!fresh) {
-    // A stale link must not print a plausible-looking number.
-    snprintf(val, sizeof(val), "-- W");
+    snprintf(vw, sizeof(vw), "-- W");
   } else if (watts > -OLED_IDLE_W && watts < OLED_IDLE_W) {
-    snprintf(val, sizeof(val), "0 W");
+    snprintf(vw, sizeof(vw), "0 W");
   } else {
     // Rounded, never truncated: 184.73 W must read as 185 W.
-    snprintf(val, sizeof(val), "%d W",
-             (int)((watts < 0 ? -watts : watts) + 0.5f));
+    snprintf(vw, sizeof(vw), "%d W", (int)((watts < 0 ? -watts : watts) + 0.5f));
   }
+
+  float a = amps < 0 ? -amps : amps;
+  bool decimal = a < 10.0f;                 // 4.2 A, but 12 A
+  auto fmtA = [&](bool withDecimal) {
+    if (!fresh)                 snprintf(va, sizeof(va), "-- A");
+    else if (a < OLED_B_IDLE_A) snprintf(va, sizeof(va), "0 A");
+    else if (withDecimal)       snprintf(va, sizeof(va), "%.1f A", a);
+    else                        snprintf(va, sizeof(va), "%d A", (int)(a + 0.5f));
+  };
+  fmtA(decimal);
+
   u8g2.setFont(FONT_TXT);
-  u8g2.drawStr(OLED_B_X, OLED_B_BASELINE, val);
+  int16_t pad = OLED_B_SEP_PAD;
+  int16_t ww = (int16_t)u8g2.getStrWidth(vw);
+  int16_t wa = (int16_t)u8g2.getStrWidth(va);
+  int16_t total = OLED_B_X + ww + pad + 1 + pad + wa;
+
+  // Degrade in the stated order, and only as far as needed.
+  if (total > OLED_A_W && decimal) {
+    decimal = false; fmtA(false);
+    wa = (int16_t)u8g2.getStrWidth(va);
+    total = OLED_B_X + ww + pad + 1 + pad + wa;
+  }
+  while (total > OLED_A_W && pad > 1) {
+    pad--;
+    total = OLED_B_X + ww + pad + 1 + pad + wa;
+  }
+
+  u8g2.drawStr(OLED_B_X, OLED_B_BASELINE, vw);
+  int16_t sepX = OLED_B_X + ww + pad;
+  if (total <= OLED_A_W) {
+    // The rule sits on the text's own cap height, not the row's.
+    u8g2.drawVLine(sepX, OLED_B_BASELINE - OLED_B_SEP_H + 1, OLED_B_SEP_H);
+    u8g2.drawStr(sepX + 1 + pad, OLED_B_BASELINE, va);
+  }
+  // If it still does not fit -- which the layout test says cannot
+  // happen -- the watts alone are drawn and the lane stays clean.
 }
 
 // ---- region A: the three screens -------------------------------
@@ -4166,6 +4293,13 @@ static void oledScreenSoc() {
 // PV or the time.
 static void oledScreenSrc() {
   aCentre(FONT_SRC, srcActual == SRC_UTILITY ? "CEB" : "Pack", 36);
+  // PART H. Only this screen, only while the switch is closed, and
+  // inside the existing top area -- no new screen, no retiming.
+  if (travelMode) {
+    u8g2.setFont(FONT_SMALL);
+    int16_t w = (int16_t)u8g2.getStrWidth("TRAVEL");
+    u8g2.drawStr(OLED_A_X0 + (OLED_A_W - w) / 2, 46, "TRAVEL");
+  }
 }
 
 // Weather: 28x28 icon on the left, condition text on the right,
@@ -4401,6 +4535,10 @@ static void oledInit() {
   u8g2.setI2CAddress(OLED_ADDR << 1);     // U8g2 wants the 8-bit form
   u8g2.setBusClock(OLED_I2C_HZ);
   oledOk = u8g2.begin();
+  // PART G. The panel is mounted upside down. u8g2 rotates the
+  // FINISHED frame, so every coordinate in this file keeps its
+  // meaning -- no region, font, baseline or animation value changes.
+  u8g2.setDisplayRotation(OLED_ROTATION);
   if (!oledOk) {
     Serial.println("J: OLED begin() failed - continuing without it");
     return;
@@ -4448,7 +4586,7 @@ static void oledTick() {
   // border, no box around the power row, no divider beside the lane.
   u8g2.drawHLine(OLED_A_X0, OLED_RULE_Y, OLED_RULE_W);
 
-  oledDrawPower(b.packW, fresh);                        // power row
+  oledDrawPower(b.packW, b.packI, fresh);               // power row
   oledDrawLane(b.packW, fresh);                         // arrow lane
 
   u8g2.sendBuffer();
@@ -4638,7 +4776,8 @@ static void setupWebServer() {
       (manualSrc != SRC_NONE ? "true" : "false") +
       ",\"light\":" + (lightOn ? "true" : "false") +
       ",\"lightMode\":\"" + lightModeName() + "\"" +
-      ",\"cutoff\":" + (loadCutoff ? "true" : "false") + "}");
+      ",\"cutoff\":" + (loadCut ? "true" : "false") +
+      ",\"travel\":" + (travelMode ? "true" : "false") + "}");
   });
 
   server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest* req) {
@@ -4659,9 +4798,9 @@ static void setupWebServer() {
       cebOn ? "true" : "false", cebRelMin / 60, cebRelMin % 60,
       wxName(wxEffectiveClass()), wxTrusted() ? "true" : "false",
       wxDecisionSrc(),        /* which evidence is in force right now */
-      SOC_CRITICAL, SOC_BUZZER_WARN, SOC_LOAD_CUTOFF,
+      SOC_CRITICAL, SOC_BUZZER_WARN, LOAD_CUT_SOC,
       PACK_CAPACITY_AH, OLED_ENABLE ? "true" : "false",
-      TRAVEL_ON_HOUR, TRAVEL_ON_MIN, TRAVEL_OFF_HOUR, TRAVEL_OFF_MIN,
+      TRAVEL_LIGHTS_ON_H, TRAVEL_LIGHTS_ON_M, TRAVEL_LIGHTS_OFF_H, TRAVEL_LIGHTS_OFF_M,
       (unsigned long)(WIFI_RETRY_MAX_MS / 1000),
       (unsigned long)(OFFLINE_LOG_MS / 1000), (unsigned long)(LIVE_PUSH_MS / 1000));
     req->send(200, "application/json", buf);
@@ -4864,19 +5003,24 @@ void setup() {
   // 5 ms, so it has never been observable; but writing the safe
   // level into the latch first means the coil is never commanded on
   // at all, which is what the requirement actually asks for.
-  relayDrive(RELAY_UTILITY_PIN, false);
+  relayCoil(RELAY_UTILITY_PIN, false);
   pinMode(RELAY_UTILITY_PIN, OUTPUT);
   // RELAY_SOLAR_PIN is -1 on the v5 changeover wiring; only configure
   // it if a second physical relay actually exists.
   if (RELAY_SOLAR_PIN >= 0) {
-    relayDrive(RELAY_SOLAR_PIN, false);
+    relayCoil(RELAY_SOLAR_PIN, false);
     pinMode(RELAY_SOLAR_PIN, OUTPUT);
   }
   setSourceRelays(SRC_NONE);
   if (RELAY_LOAD_PIN >= 0) {
-    relayDrive(RELAY_LOAD_PIN, false);
+    // DE-energised, before and after the driver is enabled. On this
+    // normally-closed contact that means the lights come up ON and
+    // the coil is never pulsed -- the level is written into the
+    // latch first, so enabling the output cannot produce an edge.
+    relayCoil(RELAY_LOAD_PIN, false);
     pinMode(RELAY_LOAD_PIN, OUTPUT);
-    relayDrive(RELAY_LOAD_PIN, false);
+    relayCoil(RELAY_LOAD_PIN, false);
+    lightOn = true;                  // the contact state we just made
   }
   if (BUZZER_PIN >= 0) {
     ledcSetup(BUZZER_LEDC_CH, 2000, BUZZER_LEDC_RES);
@@ -4958,12 +5102,11 @@ void setup() {
   }
 
   {
-    int raw = digitalRead(TRAVEL_SWITCH_PIN);
-#if TRAVEL_SWITCH_ACTIVE_LOW
-    travelMode = (raw == LOW);
-#else
-    travelMode = (raw == HIGH);
-#endif
+    // PART E. Read once here so the correct mode is active from the
+    // first second after boot. Without this the first travelTask()
+    // pass would run in normal mode for one debounce period and the
+    // lights would visibly flick.
+    travelMode = travelSwitchClosed();
     Serial.printf("E: travel switch GPIO %d reads %s\n",
                   TRAVEL_SWITCH_PIN, travelMode ? "CLOSED (travel mode)" : "open (normal)");
   }
@@ -5024,11 +5167,12 @@ void loop() {
     socUpdate(b, now);      // validates SoC BEFORE anything acts on it
     etaUpdate(now);         // display-only rolling mean, no vote in anything
     solarDayUpdate(now);    // 8q: poor/normal day, input to the CEB hold only
-    protectionUpdate();     // sets loadCutoff / buzzMode from SoC
-    travelTask();           // applies loadCutoff to the load relay
+    protectionUpdate();     // sets loadCut / buzzMode from SoC
+    travelTask();           // the ONLY writer of RELAY_LOAD_PIN
     relayTask();
     utilityAccounting();
     lightsAccounting();     // lights runtime today, display only
+    travelAccounting();     // travel-mode runtime today, display only
   }
 
   if (now - tLog  >= OFFLINE_LOG_MS) { tLog  = now; logSample(); }
@@ -5042,7 +5186,7 @@ void loop() {
                   bleStateName(bleState), (unsigned long)bleReconnects,
                   WiFi.status() == WL_CONNECTED ? "up" : "down",
                   socStableVal, b.soc, b.packV, b.packI, pvFilt, srcName(srcActual),
-                  travelMode ? " travel" : "", loadCutoff ? " CUTOFF" : "",
+                  travelMode ? " travel" : "", loadCut ? " LOAD-SHED" : "",
                   bufferedLines, (unsigned long)ESP.getFreeHeap());
   }
 

@@ -7,9 +7,9 @@
 <title>Nipuna's Solar - Atabage, Udagama</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Outfit:wght@400;500;600&family=JetBrains+Mono:wght@400;600;800&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=20260923-2e1189">
+<link rel="stylesheet" href="style.css?v=20261001-9f4adf">
 </head>
-<body data-build="20260923-2e1189">
+<body data-build="20261001-9f4adf">
 
 <header class="top">
   <!-- Two lines only. The old third line (site, array size, pack
@@ -190,7 +190,15 @@
          dashboard; here the mode and its reason are reported. -->
     <p class="card-sub" id="solar-day"></p>
     <p class="card-sub" id="lights-line">lights --</p>
-    <p class="card-sub"><span id="util-min">0</span> min on CEB today · <span id="light-min">0</span> min of lights · solar <span id="pv-now">0</span> W · load <span id="load-now">0</span> W</p>
+    <!-- PART J.2 · manual control, disabled while the physical
+         travel switch is closed, with the reason written out. -->
+    <div class="light-ctl" id="light-ctl">
+      <button class="relay-chip" data-light="on">Lights on</button>
+      <button class="relay-chip" data-light="off">Lights off</button>
+      <button class="relay-chip" data-light="auto">Auto</button>
+    </div>
+    <p class="card-sub travel-note hidden" id="travel-note"></p>
+    <p class="card-sub"><span id="util-min">0</span> min on CEB today · <span id="light-min">0</span> min of lights · <span id="travel-min">0</span> min travel · solar <span id="pv-now">0</span> W · load <span id="load-now">0</span> W</p>
     <p class="card-sub tonight" id="tonight">tonight's floor --</p>
   </article>
 </section>
@@ -361,7 +369,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-<script src="app.js?v=20260923-2e1189"></script>
+<script src="app.js?v=20261001-9f4adf"></script>
 
 <!-- ============================================================
      UI glue · lives here so app.js stays 100% untouched
