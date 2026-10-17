@@ -847,6 +847,14 @@ struct HouseCommand {
 
 
 /* Pure policy shared with the native boundary tests; no GPIO/network effects. */
+typedef struct {
+  bool armed;
+  bool active;
+  uint32_t since;
+  uint32_t alarmSince;
+  int32_t notifiedDay;
+} HouseMorningState;
+
 static inline bool houseScheduleActive(int minute, int on, int off) {
   return on < off ? minute >= on && minute < off : minute >= on || minute < off;
 }
@@ -876,13 +884,7 @@ static inline bool houseMorningCandidate(bool travel, bool fresh, bool protected
   return !travel && fresh && !protectedLoad && minute >= start && minute < end &&
     chargeWatts >= minimumCharge && loadWatts >= 0 && loadWatts <= maximumIdleLoad;
 }
-typedef struct {
-  bool armed;
-  bool active;
-  uint32_t since;
-  uint32_t alarmSince;
-  int32_t notifiedDay;
-} HouseMorningState;
+
 
 /* True exactly when a new daily advisory starts. notifiedDay is persisted by caller. */
 static inline bool houseMorningTick(HouseMorningState* state, bool ready, int32_t day,
