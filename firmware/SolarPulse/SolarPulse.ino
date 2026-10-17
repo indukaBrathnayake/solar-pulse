@@ -134,7 +134,777 @@
 // only mode in which the arrow lane can be redrawn atomically.
 #include <U8g2lib.h>
 #include <time.h>
-#include "config.h"
+// PUBLIC SELF-CONTAINED RELEASE: enter your private credentials in the blank
+// configuration fields below before flashing. No project headers are needed.
+
+
+enum Source : uint8_t { SRC_NONE = 0, SRC_SOLAR = 1, SRC_UTILITY = 2 };
+
+enum WeatherClass : uint8_t {
+  WX_UNKNOWN = 0,   
+  WX_CLEAR,         
+  WX_HALF,          
+  WX_HEAVY          
+};
+
+enum WxIcon : uint8_t {
+  WI_UNKNOWN = 0,   
+  WI_SUNNY,         
+  WI_PARTLY,        
+  WI_CLOUDY,        
+  WI_LOWSUN         
+};
+
+struct PvDay {
+  int32_t stamp;        
+  uint8_t mins;         
+  uint8_t score;        
+  uint16_t wh;          
+};
+
+struct WxBias {
+  uint16_t f1000;
+  uint8_t  n;           
+};
+
+enum WxCond : uint8_t {
+  WC_UNKNOWN = 0,
+  WC_SUNNY,             
+  WC_PARTLY,            
+  WC_CLOUDY,            
+  WC_FOG,
+  WC_RAIN,
+  WC_HEAVYRAIN,
+  WC_STORM
+};
+
+struct WxDay {
+  int32_t stamp;        
+  uint8_t cond;         
+  uint8_t cloud;        
+  int16_t precip10;     
+  uint16_t sunsetMin;   
+};
+
+enum SrcReason : uint8_t {
+  SR_NONE = 0,
+  SR_SOC_LOW,        
+  SR_CRITICAL,       
+  SR_BMS_LOST,       
+  SR_RECOVERED,      
+  SR_DEADLINE,       
+  SR_MANUAL,         
+  SR_RESTORE,        
+  SR_VOLT_LOW        
+};
+
+struct ResetRec {
+  int32_t  stamp;    
+  uint16_t upMin;    
+  uint8_t  reason;   
+  uint8_t  pad;
+  char     task[12]; 
+  uint32_t pc;       
+};
+
+enum LightMode : uint8_t {
+  LIGHT_AUTO = 0,
+  LIGHT_ON,
+  LIGHT_OFF
+};
+
+struct Persist {
+  bool     armed = false;
+  uint32_t since = 0;
+
+  bool hold(bool cond, uint32_t ms, uint32_t now) {
+    if (!cond) { armed = false; return false; }
+    if (!armed) { armed = true; since = now; return false; }
+    return (uint32_t)(now - since) >= ms;
+  }
+  uint32_t heldMs(uint32_t now) const { return armed ? (uint32_t)(now - since) : 0; }
+  void reset() { armed = false; }
+};
+
+struct PredOut {
+  bool    ok;        
+  bool    learning;  
+  bool    starred;   
+  uint8_t cond;      
+  float   baseWh;    
+  float   predWh;    
+  int     pct;       
+};
+
+enum EtaKind : uint8_t {
+  ETA_NONE = 0,      
+  ETA_EMPTY,         
+  ETA_FULL,          
+  ETA_FULL_NOW       
+};
+
+struct EtaOut {
+  EtaKind kind;
+  float   hours;
+  int     hh, mm;    
+};
+
+enum OledScreen : uint8_t {
+  OS_SOC = 0,       
+  OS_SRC,           
+  OS_WX,            
+  OS_ETA,           
+  OS_TOM,           
+  OS__COUNT
+};
+
+enum SrcPhase : uint8_t {
+  SRCP_WAIT = 0,    
+  SRCP_RUN          
+};
+
+enum BleState : uint8_t {
+  BLE_OFF = 0,      
+  BLE_IDLE,         
+  BLE_CONNECTING,   
+  BLE_DISCOVER,     
+  BLE_WAIT_DATA,    
+  BLE_STREAMING     
+};
+
+enum BuzzTone : uint8_t {
+  BUZZ_SILENT = 0,  
+  BUZZ_WARN,        
+  BUZZ_ALARM,       
+  BUZZ_EMERG,       
+  BUZZ_NIGHT,       
+  BUZZ_SOLAR        
+};
+
+struct BmsData {
+  float cell[4]       = {0};
+  float packV         = 0;
+  float packI         = 0;       
+  float packW         = 0;
+  float t1 = 0, t2 = 0, mosT = 0;
+  float balI          = 0;
+  uint8_t soc         = 0;
+  float remainAh      = 0;
+  float fullAh        = 0;
+  uint32_t cycles     = 0;
+  uint8_t soh         = 0;
+  uint32_t errBits    = 0;
+  bool chgMos = false, disMos = false, balancing = false;
+  uint32_t lastFrameMs = 0;      
+  uint32_t frameCount  = 0;      
+};
+
+struct Note { uint16_t freq; uint16_t ms; };
+
+#define WIFI_SSID       ""
+#define WIFI_PASS       ""
+
+#define BMS_MAC         "00:00:00:00:00:00"
+
+#define FIREBASE_HOST   ""
+
+#define FIREBASE_AUTH   ""
+
+#define MDNS_NAME       "solarpulse"
+
+#define WEB_USER        ""
+#define WEB_PASS        ""
+
+#define TZ_OFFSET_SEC   19800
+#define NTP_1           "pool.ntp.org"
+#define NTP_2           "time.google.com"
+
+#define LIVE_PUSH_MS       5000UL    
+#define CONTROL_TICK_MS     250UL    
+#define DAILY_PUSH_MS     60000UL    
+#define OFFLINE_LOG_MS    60000UL    
+#define NVS_SAVE_MS      300000UL    
+
+#define WIFI_RETRY_MS     20000UL    
+#define WIFI_RETRY_MAX_MS 900000UL   
+#define UPLOAD_TRY_MS     10000UL    
+
+#define TLS_IDLE_MAX_MS   45000UL
+
+#define HEAP_TLS_FLOOR    50000UL
+
+#define BMS_FRAME_TIMEOUT_MS  20000UL 
+#define BMS_NUDGE_AFTER_MS     6000UL 
+#define BMS_HANDSHAKE_MS      12000UL 
+#define BLE_BACKOFF_MIN_MS     3000UL 
+#define BLE_BACKOFF_MAX_MS    60000UL 
+#define BLE_CONNECT_TIMEOUT_S      8  
+
+#define BLE_STABLE_AFTER_MS   60000UL
+
+#define WDT_TIMEOUT_S             30
+
+#define QUEUE_FILE          "/queue.jsonl"
+#define QUEUE_POS_FILE      "/queue.pos"
+#define DAILY_FILE          "/daily.csv"
+#define HISTORY_DIR         "/h"
+
+#define QUEUE_BATCH          20      
+#define QUEUE_MAX_BYTES   300000UL   
+#define QUEUE_COMPACT_BYTES 32768UL  
+
+#define LOCAL_HISTORY_DAYS   3       
+#define DAILY_LOG_DAYS     400       
+
+#define CURRENT_DEADBAND   0.25f     
+#define PACK_CAPACITY_AH   100.0f
+
+#define GPIO34_UNUSED       34       
+#define GPIO35_UNUSED       35       
+
+#define RELAY_UTILITY_PIN   25       
+#define RELAY_SOLAR_PIN     -1       
+#define RELAY_LOAD_PIN      27       
+
+#define RELAY_ACTIVE_LOW    1        
+#define CEB_RELAY_ENERGISE_TO_CONNECT 1  
+#define LOAD_RELAY_ENERGISE_TO_CUT    1  
+
+#define RELAY_DEAD_TIME_MS  800UL
+
+#define SOURCE_MIN_DWELL_MS 180000UL
+
+#define MANUAL_OVERRIDE_MS  1800000UL
+
+#define SOC_CEB_ON          18
+
+#define SOC_CEB_OFF         25
+
+#define SOC_CEB_SAFE        55
+
+#define CEB_RELEASE_CHARGE_W  40.0f
+
+#define CEB_MIN_ON_MS       600000UL   
+
+#define CEB_CLEAR_RELEASE_HOUR    8
+#define CEB_CLEAR_RELEASE_MINUTE 30
+#define CEB_HEAVY_RELEASE_HOUR   18
+#define CEB_HEAVY_RELEASE_MINUTE 15
+
+#define CEB_EARLY_RELEASE_SOC    70
+
+#define SOC_CRITICAL        12
+
+#define SOC_BUZZER_WARN     38   
+#define SOC_ALARM_HYST       2   
+
+#define BUZZER_PIN          33   
+#define BUZZER_LEDC_CH       0   
+#define BUZZER_LEDC_RES      8   
+#define BUZZER_DUTY        128   
+
+#define BUZZER_WARN_PERIOD_MS   20000UL 
+#define BUZZER_ALARM_PERIOD_MS   5000UL 
+
+#define PV_GOOD_W             150.0f  
+#define PV_GOOD_MINUTES        90     
+#define PV_POOR_MINUTES        45     
+#define PV_VERDICT_HOUR        11     
+#define PV_WINDOW_START_HOUR    7     
+#define PV_WINDOW_END_HOUR     12
+
+#define PV_SCORE_FULL_MIN     150     
+#define PV_SCORE_SUNNY         80     
+#define PV_SCORE_PARTLY        60     
+#define PV_SCORE_CLOUDY        40     
+#define PV_PRED_YEST_PCT       50     
+#define PV_PRED_MIN_DAYS        2     
+
+#define PV_HIST_DAYS           14     
+#define PV_HIST_NVS_KEY      "pvh"    
+#define PV_HIST_TRUST_DAYS     10     
+
+#define WEATHER_ENABLE          1     
+#define WEATHER_HOST      "api.open-meteo.com"
+#define WEATHER_LAT       ""    
+#define WEATHER_LON       ""
+#define WEATHER_TZ        "Asia%2FColombo"   
+#define WEATHER_DAYS            7     
+#define WEATHER_NVS_KEY   "wxc"       
+#define WEATHER_TRUST_DAYS      5     
+#define WEATHER_REFRESH_MS 10800000UL 
+#define WEATHER_RETRY_MS    900000UL  
+#define WEATHER_MORNING_HOUR    5     
+#define WEATHER_HTTP_TIMEOUT_MS 8000
+
+#define WX_HEAVY_PRECIP_MM    4.0f    
+#define WX_HEAVY_CLOUD_PCT      85
+#define WX_CLEAR_CLOUD_PCT      55    
+
+#define WX_CONF_FRESH          60     
+#define PV_CONF_BASE           40     
+#define PV_CONF_PER_DAY         5     
+#define PV_CONF_DAY_CAP         5     
+#define PV_CONF_WINDOW         15     
+
+#define PACK_NOMINAL_V      12.8f     
+#define PACK_USABLE_WH   (PACK_NOMINAL_V * PACK_CAPACITY_AH)
+#define ETA_RESERVE_SOC   SOC_CEB_ON  
+#define ETA_AVG_MINUTES        5      
+#define ETA_MIN_W            5.0f     
+#define ETA_MAX_HOURS         24      
+#define ETA_FULL_SOC          99      
+
+#define PRED_MIN_DAYS           7     
+#define PRED_BIAS_NVS_KEY  "wxb"
+#define PRED_BIAS_MAX          20     
+#define PRED_RATIO_MIN       200      
+#define PRED_RATIO_MAX      2500
+
+#define PRED_F_SUNNY         1000
+#define PRED_F_PARTLY         850
+#define PRED_F_CLOUDY         600
+#define PRED_F_FOG            600
+#define PRED_F_RAIN           400
+#define PRED_F_HEAVYRAIN      250
+#define PRED_F_STORM          200
+
+#define PRED_STRONG           850
+#define PRED_GOOD             650
+#define PRED_WEAK             400
+
+#define LOAD_CUT_SOC           10     
+#define LOAD_CUT_HYST           5     
+
+#define TRAVEL_LIGHTS_ON_H     18
+#define TRAVEL_LIGHTS_ON_M      0     
+#define TRAVEL_LIGHTS_OFF_H    23
+#define TRAVEL_LIGHTS_OFF_M    30     
+
+#define SRC_NVS_STATE      "srcs"     
+#define SRC_NVS_EPOCH      "srct"     
+#define SRC_NVS_REASON     "srcr"     
+#define SRC_NVS_SOC        "srcq"     
+#define SRC_NVS_OPS        "srco"     
+#define RESET_LOG_NVS      "rstlog"   
+#define RESET_LOG_N            10     
+
+#define SOURCE_RESTORE_MAX_AGE_S  1800UL   
+
+#define HEAP_LOG_MS         60000UL   
+#define LOOP_STALL_MS       30000UL   
+
+#define XFER_BURST_N            3     
+#define XFER_BURST_WINDOW_MS 600000UL 
+
+#define CEB_FAILSAFE_ON_BMS_LOST 1
+
+#define PACK_V_CEB_ON_MV     11500  
+#define PACK_V_CEB_OFF_MV    12200  
+#define PACK_V_VALID_MIN_MV   8000  
+#define PACK_V_VALID_MAX_MV  16000  
+
+#define PACK_V_CEB_ON     (PACK_V_CEB_ON_MV    / 1000.0f)
+#define PACK_V_CEB_OFF    (PACK_V_CEB_OFF_MV   / 1000.0f)
+#define PACK_V_VALID_MIN  (PACK_V_VALID_MIN_MV / 1000.0f)
+#define PACK_V_VALID_MAX  (PACK_V_VALID_MAX_MV / 1000.0f)
+#define PACK_V_FILTER_TC_S  30.0f   
+
+#define POOR_DAY_RATIO        45    
+#define GOOD_SOLAR_RATIO      75    
+#define POOR_DAY_HOLD_MIN     45    
+#define GOOD_DAY_HOLD_MIN     30    
+#define CEB_HOLD_DEADLINE_H   17    
+#define CEB_HOLD_DEADLINE_M    0
+#define CEB_HOLD_BAD_H        18    
+#define CEB_HOLD_BAD_M         0
+
+#define NIGHT_CHECK_HOUR      23
+#define NIGHT_CHECK_MIN        0
+#define NIGHT_SOC_WARN        35    
+#define NIGHT_SOC_HYST         3    
+#define NIGHT_ALARM_REPEAT_MS 600000UL  
+#define NIGHT_ALARM_END_HOUR   1    
+#define NIGHT_BLINK_MS       250UL  
+
+#define BMS_ERR_IGNORE_MASK  0x00080000UL   
+
+#define WX_NVS_NEXT        "wxnext"  
+#define WX_TLS_HEADROOM    90000UL   
+#define WX_BOOT_DEFER_MS   120000UL  
+
+#define SOC_EMERGENCY          10     
+#define BUZZER_EMERG_PERIOD_MS 3000UL 
+
+#define OLED_A_X0               0
+#define OLED_A_X1             109
+#define OLED_A_W              110     
+#define OLED_A_Y0               0
+#define OLED_A_Y1              49
+
+#define OLED_RULE_Y            51
+#define OLED_RULE_W            44
+
+#define OLED_B_Y0              52
+#define OLED_B_Y1              63
+#define OLED_B_BASELINE        62
+#define OLED_B_X                2     
+
+#define OLED_B_SEP_H            8     
+#define OLED_B_SEP_PAD          4     
+#define OLED_B_IDLE_A        0.2f     
+#define OLED_IDLE_W           5.0f    
+
+#define OLED_C_X0             112
+#define OLED_C_X1             127
+#define OLED_ARROW_CX         119     
+#define OLED_ARROW_HEAD_W      11
+#define OLED_ARROW_HEAD_H       7
+#define OLED_ARROW_TAIL_H       6
+#define OLED_ARROW_H     (OLED_ARROW_HEAD_H + OLED_ARROW_TAIL_H)
+#define OLED_ARROW_GAP         32     
+#define OLED_ARROW_STEP         3     
+#define OLED_ARROW_WRAP        64     
+#define OLED_FRAME_MS        50UL     
+
+#define OLED_SOC_BASELINE      44
+#define OLED_SOC_GAP            3     
+
+#define OLED_SOC_MS         10000UL
+#define OLED_SRC_MS          2000UL
+#define OLED_WX_MS           4000UL
+#define OLED_WX_START_HOUR      6     
+#define OLED_WX_END_HOUR       14     
+#define OLED_ETA_MS          3000UL   
+#define OLED_TOM_MS          4000UL   
+#define OLED_TOM_START_HOUR    18     
+#define OLED_TOM_END_HOUR      24     
+
+#define SOC_ENGAGE_HYST         2     
+#define SOC_VALID_MIN           0     
+#define SOC_VALID_MAX         100
+#define SOC_MAX_JUMP           10     
+#define SOC_OUTLIER_CONFIRM     3     
+
+#define SRC_ENGAGE_HOLD_MS   30000UL  
+#define SRC_RELEASE_HOLD_MS  60000UL  
+#define SRC_CRITICAL_HOLD_MS  5000UL  
+
+#define SRC_STARTUP_MIN_MS   10000UL  
+#define SRC_STARTUP_MAX_MS  120000UL  
+
+#define PV_FILTER_TC_S        30.0f   
+#define SOC_TREND_PERIOD_MS  60000UL  
+#define SOC_TREND_SPAN          5     
+#define SRC_LOG_THROTTLE_MS  30000UL  
+
+#define SOLAR_OK_W          40.0f
+
+#define PV_HOUR_START        6
+#define PV_HOUR_END         19
+
+#define OLED_ENABLE         1
+#define OLED_SDA_PIN        21
+#define OLED_SCL_PIN        22
+#define OLED_ADDR           0x3C     
+#define OLED_WIDTH          128
+#define OLED_HEIGHT         64
+#define OLED_I2C_HZ         400000UL 
+
+#define OLED_ROTATION       U8G2_R2
+
+#if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32C3)
+  #define TRAVEL_SWITCH_PIN   8
+#else
+  #define TRAVEL_SWITCH_PIN   32
+#endif
+
+#define TRAVEL_SWITCH_ACTIVE_LOW 1   
+#define TRAVEL_DEBOUNCE_MS        50UL  
+
+#if defined(CONFIG_IDF_TARGET_ESP32)
+  #if (TRAVEL_SWITCH_PIN >= 6) && (TRAVEL_SWITCH_PIN <= 11)
+    #error "TRAVEL_SWITCH_PIN 6-11 is wired to the SPI flash on the classic ESP32. The board will not boot. Use 32, 33, 34 or 35."
+  #endif
+  #if (RELAY_UTILITY_PIN >= 6) && (RELAY_UTILITY_PIN <= 11)
+    #error "RELAY_UTILITY_PIN 6-11 is wired to the SPI flash on the classic ESP32."
+  #endif
+  #if (RELAY_SOLAR_PIN >= 6) && (RELAY_SOLAR_PIN <= 11)
+    #error "RELAY_SOLAR_PIN 6-11 is wired to the SPI flash on the classic ESP32."
+  #endif
+  #if (RELAY_UTILITY_PIN >= 34) || (RELAY_SOLAR_PIN >= 34)
+    #error "GPIO 34-39 are input-only on the classic ESP32 and cannot drive a relay."
+  #endif
+  #if (BUZZER_PIN >= 6) && (BUZZER_PIN <= 11)
+    #error "BUZZER_PIN 6-11 is wired to the SPI flash on the classic ESP32."
+  #endif
+  #if (BUZZER_PIN >= 34)
+    #error "GPIO 34-39 are input-only on the classic ESP32 and cannot drive a buzzer."
+  #endif
+#endif
+#if (RELAY_UTILITY_PIN == RELAY_SOLAR_PIN)
+  #error "The two source relays must be on different pins."
+#endif
+#if (BUZZER_PIN >= 0) && ((BUZZER_PIN == RELAY_UTILITY_PIN) || (BUZZER_PIN == RELAY_SOLAR_PIN) || (BUZZER_PIN == RELAY_LOAD_PIN) || (BUZZER_PIN == TRAVEL_SWITCH_PIN))
+  #error "BUZZER_PIN collides with a relay or the travel switch."
+#endif
+#if (RELAY_LOAD_PIN >= 0) && ((RELAY_LOAD_PIN == RELAY_UTILITY_PIN) || (RELAY_LOAD_PIN == RELAY_SOLAR_PIN))
+  #error "RELAY_LOAD_PIN collides with a source relay."
+#endif
+#if LOAD_CUT_SOC >= SOC_BUZZER_WARN
+  #error "SOC_BUZZER_WARN must sit above LOAD_CUT_SOC or the buzzer never warns before the load is shed."
+#endif
+
+#if SOC_CEB_OFF <= SOC_CEB_ON
+  #error "SOC_CEB_OFF must be ABOVE SOC_CEB_ON or CEB will chatter at the trigger point."
+#endif
+#if SOC_CEB_SAFE < SOC_CEB_OFF
+  #error "SOC_CEB_SAFE must be at or above SOC_CEB_OFF."
+#endif
+#if SOC_CRITICAL > SOC_CEB_ON
+  #error "SOC_CRITICAL is the last-resort backstop and must be at or below SOC_CEB_ON."
+#endif
+
+#if OLED_ENABLE
+  #if defined(CONFIG_IDF_TARGET_ESP32)
+    #if (OLED_SDA_PIN >= 6) && (OLED_SDA_PIN <= 11)
+      #error "OLED_SDA_PIN 6-11 is wired to the SPI flash on the classic ESP32."
+    #endif
+    #if (OLED_SCL_PIN >= 6) && (OLED_SCL_PIN <= 11)
+      #error "OLED_SCL_PIN 6-11 is wired to the SPI flash on the classic ESP32."
+    #endif
+    #if (OLED_SDA_PIN >= 34) || (OLED_SCL_PIN >= 34)
+      #error "GPIO 34-39 are input-only and cannot drive an I2C bus."
+    #endif
+  #endif
+  #if (OLED_SDA_PIN == OLED_SCL_PIN)
+    #error "OLED_SDA_PIN and OLED_SCL_PIN must differ."
+  #endif
+  #if (OLED_SDA_PIN == RELAY_UTILITY_PIN) || (OLED_SCL_PIN == RELAY_UTILITY_PIN) || \
+      (OLED_SDA_PIN == RELAY_LOAD_PIN)    || (OLED_SCL_PIN == RELAY_LOAD_PIN)    || \
+      (OLED_SDA_PIN == BUZZER_PIN)        || (OLED_SCL_PIN == BUZZER_PIN)        || \
+      (OLED_SDA_PIN == TRAVEL_SWITCH_PIN) || (OLED_SCL_PIN == TRAVEL_SWITCH_PIN)
+    #error "An OLED I2C pin collides with a relay, the buzzer or the travel switch."
+  #endif
+#endif
+
+#if SOC_EMERGENCY < LOAD_CUT_SOC
+  #error "SOC_EMERGENCY must sit at or above LOAD_CUT_SOC: the alarm warns before the load is shed, not after."
+#endif
+#if PV_POOR_MINUTES >= PV_GOOD_MINUTES
+  #error "PV_POOR_MINUTES must be below PV_GOOD_MINUTES or the PV verdict is ambiguous."
+#endif
+#if OLED_WX_START_HOUR >= OLED_WX_END_HOUR
+  #error "OLED weather window must start before it ends."
+#endif
+#if PV_HIST_DAYS < 3 || PV_HIST_DAYS > 31
+  #error "PV_HIST_DAYS out of range; the NVS blob is sized for a few weeks of daily records."
+#endif
+
+#if PV_SCORE_SUNNY <= PV_SCORE_PARTLY || PV_SCORE_PARTLY <= PV_SCORE_CLOUDY
+  #error "Expected-solar score cut points must be strictly descending: SUNNY > PARTLY > CLOUDY."
+#endif
+#if PV_SCORE_FULL_MIN < PV_GOOD_MINUTES
+  #error "PV_SCORE_FULL_MIN must be at least PV_GOOD_MINUTES or a merely good day already scores 100."
+#endif
+#if SOC_CEB_OFF - SOC_CEB_ON < 3
+  #error "SoC hysteresis band is too narrow to survive BMS quantisation; widen SOC_CEB_OFF."
+#endif
+#if SOURCE_MIN_DWELL_MS >= CEB_MIN_ON_MS
+  #error "SOURCE_MIN_DWELL_MS must be shorter than CEB_MIN_ON_MS or the dwell, not the CEB policy, becomes the binding constraint on a legitimate release."
+#endif
+#if SRC_STARTUP_MIN_MS >= SRC_STARTUP_MAX_MS
+  #error "SRC_STARTUP_MIN_MS must be below SRC_STARTUP_MAX_MS."
+#endif
+#if SOC_MAX_JUMP < 2 || SOC_MAX_JUMP > 50
+  #error "SOC_MAX_JUMP out of sane range."
+#endif
+#if SOC_CEB_ON + SOC_ENGAGE_HYST >= SOC_CEB_OFF
+  #error "The engage Schmitt band overlaps SOC_CEB_OFF; engage and release hysteresis would interact."
+#endif
+
+#if OLED_A_X1 >= OLED_C_X0
+  #error "The top area overlaps the reserved arrow lane."
+#endif
+#if OLED_C_X1 >= OLED_WIDTH || OLED_B_Y1 >= OLED_HEIGHT
+  #error "The region map runs off the panel."
+#endif
+#if OLED_A_Y1 >= OLED_RULE_Y || OLED_RULE_Y >= OLED_B_Y0
+  #error "The top area, the rule and the power row must not overlap."
+#endif
+#if OLED_RULE_W > OLED_A_W
+  #error "The rule is wider than the area it sits under."
+#endif
+#if OLED_A_W != (OLED_A_X1 - OLED_A_X0 + 1)
+  #error "OLED_A_W does not match OLED_A_X0..OLED_A_X1."
+#endif
+#if OLED_SOC_BASELINE > OLED_A_Y1
+  #error "The SoC baseline sits below the top area."
+#endif
+#if LOAD_CUT_SOC + LOAD_CUT_HYST > 100
+  #error "The load cut can never release."
+#endif
+#if LOAD_CUT_SOC >= SOC_CEB_ON
+  #error "LOAD_CUT_SOC must sit BELOW SOC_CEB_ON: CEB is the first response to a low pack, shedding the load is the last."
+#endif
+#if TRAVEL_LIGHTS_ON_H > 23 || TRAVEL_LIGHTS_OFF_H > 23
+  #error "Travel schedule hours must be 0-23."
+#endif
+
+#if RESET_LOG_N < 1 || RESET_LOG_N > 32
+  #error "RESET_LOG_N outside a sane range for an NVS blob."
+#endif
+#if PACK_V_CEB_OFF_MV <= PACK_V_CEB_ON_MV
+  #error "The pack-voltage release must sit ABOVE the engage threshold, or the rule has no hysteresis."
+#endif
+#if PACK_V_CEB_ON_MV <= PACK_V_VALID_MIN_MV || PACK_V_CEB_OFF_MV >= PACK_V_VALID_MAX_MV
+  #error "The voltage thresholds must lie inside the plausible-sample window."
+#endif
+#if GOOD_SOLAR_RATIO <= POOR_DAY_RATIO
+  #error "The solar recovery ratio must sit above the poor-day ratio, or the day can be both at once."
+#endif
+#if CEB_HOLD_BAD_H < CEB_HOLD_DEADLINE_H
+  #error "The extended hold deadline cannot be earlier than the normal one."
+#endif
+#if NIGHT_SOC_WARN <= LOAD_CUT_SOC
+  #error "The night warning must sit above the load cut, or the load sheds before the warning is ever useful."
+#endif
+#if NIGHT_SOC_WARN >= 100 || NIGHT_SOC_WARN + NIGHT_SOC_HYST > 100
+  #error "The night warning can never clear."
+#endif
+#if NIGHT_CHECK_HOUR > 23 || NIGHT_ALARM_END_HOUR > 23
+  #error "Night alarm hours must be 0-23."
+#endif
+#if SOURCE_RESTORE_MAX_AGE_S < 60
+  #error "A restore window under a minute defeats the purpose of persisting the source."
+#endif
+
+#if SOURCE_RESTORE_MAX_AGE_S > 86400UL
+  #error "SOURCE_RESTORE_MAX_AGE_S longer than a day is not a reboot, it is a new deployment."
+#endif
+#if OLED_ARROW_CX - OLED_ARROW_HEAD_W / 2 < OLED_C_X0 || \
+    OLED_ARROW_CX + OLED_ARROW_HEAD_W / 2 > OLED_C_X1
+  #error "The arrow head is wider than the lane it is drawn in."
+#endif
+#if OLED_ARROW_GAP * 2 != OLED_ARROW_WRAP
+  #error "Two arrows only space evenly when the gap is half the wrap."
+#endif
+#if OLED_FRAME_MS < 40
+  #error "Under 40 ms the 1 kB I2C frame cannot complete before the next one is due."
+#endif
+#if OLED_TOM_START_HOUR >= OLED_TOM_END_HOUR || OLED_TOM_END_HOUR > 24
+  #error "The outlook window must be a non-empty range ending at or before midnight."
+#endif
+#if ETA_RESERVE_SOC != SOC_CEB_ON
+  #error "The ETA reserve must BE the CEB floor, not a copy of it that can drift."
+#endif
+#if ETA_AVG_MINUTES < 1 || ETA_AVG_MINUTES > 30
+  #error "ETA_AVG_MINUTES outside a sane smoothing window."
+#endif
+#if PRED_F_SUNNY <= PRED_F_PARTLY || PRED_F_PARTLY <= PRED_F_CLOUDY || \
+    PRED_F_CLOUDY <= PRED_F_RAIN  || PRED_F_RAIN   <= PRED_F_HEAVYRAIN || \
+    PRED_F_HEAVYRAIN <= PRED_F_STORM
+  #error "Label factors must decrease monotonically from SUNNY to STORM."
+#endif
+#if PRED_STRONG <= PRED_GOOD || PRED_GOOD <= PRED_WEAK
+  #error "Confidence thresholds must decrease from STRONG to WEAK."
+#endif
+#if WEATHER_ENABLE && (WEATHER_TRUST_DAYS < 1 || WEATHER_TRUST_DAYS > WEATHER_DAYS)
+  #error "WEATHER_TRUST_DAYS must be between 1 and WEATHER_DAYS."
+#endif
+#if WEATHER_ENABLE && (WX_CLEAR_CLOUD_PCT >= WX_HEAVY_CLOUD_PCT)
+  #error "WX_CLEAR_CLOUD_PCT must sit below WX_HEAVY_CLOUD_PCT."
+#endif
+#if PV_CONF_BASE + PV_CONF_PER_DAY * PV_CONF_DAY_CAP <= WX_CONF_FRESH
+  #error "A mature PV model must be able to outrank a fresh forecast, or section 8k has no effect."
+#endif
+
+#define SOURCE_CONTROL_MANUAL 1
+#define ALARM_INDICATOR_PIN RELAY_UTILITY_PIN // GPIO25, red bulb via NO contact
+#define HOUSE_CRITICAL_SOC 5                 // strictly below 5%, any time
+#define ALARM_INDICATOR_HALF_MS 1000UL       // gentle mechanical-relay blinking
+#define HOUSE_COMMAND_POLL_MS 5000UL
+#define HOUSE_COMMAND_MAX_AGE_S 60
+
+#define MORNING_SOLAR_START_MIN (4 * 60)
+#define MORNING_SOLAR_END_MIN (8 * 60 + 15)
+#define MORNING_SOLAR_READY_W 40.0f
+#define MORNING_IDLE_LOAD_W 5.0f
+#define MORNING_SOLAR_HOLD_MS 180000UL
+#define MORNING_SOLAR_ALARM_MS 30000UL
+#define MORNING_SOLAR_REPEAT_MS 10000UL
+
+
+
+
+struct HouseCommand {
+  char id[21];
+  char session[17];
+  int mode;
+  int64_t issuedMs;
+  int64_t expiresMs;
+};
+
+
+/* Pure policy shared with the native boundary tests; no GPIO/network effects. */
+static inline bool houseScheduleActive(int minute, int on, int off) {
+  return on < off ? minute >= on && minute < off : minute >= on || minute < off;
+}
+static inline int houseSecondsToEvent(int minute, int second, int on, int off) {
+  int a = on * 60 - minute * 60 - second;
+  int b = off * 60 - minute * 60 - second;
+  if (a <= 0) a += 86400;
+  if (b <= 0) b += 86400;
+  return a < b ? a : b;
+}
+static inline bool houseWeeknight(int weekday, int minute, int arm, int end) {
+  const bool wraps = arm > end;
+  const bool inside = wraps ? minute >= arm || minute < end : minute >= arm && minute < end;
+  if (!inside) return false;
+  const int eveningDay = wraps && minute < end ? (weekday + 6) % 7 : weekday;
+  return eveningDay >= 0 && eveningDay <= 4; // Sunday through Thursday evenings.
+}
+static inline bool houseAlarmLatch(bool active, int soc, int threshold, int hysteresis) {
+  return active ? soc < threshold + hysteresis : soc < threshold;
+}
+static inline int houseAlarmPriority(bool travel, bool night, bool critical, bool morning) {
+  return travel ? 0 : critical ? 2 : night ? 1 : morning ? 3 : 0;
+}
+static inline bool houseMorningCandidate(bool travel, bool fresh, bool protectedLoad,
+    int minute, float chargeWatts, float loadWatts, int start, int end,
+    float minimumCharge, float maximumIdleLoad) {
+  return !travel && fresh && !protectedLoad && minute >= start && minute < end &&
+    chargeWatts >= minimumCharge && loadWatts >= 0 && loadWatts <= maximumIdleLoad;
+}
+typedef struct {
+  bool armed;
+  bool active;
+  uint32_t since;
+  uint32_t alarmSince;
+  int32_t notifiedDay;
+} HouseMorningState;
+
+/* True exactly when a new daily advisory starts. notifiedDay is persisted by caller. */
+static inline bool houseMorningTick(HouseMorningState* state, bool ready, int32_t day,
+    uint32_t now, uint32_t holdMs, uint32_t alarmMs) {
+  if (!ready) { state->armed = false; state->active = false; return false; }
+  if (state->active && (uint32_t)(now - state->alarmSince) >= alarmMs) state->active = false;
+  if (state->notifiedDay == day) return false;
+  if (!state->armed) { state->armed = true; state->since = now; return false; }
+  if ((uint32_t)(now - state->since) < holdMs) return false;
+  state->notifiedDay = day;
+  state->active = true;
+  state->alarmSince = now;
+  state->armed = false;
+  return true;
+}
+static inline bool houseCommandTimely(int64_t now, int64_t issued, int64_t expires, int maxAgeSeconds) {
+  return issued <= now + 5000 && expires > now && expires > issued &&
+    expires - issued <= 60000 && now - issued <= (int64_t)maxAgeSeconds * 1000;
+}
+
+// Keep this include after type declarations for Arduino's generated prototypes.
+#include <freertos/queue.h>
 
 // ============================================================
 //  SECTION 1 - SHARED DATA MODEL
@@ -333,7 +1103,17 @@ static bool     nightAcked  = false;      // cleared from the dashboard
 static uint32_t nightNextMs = 0;          // next chirp
 static int32_t  nightArmDay = 0;          // date the alarm last armed
 static BuzzTone buzzMode    = BUZZ_SILENT;
+static HouseMorningState morningState = {};
+static bool morningSolarAlarm = false;
 static uint32_t utilitySecToday = 0;
+
+// Travel commands are passed to the control loop; network callbacks never drive GPIO.
+static QueueHandle_t houseCommands = nullptr;
+static char travelSession[17] = "";
+static char houseCmdId[21] = "";
+static char houseCmdStatus[24] = "idle";
+static LightMode travelOverride = LIGHT_AUTO;
+static time_t travelOverrideUntil = 0;
 
 // ---- plumbing ----
 static Preferences prefs;
@@ -833,6 +1613,7 @@ static void packVUpdate(float v, float dt) {
 // of the same implausible value are accepted, so a genuine BMS
 // recalibration gets through within a few control ticks.
 static void socUpdate(const BmsData& b, uint32_t now) {
+  static uint32_t validatedFrame = 0;
   if (!bmsFresh()) {
     // No data is UNKNOWN. It is never 0%, and nothing downstream may
     // turn it into 0% and then act on it.
@@ -844,6 +1625,8 @@ static void socUpdate(const BmsData& b, uint32_t now) {
     return;
   }
 
+  if (b.frameCount == validatedFrame) return;
+  validatedFrame = b.frameCount;
   int raw = (int)b.soc;
   if (raw < SOC_VALID_MIN || raw > SOC_VALID_MAX) {
     socPending   = -1;                 // impossible value: drop it silently
@@ -1054,6 +1837,7 @@ static void loadCounters() {
   lightSecToday   = prefs.getUInt("ls", 0);
   travelSecToday  = prefs.getUInt("ts", 0);
   pvGoodMin = prefs.getInt("pvg", 0);
+  morningState.notifiedDay = prefs.getInt("mornDay", 0);
   // Restore an approximate clock from NVS -- but ONLY if the RTC is
   // not already running. After a soft reset the RTC survived and is
   // strictly newer; overwriting it with the last saved epoch would
@@ -1094,6 +1878,12 @@ static int buildLiveJson(char* out, size_t cap) {
   buildResetJson(resets, sizeof(resets));
   BmsData b = bmsGet();
   time_t t = nowEpoch();
+  char session[17], commandId[21], commandStatus[24];
+  DATA_LOCK();
+  strlcpy(session, travelSession, sizeof(session));
+  strlcpy(commandId, houseCmdId, sizeof(commandId));
+  strlcpy(commandStatus, houseCmdStatus, sizeof(commandStatus));
+  DATA_UNLOCK();
   return snprintf(out, cap,
     "{\"ts\":%ld,\"ntp\":%s,"
     "\"v\":%.2f,\"i\":%.2f,\"p\":%.1f,\"soc\":%u,\"remAh\":%.1f,"
@@ -1131,7 +1921,10 @@ static int buildLiveJson(char* out, size_t cap) {
     "\"loadFilt\":%.1f,\"srcPhase\":\"%s\",\"srcDwellS\":%lu,"
     "\"cutoff\":%s,\"buzz\":%u,\"emerg\":%s,"
     "\"bmsLink\":%s,\"ble\":\"%s\",\"reconn\":%lu,"
-    "\"rssi\":%d,\"buffered\":%u,\"heap\":%lu,\"up\":%lu}",
+    "\"rssi\":%d,\"buffered\":%u,\"heap\":%lu,\"up\":%lu,"
+    "\"controlVersion\":1,\"travelSession\":\"%s\",\"travelOverride\":\"%s\","
+    "\"houseCmdId\":\"%s\",\"houseCmdStatus\":\"%s\",\"sourceManual\":true,"
+    "\"morningSolar\":%s,\"morningNotified\":%s,\"cebInferred\":%s}",
     (long)t, ntpSynced ? "true" : "false",
     b.packV, b.packI, b.packW, b.soc, b.remainAh,
     b.cell[0], b.cell[1], b.cell[2], b.cell[3],
@@ -1190,7 +1983,12 @@ static int buildLiveJson(char* out, size_t cap) {
     bmsFresh() ? "true" : "false",
     bleStateName(bleState), (unsigned long)bleReconnects,
     WiFi.RSSI(), bufferedLines,
-    (unsigned long)ESP.getFreeHeap(), (unsigned long)(millis() / 1000));
+    (unsigned long)ESP.getFreeHeap(), (unsigned long)(millis() / 1000),
+    session, travelOverride == LIGHT_ON ? "on" : travelOverride == LIGHT_OFF ? "off" : "auto",
+    commandId, commandStatus,
+    morningSolarAlarm ? "true" : "false",
+    timeReady() && morningState.notifiedDay == dateStamp(t) ? "true" : "false",
+    bmsFresh() && filtInit && loadFilt <= MORNING_IDLE_LOAD_W ? "true" : "false");
 }
 
 static int buildSampleJson(char* out, size_t cap, time_t t, const BmsData& b) {
@@ -1268,7 +2066,7 @@ static bool fbRequest(const char* method, const String& path, const String& body
 }
 
 static void pushLive() {
-  static char buf[3800];
+  static char buf[4100];
   buildLiveJson(buf, sizeof(buf));
   fbRequest("PUT", "/live", buf);
 }
@@ -2821,6 +3619,14 @@ static EtaOut etaCompute() {
 //  every threshold, hysteresis band and dwell value unchanged.
 // ============================================================
 static void sourceRestore() {
+#if SOURCE_CONTROL_MANUAL
+  relayOps = prefs.getUInt(SRC_NVS_OPS, 0);
+  srcActual = SRC_SOLAR;
+  srcPhase = SRCP_RUN;
+  srcReason = "solar output selected; CEB switch is manual";
+  snprintf(srcRestoreMsg, sizeof(srcRestoreMsg), "Manual CEB wiring: GPIO25 reserved for red indicator");
+  return;
+#endif
   relayOps = prefs.getUInt(SRC_NVS_OPS, 0);
 
 #if RELAY_SOLAR_PIN < 0
@@ -2944,6 +3750,10 @@ static inline void setLoad(bool connected) {
 // disconnected and the house on the pack, which is the safe boot
 // state and the correct behaviour after a reset.
 static void setSourceRelays(Source s) {
+#if SOURCE_CONTROL_MANUAL
+  (void)s; // GPIO25 is an alarm indicator, never a source-changeover output.
+  return;
+#endif
 #if CEB_RELAY_ENERGISE_TO_CONNECT
   relayCoil(RELAY_UTILITY_PIN, s == SRC_UTILITY);
   relayCoil(RELAY_SOLAR_PIN,   s == SRC_SOLAR);
@@ -3268,6 +4078,12 @@ static Source decideSource() {
 }
 
 static void relayTask() {
+#if SOURCE_CONTROL_MANUAL
+  srcActual = SRC_SOLAR;
+  srcPhase = SRCP_RUN;
+  srcReason = "solar output selected; CEB switch is manual";
+  return;
+#endif
   uint32_t now = millis();
 
   if (inChangeover) {
@@ -3410,6 +4226,9 @@ static const Note MELODY_EMERG[] = {
   {   0, 200 }, {   0,   0 },
 };
 
+static const Note MELODY_SOLAR[] = {
+  {1200, 180}, {0, 90}, {1700, 180}, {0, 90}, {2200, 350}, {0, 0}
+};
 static const Note* melody     = nullptr;
 static uint8_t     melodyLen  = 0;
 static uint8_t     melodyIdx  = 0;
@@ -3443,10 +4262,30 @@ static void melodyStart(const Note* m, uint8_t len) {
 //   SoC <= 38          warning melody
 //   SoC <= 35          load relay opens, alarm melody
 //   recover at +2 points above each threshold
+// An advisory only: idle load is the user's CEB inference, not physical feedback.
+static void morningReminderUpdate() {
+  struct tm local;
+  const uint32_t now = millis();
+  const bool haveTime = localNow(&local);
+  bool ready = houseMorningCandidate(travelMode, bmsFresh() && socStableVal >= 0 && filtInit,
+    loadCut, haveTime ? local.tm_hour * 60 + local.tm_min : -1, pvFilt, loadFilt,
+    MORNING_SOLAR_START_MIN, MORNING_SOLAR_END_MIN, MORNING_SOLAR_READY_W, MORNING_IDLE_LOAD_W);
+  bool notify = houseMorningTick(&morningState, ready, haveTime ? dateStamp(nowEpoch()) : 0,
+    now, MORNING_SOLAR_HOLD_MS, MORNING_SOLAR_ALARM_MS);
+  morningSolarAlarm = morningState.active;
+  if (notify) {
+    prefs.putInt("mornDay", morningState.notifiedDay);
+    Serial.printf("[morning] TURN SOLAR ON: idle load %.1fW implies CEB; charge %.1fW held %lus\n",
+      loadFilt, pvFilt, (unsigned long)(MORNING_SOLAR_HOLD_MS / 1000));
+  }
+}
+
 static void protectionUpdate() {
   BmsData b = bmsGet();
 
   if (!bmsFresh()) {
+    morningState.armed = false; morningState.active = false; morningSolarAlarm = false;
+    if (buzzMode == BUZZ_SOLAR) { buzzMode = BUZZ_SILENT; melody = nullptr; buzzerOutput(0); }
     // Never act on a stale reading. Once the link has been gone
     // long enough to be called lost, silence the alarm too --
     // the load relay stays as-is until real data returns.
@@ -3484,95 +4323,40 @@ static void protectionUpdate() {
     Serial.printf("[prot] SoC %d%%, LOAD SHED (at or below %d%%)\n", soc, LOAD_CUT_SOC);
   }
 
-  // ---- emergency: the pack is being drained while critically low ----
-  //
-  // The scenario: the grid fails overnight while the controller
-  // believes CEB is carrying the house. Nobody notices, and the
-  // inverter keeps eating an already-flat battery.
-  //
-  // The trigger is DISCHARGE, not relay position, and that is a
-  // deliberate choice. Gating on "srcActual != SRC_UTILITY" would
-  // have missed the exact failure this exists for -- in that case
-  // the relay IS commanded to CEB, it is the grid behind it that
-  // is gone. Actual discharge current is direct evidence that the
-  // battery is being consumed, whatever the relay believes, and it
-  // is equally good at NOT firing when CEB genuinely has the house
-  // (then the pack simply is not discharging).
-  bool packDraining = b.packI < -CURRENT_DEADBAND;
-  if (emergAlarm) {
-    // re-arm only once the pack is genuinely out of danger
-    if (soc >= SOC_EMERGENCY + SOC_ALARM_HYST || !packDraining) {
-      emergAlarm = false;
-      Serial.printf("[prot] emergency cleared (soc %d%%, %s)\n",
-                    soc, packDraining ? "still on pack" : "pack no longer discharging");
-    }
-  } else if (soc <= SOC_EMERGENCY && packDraining) {
-    emergAlarm = true;
-    Serial.printf("[prot] EMERGENCY: soc %d%% and the pack is supplying %.0f W\n",
-                  soc, -b.packW);
+  // User policy: travel mode is quiet. The NC load protection above remains.
+  // Sunday-Thursday NIGHT is identified by the evening date, also after midnight.
+  bool eligibleNight = false;
+  struct tm t;
+  if (localNow(&t)) {
+    eligibleNight = houseWeeknight(t.tm_wday, t.tm_hour * 60 + t.tm_min,
+      NIGHT_CHECK_HOUR * 60 + NIGHT_CHECK_MIN, NIGHT_ALARM_END_HOUR * 60);
   }
-
-  // ---- PART D: the 23:00 low-pack alarm ------------------------
-  //
-  // DISPLAY AND BUZZER ONLY. Nothing below is read by decideSource()
-  // or by any relay path; it sets nightAlarm and nothing else.
-  //
-  // Arms once per calendar day at NIGHT_CHECK_HOUR if the VALIDATED
-  // SoC is under the threshold, and clears on any of: the pack
-  // recovering past the hysteresis band, an acknowledge from the
-  // dashboard, or NIGHT_ALARM_END_HOUR.
-  {
-    struct tm t;
-    if (localNow(&t)) {
-      int32_t today = dateStamp(nowEpoch());
-      int nowMin = t.tm_hour * 60 + t.tm_min;
-      int armMin = NIGHT_CHECK_HOUR * 60 + NIGHT_CHECK_MIN;
-      int endMin = NIGHT_ALARM_END_HOUR * 60;
-      // The window wraps midnight, so "inside" is >= arm OR < end.
-      bool inWindow = (nowMin >= armMin) || (nowMin < endMin);
-
-      if (nightAlarm) {
-        if (!inWindow) {
-          nightAlarm = false;
-          Serial.println("[night] window closed, alarm cleared");
-        } else if (soc >= NIGHT_SOC_WARN + NIGHT_SOC_HYST) {
-          nightAlarm = false;
-          Serial.printf("[night] pack recovered to %d%%, alarm cleared\n", soc);
-        } else if (nightAcked) {
-          nightAlarm = false;
-          Serial.println("[night] acknowledged from the dashboard");
-        }
-      } else if (inWindow && nowMin >= armMin && nightArmDay != today &&
-                 !nightAcked && soc < NIGHT_SOC_WARN) {
-        nightAlarm  = true;
-        nightArmDay = today;
-        nightNextMs = 0;
-        Serial.printf("[night] %02d:%02d pack at %d%% (below %d%%) - TURN OFF INVERTER\n",
-                      t.tm_hour, t.tm_min, soc, NIGHT_SOC_WARN);
-      }
-      // A new day re-arms the acknowledge.
-      if (nowMin >= endMin && nowMin < armMin) nightAcked = false;
-    }
+  if (travelMode) {
+    nightAlarm = false;
+    emergAlarm = false;
+    nightAcked = false;
+  } else {
+    emergAlarm = houseAlarmLatch(emergAlarm, soc, HOUSE_CRITICAL_SOC, SOC_ALARM_HYST);
+    if (!eligibleNight) { nightAlarm = false; nightAcked = false; }
+    else if (soc >= NIGHT_SOC_WARN + NIGHT_SOC_HYST) { nightAlarm = false; nightAcked = false; }
+    else if (!nightAcked) nightAlarm = houseAlarmLatch(nightAlarm, soc, NIGHT_SOC_WARN, NIGHT_SOC_HYST);
+    else nightAlarm = false;
   }
-
-  BuzzTone want;
-  if (emergAlarm)                    want = BUZZ_EMERG;
-  else if (loadCut)                  want = BUZZ_ALARM;
-  // Below the two protection tones on purpose: a disconnected load
-  // is a louder fact than a forecast about tonight.
-  else if (nightAlarm)               want = BUZZ_NIGHT;
-  else if (soc <= SOC_BUZZER_WARN)   want = BUZZ_WARN;
-  else if (buzzMode != BUZZ_SILENT && buzzMode != BUZZ_EMERG &&
-           soc < SOC_BUZZER_WARN + SOC_ALARM_HYST) want = buzzMode;
-  else                               want = BUZZ_SILENT;
+  morningReminderUpdate();
+  int priority = houseAlarmPriority(travelMode, nightAlarm, emergAlarm, morningSolarAlarm);
+  BuzzTone want = priority == 2 ? BUZZ_EMERG : priority == 1 ? BUZZ_NIGHT : priority == 3 ? BUZZ_SOLAR : BUZZ_SILENT;
 
   if (want != buzzMode) {
     buzzMode = want;
-    lastMelody = 0;                  // sound the new state at once
+    melody = nullptr;
+    buzzerOutput(0);
+    uint32_t repeat = want == BUZZ_EMERG ? BUZZER_EMERG_PERIOD_MS : want == BUZZ_SOLAR ? MORNING_SOLAR_REPEAT_MS : NIGHT_ALARM_REPEAT_MS;
+    lastMelody = millis() - repeat; // unsigned subtraction makes first burst immediate
     if (want == BUZZ_SILENT) { melody = nullptr; buzzerOutput(0); }
     Serial.printf("[buzz] %s (soc %d%%)\n",
                   want == BUZZ_EMERG ? "EMERGENCY" :
                   want == BUZZ_NIGHT ? "night low pack" :
+                  want == BUZZ_SOLAR ? "morning: turn solar on" :
                   want == BUZZ_ALARM ? "ALARM" :
                   want == BUZZ_WARN  ? "warn" : "silent", soc);
   }
@@ -3589,12 +4373,15 @@ static void buzzerTick() {
   // start the next repetition when the gap has elapsed
   if (buzzMode != BUZZ_SILENT && !melody) {
     uint32_t period = (buzzMode == BUZZ_EMERG) ? BUZZER_EMERG_PERIOD_MS
+                    : (buzzMode == BUZZ_SOLAR) ? MORNING_SOLAR_REPEAT_MS
                     : (buzzMode == BUZZ_NIGHT) ? NIGHT_ALARM_REPEAT_MS
                     : (buzzMode == BUZZ_ALARM) ? BUZZER_ALARM_PERIOD_MS
                                               : BUZZER_WARN_PERIOD_MS;
     if (now - lastMelody >= period) {
       if (buzzMode == BUZZ_EMERG)
         melodyStart(MELODY_EMERG, sizeof(MELODY_EMERG) / sizeof(Note));
+      else if (buzzMode == BUZZ_SOLAR)
+        melodyStart(MELODY_SOLAR, sizeof(MELODY_SOLAR) / sizeof(Note));
       else if (buzzMode == BUZZ_NIGHT)
         melodyStart(MELODY_NIGHT, sizeof(MELODY_NIGHT) / sizeof(Note));
       else if (buzzMode == BUZZ_ALARM)
@@ -3700,76 +4487,147 @@ static bool travelSwitchClosed() {
 #endif
 }
 
+static void newTravelSession() {
+  DATA_LOCK();
+  snprintf(travelSession, sizeof(travelSession), "%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
+  DATA_UNLOCK();
+  travelOverride = LIGHT_AUTO;
+  travelOverrideUntil = 0;
+}
+
+static void acknowledgeHouseCommand(const char* id, const char* result) {
+  DATA_LOCK();
+  strlcpy(houseCmdId, id, sizeof(houseCmdId));
+  strlcpy(houseCmdStatus, result, sizeof(houseCmdStatus));
+  DATA_UNLOCK();
+}
+
+// Reuse the Firebase TLS client, with a bounded response and no second TLS context.
+static bool readHouseCommand(String& body) {
+  if (!tlsEnsure()) return false;
+  String url = "https://" + String(FIREBASE_HOST) + "/commands/house.json";
+  if (strlen(FIREBASE_AUTH)) url += "?auth=" + String(FIREBASE_AUTH);
+  HTTPClient http;
+  http.setReuse(true);
+  http.setConnectTimeout(6000);
+  http.setTimeout(8000);
+  if (!http.begin(*tls, url)) return false;
+  int code = http.GET();
+  class LimitedStream : public Stream {
+   public:
+    String value;
+    LimitedStream() { value.reserve(512); }
+    int available() override { return 0; }
+    int read() override { return -1; }
+    int peek() override { return -1; }
+    void flush() override {}
+    size_t write(uint8_t byte) override {
+      if (value.length() >= 512) return 0;
+      value += (char)byte; return 1;
+    }
+    size_t write(const uint8_t* bytes, size_t length) override {
+      if (value.length() + length > 512) return 0;
+      return value.concat((const char*)bytes, length) ? length : 0;
+    }
+  } bounded;
+  bool ok = code == 200 && http.getSize() <= 512;
+  if (ok) {
+    int written = http.writeToStream(&bounded);
+    ok = written >= 0 && written <= 512;
+    if (ok) body = bounded.value;
+  }
+  http.end();
+  if (code <= 0) tlsDrop("command transport error");
+  else tlsLastUse = millis();
+  return ok && body.length() <= 512;
+}
+
+static String commandText(const String& body, const char* key) {
+  String raw = jsonRaw(body, key); raw.trim();
+  if (raw.length() < 2 || raw[0] != '"' || raw[raw.length() - 1] != '"') return String();
+  return raw.substring(1, raw.length() - 1);
+}
+
+static void pollHouseCommand() {
+  if (!houseCommands || !timeReady()) return;
+  static char lastSeen[21] = "";
+  String body;
+  if (!readHouseCommand(body) || body == "null") return;
+  String id = commandText(body, "id"), session = commandText(body, "session");
+  if (id.length() != 20 || session.length() != 16 || id == lastSeen) return;
+  for (size_t i = 0; i < id.length(); i++) if (!isalnum((unsigned char)id[i]) && id[i] != '-' && id[i] != '_') return;
+  for (size_t i = 0; i < session.length(); i++) if (!isxdigit((unsigned char)session[i])) return;
+  String mode = jsonRaw(body, "mode"); mode.trim();
+  if (mode != "0" && mode != "1" && mode != "2") return;
+  HouseCommand command = {};
+  strlcpy(command.id, id.c_str(), sizeof(command.id));
+  strlcpy(command.session, session.c_str(), sizeof(command.session));
+  command.mode = mode.toInt();
+  command.issuedMs = (int64_t)jsonRaw(body, "issuedAt").toDouble();
+  command.expiresMs = (int64_t)jsonRaw(body, "expiresAt").toDouble();
+  if (xQueueOverwrite(houseCommands, &command) == pdPASS) strlcpy(lastSeen, command.id, sizeof(lastSeen));
+}
+
+static void alarmIndicatorTick() {
+  const bool active = !travelMode && bmsFresh() && socStableVal >= 0 && (nightAlarm || emergAlarm);
+  relayCoil(ALARM_INDICATOR_PIN, active && ((millis() / ALARM_INDICATOR_HALF_MS) % 2 == 0));
+  if (travelMode && buzzMode != BUZZ_SILENT) {
+    buzzMode = BUZZ_SILENT; melody = nullptr; buzzerOutput(0);
+  }
+}
+
 static void travelTask() {
-  // ---- PART E: the physical switch is the ONLY way in or out ----
   static int lastRaw = -1;
   static uint32_t lastEdge = 0;
+  const uint32_t now = millis();
   int raw = digitalRead(TRAVEL_SWITCH_PIN);
-  if (raw != lastRaw) { lastRaw = raw; lastEdge = millis(); }
-  else if (millis() - lastEdge > TRAVEL_DEBOUNCE_MS) {
+  if (raw != lastRaw) { lastRaw = raw; lastEdge = now; }
+  else if (now - lastEdge >= TRAVEL_DEBOUNCE_MS) {
     bool closed = travelSwitchClosed();
     if (closed != travelMode) {
-      struct tm t;
-      bool ht = localNow(&t);
-      if (closed) {
-        // Remember what the occupant had chosen, so leaving travel
-        // mode puts them back where they were rather than on AUTO.
-        lightModeBeforeTravel = lightMode;
-      } else {
-        lightMode = lightModeBeforeTravel;
-      }
       travelMode = closed;
-      Serial.printf("[travel] %s at %02d:%02d%s\n",
-                    travelMode ? "ON - lights follow the evening schedule"
-                               : "OFF - manual control restored",
-                    ht ? t.tm_hour : 0, ht ? t.tm_min : 0,
-                    travelMode ? "" : (lightMode == LIGHT_ON ? " (was ON)"
-                                     : lightMode == LIGHT_OFF ? " (was OFF)" : " (was AUTO)"));
+      newTravelSession(); // old cloud requests can never cross a travel-mode session.
+      Serial.printf("[travel] %s (physical switch)\n", travelMode ? "ON: 18:00-23:30, remote override available" : "OFF: normal supply");
+      if (travelMode) { nightAlarm = false; emergAlarm = false; melody = nullptr; buzzMode = BUZZ_SILENT; buzzerOutput(0); }
     }
   }
-
   struct tm tmv;
   bool haveTime = localNow(&tmv);
-
-  // Precedence, lowest first, so each guard below can only subtract.
-  bool want;
-  const char* why = "";
-  if (travelMode) {
-    if (haveTime) {
-      want = travelWindow(tmv);
-    } else {
-      // PART E. No guessing and no sunset estimate: without a valid
-      // clock the schedule is unknowable, so the lights stay off and
-      // it is logged. Guessing would leave an empty house lit at
-      // random hours, which is worse than dark.
-      want = false;
-      why = " (travel mode, no valid clock)";
-      static uint32_t lastGripe = 0;
-      if (millis() - lastGripe > 60000UL) {
-        lastGripe = millis();
-        Serial.println("[travel] RTC not valid - schedule unknown, lights held OFF");
-      }
+  if (travelOverride != LIGHT_AUTO && (!haveTime || nowEpoch() >= travelOverrideUntil)) {
+    travelOverride = LIGHT_AUTO;
+    travelOverrideUntil = 0;
+    Serial.println("[travel] override ended; schedule resumed");
+  }
+  HouseCommand command = {};
+  bool received = houseCommands && xQueueReceive(houseCommands, &command, 0) == pdTRUE;
+  const char* result = "applied";
+  if (received) {
+    int64_t epochMs = (int64_t)nowEpoch() * 1000;
+    if (!travelMode) result = "travel mode off";
+    else if (!haveTime) result = "clock unavailable";
+    else if (strcmp(command.session, travelSession)) result = "old travel session";
+    else if (!houseCommandTimely(epochMs, command.issuedMs, command.expiresMs, HOUSE_COMMAND_MAX_AGE_S)) result = "command expired";
+    else if (!bmsFresh() || socStableVal < 0) result = "BMS unavailable";
+    else if (loadCut && command.mode == 1) result = "battery protection";
+    else {
+      travelOverride = command.mode == 1 ? LIGHT_ON : command.mode == 2 ? LIGHT_OFF : LIGHT_AUTO;
+      travelOverrideUntil = travelOverride == LIGHT_AUTO ? 0 : nowEpoch() +
+        houseSecondsToEvent(tmv.tm_hour * 60 + tmv.tm_min, tmv.tm_sec, travelLightsOnMinute(), travelLightsOffMinute());
     }
-  } else if (lightMode == LIGHT_ON)  {
-    want = true;
-  } else if (lightMode == LIGHT_OFF) {
-    want = false;
-  } else {
-    // PART D. Normal-mode AUTO is simply "available". There is no
-    // evening on-time, no night off-time and no sunset rule any
-    // more -- someone is home, and they have a switch.
-    want = true;
   }
-
-  // PART D. The one automatic trip, above everything including the
-  // travel schedule and any manual selection.
-  if (loadCut) { want = false; why = " (pack below 10%, load shed)"; }
-
+  bool want = true; // NC contact: normal mode supplies the house.
+  if (travelMode) {
+    want = haveTime && (travelOverride == LIGHT_ON ||
+      (travelOverride != LIGHT_OFF && houseScheduleActive(tmv.tm_hour * 60 + tmv.tm_min, travelLightsOnMinute(), travelLightsOffMinute())));
+  }
+  if (loadCut) want = false; // preserve the existing independent 10% protection.
   if (want != lightOn) {
+    setLoad(want);
     lightOn = want;
-    setLoad(lightOn);
-    Serial.printf("[load] lights %s%s\n", lightOn ? "ON" : "OFF", why);
+    Serial.printf("[house] output %s%s\n", want ? "ON" : "OFF", loadCut ? " (battery protection)" : "");
   }
+  lightMode = travelMode ? travelOverride : LIGHT_AUTO;
+  if (received) acknowledgeHouseCommand(command.id, result);
 }
 
 // ============================================================
@@ -4164,54 +5022,34 @@ static void oledDrawLane(float watts, bool fresh) {
 // padding tightens. The font is never shrunk and the arrow lane is
 // never encroached on -- those are the two things that must not
 // degrade, so they are the two things this will not trade away.
+// Balanced fixed-width watt/amp cells. Arrow lane and rotation are unchanged.
 static void oledDrawPower(float watts, float amps, bool fresh) {
-  char vw[12], va[12];
-
-  if (!fresh) {
+  char vw[16], va[16];
+  const float w = fabsf(watts), a = fabsf(amps);
+  if (!fresh || !isfinite(w) || !isfinite(a)) {
     snprintf(vw, sizeof(vw), "-- W");
-  } else if (watts > -OLED_IDLE_W && watts < OLED_IDLE_W) {
-    snprintf(vw, sizeof(vw), "0 W");
+    snprintf(va, sizeof(va), "-- A");
   } else {
-    // Rounded, never truncated: 184.73 W must read as 185 W.
-    snprintf(vw, sizeof(vw), "%d W", (int)((watts < 0 ? -watts : watts) + 0.5f));
+    if (w < OLED_IDLE_W) snprintf(vw, sizeof(vw), "0 W");
+    else if (w >= 10000) snprintf(vw, sizeof(vw), ">9kW");
+    else if (w >= 1000) snprintf(vw, sizeof(vw), "%.1fkW", w / 1000.0f);
+    else snprintf(vw, sizeof(vw), "%.0f W", w);
+    if (a < OLED_B_IDLE_A) snprintf(va, sizeof(va), "0 A");
+    else if (a >= 1000) snprintf(va, sizeof(va), ">999A");
+    else snprintf(va, sizeof(va), a < 10 ? "%.1f A" : "%.0f A", a);
   }
-
-  float a = amps < 0 ? -amps : amps;
-  bool decimal = a < 10.0f;                 // 4.2 A, but 12 A
-  auto fmtA = [&](bool withDecimal) {
-    if (!fresh)                 snprintf(va, sizeof(va), "-- A");
-    else if (a < OLED_B_IDLE_A) snprintf(va, sizeof(va), "0 A");
-    else if (withDecimal)       snprintf(va, sizeof(va), "%.1f A", a);
-    else                        snprintf(va, sizeof(va), "%d A", (int)(a + 0.5f));
+  const int16_t middle = OLED_A_X0 + OLED_A_W / 2;
+  auto drawCell = [&](const char* text, int16_t left, int16_t right) {
+    u8g2.setFont(FONT_TXT);
+    int16_t width = u8g2.getStrWidth(text);
+    if (width > right - left - 4) { u8g2.setFont(FONT_SMALL); width = u8g2.getStrWidth(text); }
+    u8g2.setClipWindow(left, OLED_B_Y0, right, OLED_B_Y1 + 1);
+    u8g2.drawStr(left + (right - left - width) / 2, OLED_B_BASELINE, text);
+    u8g2.setMaxClipWindow();
   };
-  fmtA(decimal);
-
-  u8g2.setFont(FONT_TXT);
-  int16_t pad = OLED_B_SEP_PAD;
-  int16_t ww = (int16_t)u8g2.getStrWidth(vw);
-  int16_t wa = (int16_t)u8g2.getStrWidth(va);
-  int16_t total = OLED_B_X + ww + pad + 1 + pad + wa;
-
-  // Degrade in the stated order, and only as far as needed.
-  if (total > OLED_A_W && decimal) {
-    decimal = false; fmtA(false);
-    wa = (int16_t)u8g2.getStrWidth(va);
-    total = OLED_B_X + ww + pad + 1 + pad + wa;
-  }
-  while (total > OLED_A_W && pad > 1) {
-    pad--;
-    total = OLED_B_X + ww + pad + 1 + pad + wa;
-  }
-
-  u8g2.drawStr(OLED_B_X, OLED_B_BASELINE, vw);
-  int16_t sepX = OLED_B_X + ww + pad;
-  if (total <= OLED_A_W) {
-    // The rule sits on the text's own cap height, not the row's.
-    u8g2.drawVLine(sepX, OLED_B_BASELINE - OLED_B_SEP_H + 1, OLED_B_SEP_H);
-    u8g2.drawStr(sepX + 1 + pad, OLED_B_BASELINE, va);
-  }
-  // If it still does not fit -- which the layout test says cannot
-  // happen -- the watts alone are drawn and the lane stays clean.
+  drawCell(vw, OLED_A_X0, middle - 1);
+  drawCell(va, middle + 2, OLED_A_X0 + OLED_A_W);
+  u8g2.drawVLine(middle, OLED_B_BASELINE - OLED_B_SEP_H + 1, OLED_B_SEP_H);
 }
 
 // ---- region A: the three screens -------------------------------
@@ -4233,7 +5071,7 @@ static void oledScreenSoc() {
   // and the instruction sits under it. Same font, same geometry,
   // same top area -- only the visibility of the digits changes, and
   // the power row and arrow lane are untouched.
-  if (nightAlarm) {
+  if (nightAlarm || emergAlarm) {
     bool on = ((millis() / NIGHT_BLINK_MS) & 1) == 0;
     if (on) {
       char d[6];
@@ -4250,7 +5088,7 @@ static void oledScreenSoc() {
       u8g2.drawStr(x + dw + OLED_SOC_GAP, 34, "%");
     }
     u8g2.setFont(FONT_TXT);
-    const char* m = "TURN OFF INVERTER";
+    const char* m = "TURN CEB ON";
     int16_t w = (int16_t)u8g2.getStrWidth(m);
     if (w > OLED_A_W) { u8g2.setFont(FONT_SMALL); w = (int16_t)u8g2.getStrWidth(m); }
     u8g2.drawStr(OLED_A_X0 + (OLED_A_W - w) / 2, 47, m);
@@ -4292,13 +5130,11 @@ static void oledScreenSoc() {
 // authoritative committed relay state -- never inferred from SoC,
 // PV or the time.
 static void oledScreenSrc() {
-  aCentre(FONT_SRC, srcActual == SRC_UTILITY ? "CEB" : "Pack", 36);
-  // PART H. Only this screen, only while the switch is closed, and
-  // inside the existing top area -- no new screen, no retiming.
+  aCentre(FONT_SRC, srcActual == SRC_UTILITY ? "CEB" : "Pack", travelMode ? 25 : 36);
   if (travelMode) {
-    u8g2.setFont(FONT_SMALL);
+    u8g2.setFont(u8g2_font_helvB14_tf);
     int16_t w = (int16_t)u8g2.getStrWidth("TRAVEL");
-    u8g2.drawStr(OLED_A_X0 + (OLED_A_W - w) / 2, 46, "TRAVEL");
+    u8g2.drawStr(OLED_A_X0 + (OLED_A_W - w) / 2, 47, "TRAVEL");
   }
 }
 
@@ -4685,7 +5521,7 @@ static void addCors(AsyncWebServerResponse* r) {
 static void setupWebServer() {
   server.on("/api/live", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (!authOk(req)) return;
-    char buf[3800];
+    char buf[4100];
     buildLiveJson(buf, sizeof(buf));
     AsyncWebServerResponse* r = req->beginResponse(200, "application/json", buf);
     addCors(r);
@@ -4748,21 +5584,23 @@ static void setupWebServer() {
   server.on("/api/relay", HTTP_ANY, [](AsyncWebServerRequest* req) {
     if (!authOk(req)) return;
     if (req->hasParam("src")) {
-      String s = req->getParam("src")->value();
-      if      (s == "auto")    manualSrc = SRC_NONE;
-      else if (s == "solar")   { manualSrc = SRC_SOLAR;   manualSince = millis(); }
-      else if (s == "utility") { manualSrc = SRC_UTILITY; manualSince = millis(); }
-      Serial.printf("[web] source request: %s\n", s.c_str());
+      req->send(409, "application/json", "{\"error\":\"CEB switch is manual; GPIO25 is the red indicator\"}");
+      return;
     }
     if (req->hasParam("light")) {
-      // Accepts the words and the legacy 0/1 the older on-device
-      // page sent, so an un-updated dashboard keeps working.
-      String v = req->getParam("light")->value();
-      if      (v == "auto") lightMode = LIGHT_AUTO;
-      else if (v == "on")   lightMode = LIGHT_ON;
-      else if (v == "off")  lightMode = LIGHT_OFF;
-      else                  lightMode = v.toInt() != 0 ? LIGHT_ON : LIGHT_OFF;
-      Serial.printf("[web] lights request: %s\n", lightModeName());
+      if (!travelMode || !timeReady()) { req->send(409, "application/json", "{\"error\":\"Travel mode and a valid clock are required\"}"); return; }
+      String value = req->getParam("light")->value();
+      int mode = value == "auto" ? 0 : (value == "on" || value == "1") ? 1 : (value == "off" || value == "0") ? 2 : -1;
+      if (mode < 0) { req->send(400, "application/json", "{\"error\":\"Unknown house command\"}"); return; }
+      HouseCommand command = {};
+      snprintf(command.id, sizeof(command.id), "local-%lu", (unsigned long)millis());
+      DATA_LOCK(); strlcpy(command.session, travelSession, sizeof(command.session)); DATA_UNLOCK();
+      command.mode = mode;
+      command.issuedMs = (int64_t)nowEpoch() * 1000;
+      command.expiresMs = command.issuedMs + 45000;
+      if (!houseCommands || xQueueOverwrite(houseCommands, &command) != pdPASS) {
+        req->send(503, "application/json", "{\"error\":\"Command queue unavailable\"}"); return;
+      }
     }
     if (req->hasParam("ackNight")) {
       // Part D: acknowledge clears the alarm for the rest of tonight.
@@ -4882,7 +5720,7 @@ static void netTask(void*) {
   esp_task_wdt_add(NULL);
 
   bool wifiWasUp = false;
-  uint32_t tWifi = 0, tLive = 0, tDaily = 0, tUp = 0, tDaySync = 0;
+  uint32_t tWifi = 0, tLive = 0, tDaily = 0, tUp = 0, tDaySync = 0, tCommand = 0;
   uint32_t wifiBackoff = WIFI_RETRY_MS;   // grows to WIFI_RETRY_MAX_MS
 
   for (;;) {
@@ -4925,6 +5763,9 @@ static void netTask(void*) {
 
     // Each of these can block for up to the 8 s HTTP timeout, so the
     // watchdog is fed between them rather than once per iteration.
+    if (cloudOk && travelMode && now - tCommand >= HOUSE_COMMAND_POLL_MS) {
+      tCommand = now; pollHouseCommand(); esp_task_wdt_reset();
+    }
     if (cloudOk && now - tLive >= LIVE_PUSH_MS) {
       tLive = now; pushLive(); esp_task_wdt_reset();
     }
@@ -5063,7 +5904,7 @@ void setup() {
   Serial.begin(115200);
   delay(2000);                       // one-off, lets USB serial enumerate
   Serial.println();
-  Serial.println("=== SolarPulse v4 ===");
+  Serial.println("=== SolarPulse v2026.10.17-rc.2 ===");
   Serial.printf("A: boot reason %s%s\n", resetReasonName((uint8_t)bootReason),
                 sysFault ? "  <-- FAULT RESET" : "");
   if (bootReason == ESP_RST_BROWNOUT)
@@ -5083,6 +5924,7 @@ void setup() {
 
   dataMux = xSemaphoreCreateMutex();
   fsLock  = xSemaphoreCreateMutex();
+  houseCommands = xQueueCreate(1, sizeof(HouseCommand));
 
   pvHistLoad();                        // measured PV history from NVS
   wxLoad();                            // cached forecast, if any
@@ -5107,6 +5949,7 @@ void setup() {
     // pass would run in normal mode for one debounce period and the
     // lights would visibly flick.
     travelMode = travelSwitchClosed();
+    newTravelSession();
     Serial.printf("E: travel switch GPIO %d reads %s\n",
                   TRAVEL_SWITCH_PIN, travelMode ? "CLOSED (travel mode)" : "open (normal)");
   }
@@ -5158,6 +6001,7 @@ void loop() {
   // Melody stepping runs on EVERY pass: its shortest note is 70 ms,
   // and quantising to the 250 ms control tick would wreck the rhythm.
   buzzerTick();
+  alarmIndicatorTick();
   oledTick();               // rate-limited inside; no-op if absent
 
   if (now - tCtl >= CONTROL_TICK_MS) {
@@ -5167,7 +6011,8 @@ void loop() {
     socUpdate(b, now);      // validates SoC BEFORE anything acts on it
     etaUpdate(now);         // display-only rolling mean, no vote in anything
     solarDayUpdate(now);    // 8q: poor/normal day, input to the CEB hold only
-    protectionUpdate();     // sets loadCut / buzzMode from SoC
+    travelTask();           // physical switch updates BEFORE alarm policy
+    protectionUpdate();     // sets loadCut / alarm state from validated SoC
     travelTask();           // the ONLY writer of RELAY_LOAD_PIN
     relayTask();
     utilityAccounting();

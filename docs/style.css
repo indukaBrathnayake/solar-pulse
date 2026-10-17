@@ -843,3 +843,49 @@ body { padding-bottom: 96px; }
   cursor: not-allowed;
 }
 .travel-note { color: var(--gold-text); }
+
+
+/* Scoped to the Powering the house tile; existing dashboard styles stay intact. */
+.cards:has(.house-card) { grid-template-columns:repeat(3,minmax(0,1fr)); }
+.house-card { grid-column:1/-1; display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:24px; }
+.house-card:not(.is-travelling) .house-summary { grid-column:1/-1; }
+.house-card .house-heading { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; margin-bottom:14px; }
+.house-card .house-heading .card-eyebrow { margin:0; }
+.house-card .house-badge { border:1px solid var(--line); border-radius:30px; padding:5px 9px; font-size:11px; color:var(--muted); }
+.house-card .house-badge.active { color:var(--teal); background:var(--teal-soft); border-color:var(--teal); }
+.house-card .house-output { margin:16px 0 5px; color:var(--muted); font-weight:600; }
+.house-card .house-output.is-on { color:var(--gen-text); }
+.house-card .house-travel-panel { padding:18px; border:1px solid var(--line); border-radius:12px; background:var(--panel-2); }
+.house-card [hidden] { display:none !important; }
+.house-card .house-schedule-label { margin:0 0 5px; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:1px; }
+.house-card .house-schedule { margin:0 0 12px; color:var(--ink); font-size:14px; font-weight:600; }
+.house-card .house-actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:12px 0; }
+.house-card .house-actions button, .house-card .house-auth-button { font:inherit; cursor:pointer; border:1px solid var(--line); border-radius:9px; padding:11px 8px; color:var(--ink); background:var(--paper); min-height:44px; }
+.house-card .house-actions button[data-house-mode="0"] { grid-column:1/-1; padding:8px; }
+.house-card .house-actions button[aria-pressed="true"] { border-color:var(--teal); background:var(--teal-soft); }
+.house-card .house-actions button:disabled { opacity:.42; cursor:not-allowed; }
+.house-card button:focus-visible { outline:2px solid var(--teal); outline-offset:3px; }
+.house-card .house-account, .house-card .house-command-status, .house-card .house-mode { font-size:12px; line-height:1.55; margin:8px 0; overflow-wrap:anywhere; color:var(--muted); }
+.house-card .house-command-status[data-kind="error"] { color:var(--warn-text); }
+.house-card .house-command-status[data-kind="ok"] { color:var(--gen-text); }
+.house-card .house-command-status[data-kind="pending"] { color:var(--gold-text); }
+.house-card .house-auth-button { font-size:12px; padding:8px 12px; }
+.house-card .house-details { margin-top:14px; border-top:1px solid var(--line); padding-top:10px; }
+.house-card .house-details summary { color:var(--muted); font-size:12px; cursor:pointer; }
+@media (max-width:700px) {
+  .cards:has(.house-card), .house-card { grid-template-columns:1fr; }
+  .house-card { gap:18px; }
+}
+.house-login-dialog { width:min(420px,calc(100vw - 32px)); border:1px solid var(--line); border-radius:18px; padding:25px; background:var(--paper); color:var(--ink); box-shadow:var(--shadow); font-family:Outfit,sans-serif; }
+.house-login-dialog::backdrop { background:rgba(0,0,0,.7); backdrop-filter:blur(5px); }
+.house-login-dialog h2 { margin:0 0 8px; font-size:22px; }
+.house-login-dialog p { color:var(--muted); font-size:14px; line-height:1.5; }
+.house-login-dialog label { display:block; margin:17px 0 6px; font-size:13px; }
+.house-login-dialog input { width:100%; box-sizing:border-box; border:1px solid var(--line); border-radius:8px; padding:12px; background:var(--panel-2); color:var(--ink); font:inherit; }
+.house-login-dialog .login-actions { display:flex; gap:10px; margin-top:20px; }
+.house-login-dialog button { border:1px solid var(--line); border-radius:8px; padding:11px 18px; color:var(--ink); background:var(--panel-2); font:inherit; cursor:pointer; }
+.house-login-dialog button[type="submit"] { background:var(--teal-soft); border-color:var(--teal); flex:1; }
+.house-login-dialog :focus-visible { outline:2px solid var(--teal); outline-offset:3px; }
+.house-login-dialog #house-login-error { color:var(--warn-text); min-height:20px; }
+
+.morning-banner { color:var(--gen-text); border-color:var(--gen-line); background:var(--gen-soft); }

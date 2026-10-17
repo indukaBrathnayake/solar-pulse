@@ -7,7 +7,9 @@
 <title>Nipuna's Solar - Atabage, Udagama</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Outfit:wght@400;500;600&family=JetBrains+Mono:wght@400;600;800&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=20261001-9f4adf">
+<link rel="stylesheet" href="style.css?v=20261017rc2">
+
+<meta name="solarpulse-release" content="2026.10.17-rc.2">
 </head>
 <body data-build="20261001-9f4adf">
 
@@ -61,8 +63,12 @@
      source control. Acknowledging clears it for the rest of tonight. -->
 <div class="toast hidden" id="night-banner" role="alert">
   <span class="toast-ic">⚠</span>
-  <span class="toast-txt"><b>TURN OFF INVERTER</b> — <span id="night-text"></span></span>
+  <span class="toast-txt"><b>TURN CEB ON</b> — <span id="night-text"></span></span>
   <button class="toast-x" id="night-ack" aria-label="Acknowledge">Acknowledge</button>
+</div>
+
+<div class="offline-banner hidden morning-banner" id="morning-banner" role="status" aria-live="polite">
+  <strong>Turn solar on</strong> · Sustained battery charging is available. CEB is inferred from idle load; switch the source manually.
 </div>
 
 <!-- ======================= TAB: LIVE ======================= -->
@@ -175,31 +181,44 @@
     </div>
   </article>
 
-  <!-- which relay is carrying the house right now -->
-  <article class="card accent-src">
-    <p class="card-eyebrow violet">Powering the house</p>
+  <!-- Travel-only house control; source and diagnostics retain their existing IDs. -->
+  <article class="card accent-src house-card">
+    <div class="house-summary">
+    <div class="house-heading"><p class="card-eyebrow violet">Powering the house</p>
+      <span class="house-badge" id="house-travel-badge">Travel mode off</span></div>
     <p class="card-num"><span id="src-name">--</span></p>
     <p class="card-sub" id="src-why">waiting for the controller…</p>
     <div class="relay-row">
       <span class="relay-chip" id="chip-solar"><i></i>Inverter</span>
       <span class="relay-chip" id="chip-util"><i></i>Utility</span>
-      <span class="relay-chip" id="chip-light"><i></i>Lights</span>
+      <span class="relay-chip" id="chip-light"><i></i>House output</span>
     </div>
-    <!-- Lights state. This page reads Firebase and has no route to
-         the ESP, so the ON/OFF/AUTO control lives on the on-device
-         dashboard; here the mode and its reason are reported. -->
-    <p class="card-sub" id="solar-day"></p>
-    <p class="card-sub" id="lights-line">lights --</p>
-    <!-- PART J.2 · manual control, disabled while the physical
-         travel switch is closed, with the reason written out. -->
-    <div class="light-ctl" id="light-ctl">
-      <button class="relay-chip" data-light="on">Lights on</button>
-      <button class="relay-chip" data-light="off">Lights off</button>
-      <button class="relay-chip" data-light="auto">Auto</button>
+    <p class="house-output" id="house-output" role="status">Waiting for output state…</p>
+    <p class="card-sub" id="house-normal-note">Travel switch off. Normal house supply is available.</p>
+    <details class="house-details"><summary>Energy &amp; controller details</summary>
+      <p class="card-sub" id="solar-day"></p>
+      <p class="card-sub" id="lights-line">lights --</p>
+      <p class="card-sub"><span id="util-min">0</span> min on CEB today · <span id="light-min">0</span> min of house output · <span id="travel-min">0</span> min travel · solar <span id="pv-now">0</span> W · load <span id="load-now">0</span> W</p>
+      <p class="card-sub tonight" id="tonight">tonight's floor --</p>
+    </details>
     </div>
-    <p class="card-sub travel-note hidden" id="travel-note"></p>
-    <p class="card-sub"><span id="util-min">0</span> min on CEB today · <span id="light-min">0</span> min of lights · <span id="travel-min">0</span> min travel · solar <span id="pv-now">0</span> W · load <span id="load-now">0</span> W</p>
-    <p class="card-sub tonight" id="tonight">tonight's floor --</p>
+    <div class="house-travel-panel" id="house-travel-panel" hidden>
+      <p class="house-schedule-label">Daily automatic schedule</p>
+      <p class="house-schedule" id="house-schedule">--:-- – --:-- · Sri Lanka time</p>
+      <p class="house-mode" id="house-mode">Schedule</p>
+      <div class="house-actions" role="group" aria-label="House output override">
+        <button type="button" data-house-mode="1" aria-pressed="false" disabled>Turn house on</button>
+        <button type="button" data-house-mode="2" aria-pressed="false" disabled>Turn house off</button>
+        <button type="button" data-house-mode="0" aria-pressed="true" disabled>Resume schedule</button>
+      </div>
+      <p class="house-mode">Manual choices end at the next scheduled on/off time. The schedule works without internet.</p>
+      <p class="house-account" id="house-account">Sign in to control your house remotely.</p>
+      <button type="button" class="house-auth-button" id="house-sign-in">Sign in to control</button>
+      <button type="button" class="house-auth-button" id="house-sign-out" hidden>Sign out</button>
+      <button type="button" class="house-auth-button" id="house-verify-email" hidden>Send verification email</button>
+      <p class="house-command-status" id="house-command-status" role="status" aria-live="polite"></p>
+    </div>
+
   </article>
 </section>
 
@@ -291,20 +310,7 @@
   <p class="panel-sub" id="pred-caption">Building the historical profile…</p>
 </section>
 
-<!-- ================= RESET HISTORY =================
-     The last RESET_LOG_N boots, straight from the ESP's NVS ring.
-     This is the evidence for WHY the box restarted; without it a
-     reset is just an unexplained gap in the graph. -->
-<section class="panel">
-  <div class="panel-head">
-    <h2>Reset history</h2>
-  </div>
-  <p class="panel-sub" id="reset-sub">Waiting for the controller…</p>
-  <table class="mtable" id="reset-table">
-    <thead><tr><th>Boot</th><th>Reason</th><th>Previous uptime</th><th>Faulting task</th></tr></thead>
-    <tbody id="reset-rows"></tbody>
-  </table>
-</section>
+
 
 </main><!-- /tab-live -->
 
@@ -366,10 +372,1924 @@
   </button>
 </nav>
 
+<dialog class="house-login-dialog" id="house-login-dialog" aria-labelledby="house-login-title">
+  <form id="house-login-form">
+    <h2 id="house-login-title">Welcome home</h2>
+    <p>Sign in to manage your house output. Your password is checked by Firebase.</p>
+    <label for="house-login-email">Email address</label>
+    <input id="house-login-email" type="email" autocomplete="username" required maxlength="254">
+    <label for="house-login-password">Password</label>
+    <input id="house-login-password" type="password" autocomplete="current-password" required>
+    <p id="house-login-error" role="status" aria-live="polite"></p>
+    <div class="login-actions"><button type="button" id="house-login-cancel">Cancel</button><button type="submit" id="house-login-submit">Sign in</button></div>
+    <p>Signed in for this browser session. No password is stored in this website's code.</p>
+  </form>
+</dialog>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-<script src="app.js?v=20261001-9f4adf"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script>
+window.SOLARPULSE_CONTROL_OWNER_EMAIL = ""; // Configure your approved email after setting owner-only Firebase rules; never put a password here.
+</script>
+<script>
+/* ============================================================
+   Solar Pulse dashboard
+   1) Paste your Firebase web config below (Console > Project
+      settings > Your apps > Web app > Config).
+   2) Nothing else needs editing.
+   ============================================================ */
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyD7_JShDQoGrB0V6A_6Zvd7O3DbpueUhWg",
+  authDomain: "solar-pulse-8ba33.firebaseapp.com",
+  databaseURL: "https://solar-pulse-8ba33-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "solar-pulse-8ba33",
+   
+};
+
+// The ESP pushes /live every 3 s, so 30 s of silence is ten missed
+// pushes -- comfortably a real outage rather than one dropped packet.
+const STALE_MS = 30 * 1000;
+const AMP_DEADBAND = 0.25;           // below this = idle
+const PV_HOURS = [6, 19];            // charging inside this window = PV
+const CAPACITY_AH = 100;             // pack capacity, fixed system spec
+
+firebase.initializeApp(FIREBASE_CONFIG);
+const db = firebase.database();
+
+const $ = (id) => document.getElementById(id);
+let live = null;
+// /daily rows are cached per year by daysForYear(); see the data
+// layer further down.
+
+/* ---------------- number count-up ---------------- */
+function tween(el, target, decimals = 2) {
+  const from = parseFloat(el.dataset.v || "0");
+  const t0 = performance.now(), dur = 500;
+  function step(t) {
+    const k = Math.min(1, (t - t0) / dur);
+    const v = from + (target - from) * (1 - Math.pow(1 - k, 3));
+    el.textContent = v.toFixed(decimals);
+    if (k < 1) requestAnimationFrame(step);
+    else el.dataset.v = target;
+  }
+  requestAnimationFrame(step);
+}
+
+/* ---------------- pill helper ---------------- */
+function setPill(id, state, label) {
+  const p = $(id);
+  p.classList.remove("on", "gold", "warn");
+  if (state) p.classList.add(state);
+  p.childNodes[1].textContent = label;
+}
+
+/* ---------------- relay chip helper ---------------- */
+function chip(id, on, tone) {
+  const el = $(id);
+  if (!el) return;
+  el.classList.remove("on", "warn", "gold");
+  if (on) el.classList.add(tone);
+}
+
+function fmtHM(hours) {
+  if (!isFinite(hours) || hours <= 0) return "--";
+  const totalMin = Math.round(hours * 60);
+  const h = Math.floor(totalMin / 60), m = totalMin % 60;
+  return h > 0 ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m`;
+}
+
+/* ---------------- main render ---------------- */
+/* ============================================================
+   HEADER STATUS STRIP  (patch 4 part F)
+
+   Every field is a value the ESP already publishes -- nothing here
+   is derived, guessed or timed in the browser except the age of the
+   last write, which is the one thing only the browser can know.
+
+     SYS      live.sysFault   (PANIC / BROWNOUT / any watchdog boot)
+     WIFI     freshness of /live -- a stale feed means the ESP is
+              not reaching Firebase, which is what WIFI means here
+     BLE      live.bmsLink
+     FB       the same freshness, from the write side
+     UP       live.up, seconds since boot
+     LAST SYNC  now - live.ts
+   ============================================================ */
+function fmtUp(sec) {
+  if (sec == null || !isFinite(sec)) return "--";
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (d) return `${d}d ${String(h).padStart(2, "0")}h`;
+  if (h) return `${h}h ${String(m).padStart(2, "0")}m`;
+  return `${m}m`;
+}
+
+function fmtAge(ms) {
+  if (!isFinite(ms) || ms < 0) return "--";
+  const sec = Math.round(ms / 1000);
+  if (sec < 90) return sec + "s";
+  const m = Math.round(sec / 60);
+  if (m < 90) return m + "m";
+  return Math.round(m / 60) + "h";
+}
+
+function renderStatusStrip(fresh, ageMs) {
+  const dot = (id, on) => { const e = $(id); if (e) e.classList.toggle("on", !!on); };
+  dot("st-wifi-dot", fresh);
+  dot("st-ble-dot", fresh && live.bmsLink);
+  dot("st-fb-dot", fresh);
+
+  const sys = $("st-sys");
+  if (sys) {
+    // Sticky by design: a fault reset stays on the header until the
+    // box boots cleanly again, so an overnight watchdog is still
+    // visible in the morning.
+    const fault = !!live.sysFault;
+    sys.textContent = fault ? "SYS FAULT" : "SYS OK";
+    sys.classList.toggle("fault", fault);
+    sys.title = live.boot ? `last reset: ${live.boot}` : "";
+  }
+  const up = $("st-up");   if (up) up.textContent = fmtUp(live.up);
+  const sy = $("st-sync"); if (sy) sy.textContent = fmtAge(ageMs);
+}
+
+/* The boot ring, straight from the ESP's NVS. */
+const RESET_BLURB = {
+  POWERON: "power applied", EXT: "external reset pin", SW: "software restart",
+  PANIC: "firmware crash", INT_WDT: "interrupt watchdog",
+  TASK_WDT: "task watchdog", WDT: "watchdog", BROWNOUT: "supply voltage collapsed",
+  DEEPSLEEP: "woke from deep sleep", UNKNOWN: "not recorded",
+};
+const RESET_FAULT = ["PANIC", "BROWNOUT", "INT_WDT", "TASK_WDT", "WDT"];
+
+function renderResets() {
+  const body = $("reset-rows"), sub = $("reset-sub");
+  if (!body) return;
+  const rows = Array.isArray(live.resets) ? live.resets : null;
+  if (!rows) {
+    body.innerHTML = "";
+    if (sub) sub.textContent = "This firmware does not record reset history yet";
+    return;
+  }
+  if (!rows.length) {
+    body.innerHTML = "";
+    if (sub) sub.textContent = "No resets recorded yet";
+    return;
+  }
+  const faults = rows.filter((r) => RESET_FAULT.includes(r[0])).length;
+  if (sub) {
+    const bits = [`Last ${rows.length} boot${rows.length === 1 ? "" : "s"}`,
+                  `${faults} fault${faults === 1 ? "" : "s"}`];
+    if (live.relayOps != null) bits.push(`${live.relayOps} lifetime relay transfers`);
+    if (live.heapMin != null) bits.push(`min free heap ${Math.round(live.heapMin / 1024)} kB`);
+    if (live.stkNet != null) {
+      bits.push(`stack headroom ble ${live.stkBle} / net ${live.stkNet} / loop ${live.stkLoop} B`);
+    }
+    sub.textContent = bits.join(" · ");
+  }
+  body.innerHTML = rows.map((r) => {
+    // Older firmware sent 3 columns; patch 5 adds the faulting task
+    // and PC, so read positionally and tolerate the short form.
+    const [reason, stamp, upMin, task, pc] = r;
+    const fault = RESET_FAULT.includes(reason);
+    const when = stamp && stamp > 19700101
+      ? `${String(stamp).slice(0, 4)}-${String(stamp).slice(4, 6)}-${String(stamp).slice(6, 8)}`
+      : "clock unset";
+    const prev = upMin ? fmtUp(upMin * 60) : "--";
+    const where = task
+      ? `${task}${pc ? " @ 0x" + (pc >>> 0).toString(16).toUpperCase() : ""}`
+      : "--";
+    return `<tr class="${fault ? "fault" : ""}"><td>${when}</td>` +
+           `<td>${reason} · ${RESET_BLURB[reason] || ""}</td><td>${prev}</td>` +
+           `<td class="mono">${where}</td></tr>`;
+  }).join("");
+}
+
+function render() {
+  if (!live) return;
+  const now = Date.now();
+  const ageMs = now - live.ts * 1000;
+  const fresh = ageMs < STALE_MS;
+  renderStatusStrip(fresh, ageMs);
+  renderResets();
+  const hour = new Date().getHours();
+
+  document.body.classList.toggle("live", fresh);
+  $("river").classList.toggle("stale", !fresh);
+  $("offline-banner").classList.toggle("hidden", fresh);
+
+  const seen = new Date(live.ts * 1000);
+  const seenTxt = seen.toLocaleString("en-GB", { hour12: false });
+  $("last-seen").textContent = seenTxt + (fresh ? " (live)" : "");
+  $("last-seen-banner").textContent = seenTxt;
+
+  setPill("pill-esp", fresh ? "on" : "warn", fresh ? "Monitor online" : "Monitor offline");
+  setPill("pill-bms", fresh && live.bmsLink ? "on" : "warn",
+          live.bmsLink ? "BMS linked" : "BMS lost");
+
+  const i = live.i ?? 0;
+  const charging = i > AMP_DEADBAND;
+  const discharging = i < -AMP_DEADBAND;
+  const daylight = hour >= PV_HOURS[0] && hour < PV_HOURS[1];
+  const pvActive = fresh && charging && daylight;
+  const gridSuspect = fresh && charging && !daylight;
+  const loadActive = fresh && discharging;
+
+  $("river").classList.toggle("pv-on", pvActive || gridSuspect);
+  $("river").classList.toggle("load-on", loadActive);
+
+  setPill("pill-pv",
+    pvActive ? "gold" : "",
+    pvActive ? "PV generating" : (gridSuspect ? "Charging (grid?)" : (daylight ? "PV idle" : "Night")));
+  setPill("pill-load", loadActive ? "on" : "", loadActive ? "Inverter feeding load" : "Load idle");
+  setPill("pill-bal", live.bal ? "gold" : "", live.bal ? "Balancing" : "Balancer idle");
+
+  /* PART F. Bit 19 of the JK alarm word is set permanently on this
+     pack while everything measurable about it is healthy -- SoC 65%,
+     13.07 V, both MOSFETs on, SoH 100% -- so the banner fired on
+     every single page load and trained people to dismiss it.
+
+     The bit is masked; the other 31 still raise the banner. That
+     matters: removing the banner outright would have hidden a real
+     overvoltage, overtemperature or cell-imbalance fault too. */
+  const BMS_ERR_IGNORE_MASK = 0x00080000;        // matches config.h 8s
+  const errRaw = live.err ?? 0;
+  const errReal = errRaw & ~BMS_ERR_IGNORE_MASK;
+  const alarm = errReal !== 0;
+  $("pill-alarm").classList.toggle("hidden", !alarm);
+  if (alarm) setPill("pill-alarm", "warn", "BMS alarm 0x" + errReal.toString(16));
+
+  const w = Math.abs(live.p ?? 0);
+  $("pv-watts").textContent = (charging ? w.toFixed(0) : "0") + " W";
+  $("pv-state").textContent = pvActive ? "generating" :
+      gridSuspect ? "charging after dark" : daylight ? "stopped" : "sun is down";
+  $("load-watts").textContent = (loadActive ? w.toFixed(0) : "0") + " W";
+  $("load-state").textContent = loadActive ? "drawing power" : "standby";
+
+  $("soc-big").textContent = (live.soc ?? "--") + "%";
+  $("pack-vi").textContent = `${(live.v ?? 0).toFixed(2)} V · ${i.toFixed(2)} A`;
+  $("batt-state").textContent = charging ? "charging" : discharging ? "discharging" : "resting";
+
+  const soc = Math.max(0, Math.min(100, live.soc ?? 0));
+  $("batt-fill").style.height = soc + "%";
+
+  /* time remaining */
+  const remAh = live.remAh ?? 0;
+  let hrs = null, label = "resting", pct = 0, color = "var(--teal)";
+  if (charging) {
+    hrs = (CAPACITY_AH - remAh) / i;
+    label = `${fmtHM(hrs)} to full`;
+    pct = Math.min(100, (1 - hrs / 10) * 100);
+    color = "var(--amber)";
+  } else if (discharging) {
+    hrs = remAh / Math.abs(i);
+    label = `${fmtHM(hrs)} to empty at this rate`;
+    pct = Math.min(100, (hrs / 24) * 100);
+    color = hrs < 2 ? "var(--coral)" : "var(--teal)";
+  } else {
+    label = "resting, no load or charge";
+    pct = 0;
+  }
+  $("time-fill").style.width = (fresh ? pct : 0) + "%";
+  $("time-fill").style.background = color;
+  $("time-label").textContent = fresh ? label : "no recent data";
+
+  /* ---------- powering the house ----------
+     AUTHORITATIVE. live.house is computed by the firmware from the
+     committed relay state (srcActual) inside the one source state
+     machine -- it is not inferred here from SoC, PV, voltage, time
+     or the CEB threshold, and there is no second source-control
+     system in the browser.
+
+     On the v5 changeover relay the coil being energised IS "CEB";
+     everything else, including the break-before-make dead time,
+     leaves the load bus on the inverter. That is why "not switched"
+     is gone: with this hardware there is no such electrical state,
+     and showing it was the bug. */
+  const house = live.house || null;          // "CEB" | "Pack"
+  const onCeb = house === "CEB";
+  $("src-name").textContent = fresh && house ? house : "--";
+  /* PART J.4. CEB has exactly two automatic ways on, so name the
+     one that actually fired rather than echoing an internal phrase.
+     Manual selection is still labelled as manual. */
+  let whyTxt = live.why
+    ? (live.manual ? "manual · " : "automatic · ") + live.why
+    : "controller not reporting";
+  if (fresh && onCeb && !live.manual) {
+    const vOn = live.vCebOn ?? 11.5;
+    if (live.packVOk && live.packV != null && live.packV <= vOn) {
+      whyTxt = `automatic · pack voltage below ${vOn.toFixed(1)} V`;
+    } else if (live.soc != null && live.cebOn != null && live.soc <= live.cebOn) {
+      whyTxt = `automatic · SOC below ${live.cebOn}%`;
+    }
+  }
+  $("src-why").textContent = whyTxt;
+  chip("chip-solar", fresh && house === "Pack", "on");
+  chip("chip-util",  fresh && onCeb, "warn");
+  chip("chip-light", fresh && live.light,  "gold");
+
+  /* PART J. The lights line carries three separate facts, in
+     priority order, because they answer different questions:
+
+       1. the 10% load cut   -- why are the lights off right now
+       2. travel mode        -- who is in charge of them
+       3. the manual mode    -- what the occupant chose
+
+     The chip above shows the OUTPUT. In travel mode at noon the
+     lamp is off and nothing is wrong, so the output alone would be
+     misleading on its own. */
+  const ll = $("lights-line");
+  const travel = !!live.travel;
+  if (ll) {
+    const lm = live.lightMode;
+    if (!fresh || !lm) {
+      ll.textContent = "lights --";
+    } else if (live.loadCut) {
+      ll.textContent = `lights cut, pack below ${live.loadCutSoc ?? 10}%`;
+    } else if (travel) {
+      ll.textContent = `TRAVEL MODE ACTIVE · lights ${live.lightOn || "--:--"} to ` +
+                       `${live.lightOff || "--:--"} · switch closed`;
+    } else {
+      ll.textContent = `TRAVEL MODE OFF · normal house supply` +
+                       (lm === "auto" ? "" : ` · forced ${lm}`);
+    }
+  }
+  if ($("light-min")) $("light-min").textContent = live.lightMin ?? 0;
+  if ($("travel-min")) $("travel-min").textContent = live.travelMin ?? 0;
+
+  if (window.renderTravelControl) window.renderTravelControl(live, fresh && ageMs >= 0);
+
+  /* PART C. The solar-day classification and, when it is holding a
+     release back, the deadline it is holding to. */
+  const sd = $("solar-day");
+  if (sd) {
+    const cls = live.solarDay;
+    const ratio = live.solarRatio;
+    if (!fresh || !cls || cls === "unknown") {
+      sd.textContent = "";
+    } else if (live.cebHold) {
+      sd.textContent = `poor solar day · ${ratio}% of expected · holding CEB to ` +
+                       `${live.cebHoldTill} so the array can charge the pack`;
+    } else if (cls === "poor") {
+      sd.textContent = `poor solar day · ${ratio}% of expected`;
+    } else {
+      sd.textContent = `solar normal · ${ratio}% of expected`;
+    }
+  }
+
+  /* PART D. The 23:00 low-pack alarm. Display only -- the source
+     state machine has no idea this exists. */
+  const nb = $("night-banner");
+  if (nb) {
+    const on = !!(fresh && (live.nightAlarm || live.emerg));
+    nb.classList.toggle("hidden", !on);
+    const nt = $("night-text");
+    if (on && nt) {
+      nt.textContent = live.emerg
+        ? `Battery below 5% — turn the CEB switch on. Red indicator and buzzer are active.`
+        : `Weeknight battery warning: below ${live.nightWarn || 35}% — turn the CEB switch on.`;
+    }
+  }
+  $("util-min").textContent  = live.utilMin ?? 0;
+  $("pv-now").textContent    = (live.pvW ?? 0).toFixed(0);
+  $("load-now").textContent  = (live.loadW ?? 0).toFixed(0);
+
+  /* ---------- CEB / weather plan ----------
+     v5 replaces the old 99%-target "rainy" rule with the CEB state
+     machine. Firmware that predates it omits live.ceb, in which case
+     the line hides itself rather than showing a wrong number. */
+  const tn = $("tonight");
+  if (live.ceb == null) {
+    tn.classList.add("hidden");
+  } else {
+    tn.classList.remove("hidden");
+    const heavy = live.wx === "heavy";
+    tn.classList.toggle("rainy", heavy);
+    const wxTxt = live.wx === "clear" ? "clear day"
+                : heavy               ? "poor-solar day"
+                : live.wx === "half"  ? "mixed day"
+                : "forecast unavailable";
+    tn.textContent = live.ceb
+      ? `CEB carrying the house · ${wxTxt} · handing back at ${live.cebRel} if the pack allows`
+      : `on solar · ${wxTxt} · CEB engages at ${live.cebOn}%`;
+  }
+
+  if (live.sourceManual) tn.textContent = "CEB switch is manual · red indicator requests action when needed";
+
+  setPill("pill-src",
+    !fresh || !house ? "" : onCeb ? "warn" : "on",
+    house ? (onCeb ? "On CEB" : "On Pack") : "Source --");
+  $("pill-travel").classList.toggle("hidden", !live.travel);
+  if (live.travel) setPill("pill-travel", "gold", "Travel mode");
+
+  tween($("today-chg"), (live.harvestWh ?? live.todayChg ?? 0) / 1000, 2);
+  tween($("today-dis"), (live.todayDis ?? 0) / 1000, 2);
+  tween($("peak-w"), live.peakW ?? 0, 0);
+  tween($("life-chg"), (live.lifeChg ?? 0) / 1000, 1);
+  tween($("life-dis"), (live.lifeDis ?? 0) / 1000, 1);
+  tween($("rem-ah"), live.remAh ?? 0, 1);
+  $("soh").textContent = live.soh ?? "--";
+  $("cycles").textContent = live.cyc ?? "--";
+  $("mos-line").textContent =
+    `MOS chg ${live.chgMos ? "ON" : "OFF"} / dis ${live.disMos ? "ON" : "OFF"}`;
+
+  const cells = [live.c1, live.c2, live.c3, live.c4];
+  const vMin = 2.9, vMax = 3.55;
+  cells.forEach((v, k) => {
+    if (v == null) return;
+    $("cv" + (k + 1)).textContent = v.toFixed(3) + " V";
+    const pctC = Math.max(4, Math.min(100, (v - vMin) / (vMax - vMin) * 100));
+    $("cf" + (k + 1)).style.height = pctC + "%";
+  });
+  const delta = (Math.max(...cells) - Math.min(...cells)) * 1000;
+  $("delta-mv").textContent = isFinite(delta) ? delta.toFixed(0) : "--";
+  $("t1").textContent = live.t1 ?? "--";
+  $("t2").textContent = live.t2 ?? "--";
+  $("mos-t").textContent = live.mosT ?? "--";
+  $("bal-state").textContent = live.bal ? `ON ${(live.balI ?? 0).toFixed(2)} A` : "idle";
+
+  renderWeather();
+  trackBacklog(live.buffered ?? 0);
+}
+
+/* ============================================================
+   BACKLOG / BACKFILL TRACKING
+
+   While WiFi is down the ESP keeps logging to its own flash. When
+   it reconnects it replays that backlog into history/<date>/<ts>
+   using the ORIGINAL timestamps, so the writes land in the middle
+   of the day, not at the end.
+
+   That is invisible to the day feed: it is orderByKey().limitToLast(1)
+   + child_added, a window that only ever contains the newest key.
+   Backfilled keys are older, fall outside the window, and never
+   fire. The gap therefore stayed on screen until a manual reload.
+
+   So watch the ESP's own queue depth instead. When it drains to
+   zero after having been non-zero, the backlog is now in the cloud
+   and every affected view is re-fetched from scratch.
+   ============================================================ */
+let backlogPrev = null;      // last seen depth, null = nothing seen yet
+let backlogPeak = 0;         // high-water mark for this outage
+let backfillTimer = null;
+
+function trackBacklog(n) {
+  const note = $("buffered-note");
+  const wasDraining = backlogPrev !== null && backlogPrev > 0;
+
+  if (n > backlogPeak) backlogPeak = n;
+
+  // While the "backfilled N samples" message is showing, #buffered-n
+  // does not exist. Leave the note alone until it is restored.
+  const slot = $("buffered-n");
+  if (slot) {
+    note.classList.toggle("hidden", n === 0 && !backfillTimer);
+    slot.textContent = n;
+    note.classList.toggle("syncing", n > 0 && backlogPrev !== null && n < backlogPrev);
+  }
+
+  // Drained: the ESP has handed its whole backlog to Firebase.
+  if (wasDraining && n === 0) scheduleBackfillRefresh(backlogPeak);
+
+  backlogPrev = n;
+  if (n === 0) backlogPeak = 0;
+}
+
+/* Debounced so a backlog that drains over several batches triggers
+   one refresh at the end, not one per batch. */
+function scheduleBackfillRefresh(count) {
+  if (backfillTimer) clearTimeout(backfillTimer);
+  const note = $("buffered-note");
+  note.classList.remove("hidden");
+  note.classList.add("syncing");
+  $("buffered-n").textContent = 0;
+
+  backfillTimer = setTimeout(async () => {
+    backfillTimer = null;
+    await applyBackfill(count);
+  }, 2500);
+}
+
+async function applyBackfill(count) {
+  // Day chart: full re-fetch. The incremental feed structurally
+  // cannot see backdated keys, so re-read the whole day.
+  if (currentView === "day") {
+    await loadDay($("pick-day").value || localDate());
+  }
+  // Daily totals feed the month and year views and the Monthly tab.
+  invalidateDaily();
+  if (currentView !== "day") refreshChart();
+  if (!$("tab-monthly").classList.contains("hidden")) loadMonthlyTab();
+
+  const note = $("buffered-note");
+  note.classList.remove("syncing");
+  note.classList.add("done");
+  note.innerHTML = `· backfilled ${count} sample${count === 1 ? "" : "s"} from the ESP`;
+  setTimeout(() => {
+    note.classList.add("hidden");
+    note.classList.remove("done");
+    note.innerHTML = '· <span id="buffered-n">0</span> samples waiting on the ESP';
+  }, 8000);
+}
+
+
+
+/* ============================================================
+   TODAY'S WEATHER
+
+   Rendered from live.wxIcon / live.wxText, which the ESP32 derives
+   from the WMO weather code. The OLED renders from the same enum,
+   so the two displays cannot disagree about today's condition.
+
+   One distinct shape per condition -- not one generic cloud with
+   different labels.
+   ============================================================ */
+const WX_SVG = {
+  sunny: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4.2" fill="currentColor" stroke="none"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.6" y1="4.6" x2="6.4" y2="6.4"/><line x1="17.6" y1="17.6" x2="19.4" y2="19.4"/><line x1="4.6" y1="19.4" x2="6.4" y2="17.6"/><line x1="17.6" y1="6.4" x2="19.4" y2="4.6"/></g></svg>',
+  partly: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="8.5" cy="7.5" r="3.2" fill="currentColor" stroke="none"/><line x1="8.5" y1="1.4" x2="8.5" y2="3"/><line x1="2.4" y1="7.5" x2="4" y2="7.5"/><line x1="4.2" y1="3.2" x2="5.3" y2="4.3"/><path d="M8 19h9a3.5 3.5 0 0 0 .3-7 5 5 0 0 0-9.5 1.2A3 3 0 0 0 8 19z"/></svg>',
+  cloudy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 18h10a3.8 3.8 0 0 0 .3-7.6 5.4 5.4 0 0 0-10.3 1.3A3.2 3.2 0 0 0 7 18z"/></svg>',
+  fog: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 13h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 13z"/><line x1="4" y1="17" x2="20" y2="17"/><line x1="6" y1="20.5" x2="18" y2="20.5"/></svg>',
+  rain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 14h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 14z"/><line x1="8.5" y1="17" x2="7.5" y2="20"/><line x1="13" y1="17" x2="12" y2="20"/><line x1="17.5" y1="17" x2="16.5" y2="20"/></svg>',
+  heavyrain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 13h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 13z"/><line x1="7" y1="15.5" x2="5.6" y2="19"/><line x1="10.5" y1="15.5" x2="9.1" y2="19"/><line x1="14" y1="15.5" x2="12.6" y2="19"/><line x1="17.5" y1="15.5" x2="16.1" y2="19"/><line x1="9" y1="19.5" x2="8" y2="22"/><line x1="15" y1="19.5" x2="14" y2="22"/></svg>',
+  storm: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 12.5h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 12.5z"/><path d="M13 15l-3.2 4.2h3L11 23"/><line x1="17" y1="15.5" x2="16" y2="18.5"/></svg>',
+  unknown: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M7 16h10a3.6 3.6 0 0 0 .3-7.2 5.2 5.2 0 0 0-9.9 1.2A3 3 0 0 0 7 16z"/><line x1="12" y1="19.5" x2="12" y2="19.6" stroke-width="2.4"/></svg>',
+};
+
+function renderWeather() {
+  const strip = $("wx-strip");
+  if (!strip) return;
+  // Firmware that predates the weather keys omits them: hide rather
+  // than invent a condition.
+  if (!live || !live.wxIcon) { strip.classList.add("hidden"); return; }
+  strip.classList.remove("hidden");
+
+  const key = WX_SVG[live.wxIcon] ? live.wxIcon : "unknown";
+  strip.dataset.wx = key;
+  $("wx-ico").innerHTML = WX_SVG[key];
+  $("wx-cond").textContent = live.wxText || "UNKNOWN";
+
+  const bits = [];
+  if (live.wxCloud != null)  bits.push(`${live.wxCloud}% cloud`);
+  if (live.wxPrecip != null) bits.push(`${Number(live.wxPrecip).toFixed(1)} mm rain`);
+  // What the controller is ACTING on, which may differ from the
+  // forecast once measured PV has overridden it.
+  if (live.pvVerdict === "good")      bits.push("PV confirms a good day");
+  else if (live.pvVerdict === "poor") bits.push("PV says worse than forecast");
+  $("wx-sub").textContent = bits.join(" · ");
+
+  const age = live.wxAgeDays;
+  const el = $("wx-age");
+  if (age == null || age < 0) {
+    el.textContent = "no forecast";
+    el.classList.add("stale");
+  } else if (age === 0) {
+    el.textContent = "today";
+    el.classList.remove("stale");
+  } else {
+    el.textContent = `forecast ${age}d old`;
+    el.classList.toggle("stale", age >= 2);
+  }
+}
+
+/* ---------------- chart ---------------- */
+/* ============================================================
+   ONE AXIS CONFIGURATION, SHARED BY EVERY CHART
+
+   The Generation & Usage chart used to build its own axes: no
+   explicit tick font, so it fell through to Chart.defaults at
+   12 px while its x ticks were 10 px, and no maxTicksLimit, so the
+   y axis labelled every 50 W. Two different sizes on one chart is
+   what read as "shaky and oversized".
+
+   'IBM Plex Mono' was also never loaded -- index.html requests
+   Chakra Petch, Outfit and JetBrains Mono -- so this default
+   silently resolved to the generic monospace face, and the inline
+   theme script then overrode it with JetBrains Mono anyway. Naming
+   the family that is actually fetched removes a difference that
+   depended on script order.
+
+   Everything below is defined ONCE and handed to every chart, so
+   the axes cannot drift apart again.
+   ============================================================ */
+const FONT_MONO = "'JetBrains Mono', monospace";
+const FONT_UI   = "Outfit, system-ui, sans-serif";
+
+// Tick text. 10 px desktop / 9 px mobile, regular weight -- the
+// heavy look came from an unset weight resolving against a face
+// loaded at 400/600/800.
+const axisTickFont  = () => ({ family: FONT_MONO, size: isNarrow() ? 9 : 10, weight: 400 });
+const axisTitleFont = () => ({ family: FONT_UI,   size: isNarrow() ? 10 : 11, weight: 500 });
+const legendFont    = () => ({ family: FONT_UI,   size: 11, weight: 500 });
+
+// A fixed y-scale width so every plot area starts at the same x and
+// the charts line up vertically down the page. Chart.js sizes the
+// y scale to its widest label, so "500" and "100%" would otherwise
+// give two different left edges.
+const Y_SCALE_W = 46;
+
+Chart.defaults.color = "#8B8175";
+Chart.defaults.borderColor = "#ECE3D6";
+Chart.defaults.font.family = FONT_MONO;
+
+const chart = new Chart($("chart-main"), {
+  type: "line",
+  data: { labels: [], datasets: [{
+    // Seed colours only -- styleChart() repaints from the tokens on
+    // the first update. They still matter for the frame before that,
+    // so they carry the current palette rather than the old orange.
+    data: [], borderColor: "#FACC15", borderWidth: 2, pointRadius: 0,
+    fill: { target: "origin", above: "rgba(250,204,21,0.10)", below: "rgba(87,166,242,0.10)" },
+    tension: 0.3,
+  }]},
+  options: {
+    animation: { duration: 300 }, plugins: { legend: { display: false } },
+    scales: { x: { ticks: { maxTicksLimit: 8 } }, y: { title: { display: true, text: "W" } } },
+  },
+});
+
+function setChartType(type, labels, datasets) {
+  chart.config.type = type;
+  chart.data.labels = labels;
+  chart.data.datasets = datasets;
+  chart.options.scales.y =
+    valueAxis(type === "line" ? "W" : "kWh", themeColor("--muted"), themeColor("--grid"));
+  // The day view pins x to a linear 0-1440 minute axis. Month and
+  // year are label-indexed bars, so the category axis has to be put
+  // back or they inherit the fixed 24 h range and render nothing.
+  chart.options.scales.x = {
+    type: "category",
+    ticks: { maxTicksLimit: 12, maxRotation: 0 },
+  };
+  chart.update();
+}
+
+function localDate(d = new Date()) { return d.toLocaleDateString("en-CA"); }
+
+let currentView = "day";
+let currentRows = { labels: [], harvested: [], used: [] };  // for CSV export
+
+/* ============================================================
+   DAY VIEW - CIRCULAR SAMPLE BUFFER
+
+   The old version read history once with .once("value") and only
+   re-read it on a tab switch or the 30-minute timer, so the "live"
+   graph was in fact a snapshot that sat still for half an hour.
+
+   Now: a fixed-size ring keyed by unix timestamp.
+     - seeded from /history/<date> on load
+     - appended from the /live listener as values arrive (3 s)
+     - appended from a child_added listener so the canonical
+       one-minute samples and any backlog upload also land
+     - deduplicated by timestamp, so nothing is ever counted twice
+     - sorted only when a sample actually arrives out of order,
+       which happens after an offline backlog is flushed
+     - bounded at RING_MAX, oldest dropped: memory cannot grow and
+       the window scrolls instead of accumulating forever
+   ============================================================ */
+/* One slot per MINUTE of the day, which is exactly the resolution the
+   ESP logs at. Two reasons this is bucketed rather than a plain
+   timestamp set:
+
+   1. The /live listener fires every LIVE_PUSH_MS (5 s). Keyed by raw
+      timestamp that is 720 new points per hour, ~17000 a day, so the
+      ring hit its cap by mid-morning and evicted the start of the day
+      — the chart could not show a full day even in principle.
+   2. Canonical history samples are ~60 s apart but NOT aligned to :00,
+      so a live point and the history point for the same minute have
+      different timestamps and would both be kept as duplicates.
+
+   Bucketing by floor(t/60) fixes both: at most 1440 points per day,
+   the whole day always fits, and history (canonical) overwrites the
+   live estimate for the same minute when it arrives. */
+const RING_MAX = 1600;                   // 1440 minutes + headroom
+
+const ring = {
+  rows: [],            // ascending by .t
+  slot: new Map(),     // minute bucket -> row, for O(1) dedupe/upsert
+  date: null,          // which local date this ring holds
+};
+
+function ringReset(dateStr) {
+  ring.rows.length = 0;
+  ring.slot.clear();
+  ring.date = dateStr;
+}
+
+/* isLive: a 5 s estimate for the minute in progress. It may be
+   replaced by a later live sample, and is always superseded by the
+   canonical one-minute history sample for the same bucket. */
+function ringPush(s, isLive) {
+  const ts = Number(s && s.t);
+  if (!isFinite(ts) || ts <= 0) return false;
+  const bucket = Math.floor(ts / 60);
+
+  const existing = ring.slot.get(bucket);
+  if (existing) {
+    // History always wins. A live sample only refreshes another live one.
+    if (!isLive || existing.live) {
+      Object.assign(existing, s, { live: !!isLive });
+      return true;
+    }
+    return false;
+  }
+
+  const row = Object.assign({}, s, { live: !!isLive });
+  ring.slot.set(bucket, row);
+  const n = ring.rows.length;
+  if (n && ts < ring.rows[n - 1].t) {
+    ring.rows.push(row);
+    ring.rows.sort((a, b) => a.t - b.t);      // rare: backlog arrived late
+  } else {
+    ring.rows.push(row);
+  }
+  while (ring.rows.length > RING_MAX) {
+    const dropped = ring.rows.shift();
+    ring.slot.delete(Math.floor(dropped.t / 60));
+  }
+  return true;
+}
+
+/* one rAF-coalesced redraw, so a burst of samples repaints once */
+let drawQueued = false;
+function queueDayDraw() {
+  if (drawQueued || currentView !== "day") return;
+  drawQueued = true;
+  requestAnimationFrame(() => { drawQueued = false; drawDay(); });
+}
+
+/* Minutes since local midnight of the day being displayed. This is
+   the x coordinate for the day chart. */
+function minutesOfDay(ts, dateStr) {
+  const midnight = new Date(dateStr + "T00:00:00").getTime();   // local
+  return (ts * 1000 - midnight) / 60000;
+}
+
+/* ============================================================
+   PART E - THE SHARED TIME AXIS
+
+   Both day charts previously drew a label every 2 hours as
+   "00:00", "02:00", ... Twelve five-character labels do not fit
+   across 360 px, so they collided into an unreadable block; on
+   desktop they were merely crowded.
+
+   Three changes fix it, and BOTH charts take the axis from this
+   one function so they cannot drift apart or misalign vertically:
+
+     1. Hours only. "06" instead of "06:00" is 60% narrower and
+        loses nothing -- the unit is named once, in the axis title.
+     2. A breakpoint. 3-hourly on desktop, 6-hourly under 600 px.
+     3. autoSkip with maxTicksLimit, so if a container is narrower
+        than the breakpoint assumed, Chart.js drops labels itself
+        rather than overprinting them.
+
+   Labels stay horizontal (maxRotation 0): rotated ticks are
+   harder to read and cost vertical space that the chart needs.
+   ============================================================ */
+const NARROW_PX = 600;
+function isNarrow() {
+  return (window.innerWidth || document.documentElement.clientWidth) < NARROW_PX;
+}
+
+// Minutes-of-day -> "00".."24". Whole hours only; ticks always land
+// on an exact hour because stepSize is a multiple of 60.
+function hourTick(mins) {
+  const h = Math.round(mins / 60);
+  return String(h).padStart(2, "0");
+}
+
+/* MUST return a fresh plain object every call. chart.options is a
+   Chart.js proxy; handing back a shared object that has already been
+   assigned into one chart's options and assigning it into another
+   builds a self-reference and the scriptable resolver recurses
+   forever. Same trap documented on the tooltip callbacks below. */
+function timeAxis(dim, grid) {
+  const narrow = isNarrow();
+  return {
+    type: "linear",
+    min: 0,
+    max: 1440,
+    offset: false,
+    bounds: "ticks",
+    grid: { color: grid },
+    ticks: {
+      stepSize: narrow ? 360 : 180,          // 6 h on mobile, 3 h on desktop
+      autoSkip: true,
+      maxTicksLimit: narrow ? 5 : 9,
+      maxRotation: 0,
+      minRotation: 0,
+      padding: 4,
+      color: dim,
+      font: axisTickFont(),
+      callback: (v) => hourTick(v),
+    },
+    title: {
+      display: true,
+      text: "Time (h)",
+      color: dim,
+      font: axisTitleFont(),
+      padding: { top: 2, bottom: 0 },
+    },
+  };
+}
+
+/* The y counterpart. Same discipline: explicit font, explicit
+   colour, explicit padding, and a tick CEILING rather than a step,
+   so the labels stay readable whatever the day's peak turns out to
+   be. About six is the most a 200 px tall plot can carry.
+
+   afterFit pins the scale width, which is what actually aligns the
+   plot areas of the charts stacked down the page.
+
+   Returns a fresh plain object every call -- chart.options is a
+   Chart.js proxy and a shared object assigned into two charts
+   builds a self-reference the resolver recurses on. */
+function valueAxis(text, dim, grid, extra) {
+  const a = {
+    beginAtZero: true,
+    grid: { color: grid },
+    ticks: {
+      maxTicksLimit: 6,
+      color: dim,
+      padding: 4,
+      font: axisTickFont(),
+    },
+    title: {
+      display: true,
+      text: text,
+      color: dim,
+      font: axisTitleFont(),
+    },
+    afterFit: (scale) => { scale.width = Y_SCALE_W; },
+  };
+  if (extra) {
+    if (extra.min != null) a.min = extra.min;
+    if (extra.max != null) a.max = extra.max;
+    if (extra.callback) a.ticks.callback = extra.callback;
+    if (extra.stepSize) a.ticks.stepSize = extra.stepSize;
+  }
+  return a;
+}
+
+// 8 px under the ticks so the axis title is never clipped.
+function applyAxisPadding(chart) {
+  chart.options.layout.padding.bottom = 8;
+}
+
+// Minutes-of-day -> "HH:MM". Rounding to a whole minute FIRST is
+// what keeps decimals off the axis, and it also fixes a carry bug:
+// Math.round(59.9999) is 60, so the old version could render
+// "11:60" in a tooltip for a sample landing on a minute boundary.
+function hhmm(mins) {
+  let t = Math.round(mins);
+  if (!isFinite(t) || t < 0) t = 0;
+  const h = Math.floor(t / 60), m = t % 60;
+  return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
+}
+
+/* ============================================================
+   PART F - CEB RUNTIME SHADING
+
+   Every history sample the ESP writes already carries `src`, the
+   committed source state (0 none, 1 pack/solar, 2 CEB/utility) --
+   buildSampleJson() has shipped it since v4. So this needs NO new
+   firmware field, NO schema change and NO new upload path, and in
+   particular it is never inferred from SoC or PV.
+
+   Samples are about 60 s apart. A run is closed when the source
+   changes OR when the gap to the next sample exceeds SRC_GAP_MAX,
+   so a logging outage renders as an unshaded gap rather than as an
+   invented hour of grid time.
+   ============================================================ */
+const SRC_UTILITY = 2;              // matches enum Source in config.h
+const SRC_GAP_MAX = 5;              // minutes; longer is a data gap
+
+// -> { bands: [{a,b}] in minutes-of-day, cebMin, packMin }
+function cebRuns(rows, dateStr) {
+  const out = { bands: [], cebMin: 0, packMin: 0 };
+  if (!rows || rows.length < 2) return out;
+
+  let open = null;
+  for (let i = 0; i < rows.length - 1; i++) {
+    const a = rows[i], b = rows[i + 1];
+    if (a.src == null) continue;
+    const t0 = minutesOfDay(a.t, dateStr);
+    const t1 = minutesOfDay(b.t, dateStr);
+    const dt = t1 - t0;
+    if (!(dt > 0) || dt > SRC_GAP_MAX) {        // gap: close and skip
+      if (open) { out.bands.push(open); open = null; }
+      continue;
+    }
+    if (Number(a.src) === SRC_UTILITY) {
+      out.cebMin += dt;
+      if (open) open.b = t1;
+      else open = { a: t0, b: t1 };
+    } else {
+      out.packMin += dt;
+      if (open) { out.bands.push(open); open = null; }
+    }
+  }
+  if (open) out.bands.push(open);
+  return out;
+}
+
+function hoursMins(mins) {
+  const m = Math.max(0, Math.round(mins));
+  const h = Math.floor(m / 60);
+  return h ? `${h}h ${String(m % 60).padStart(2, "0")}m` : `${m}m`;
+}
+
+/* Drawn BEHIND the datasets, so the blue and green lines stay fully
+   legible on top of the tint. */
+const cebBandPlugin = {
+  id: "cebBands",
+  beforeDatasetsDraw(chart, _args, opts) {
+    const bands = opts && opts.bands;
+    if (!bands || !bands.length) return;
+    const x = chart.scales.x;
+    const area = chart.chartArea;
+    if (!x || !area) return;
+    const ctx = chart.ctx;
+    ctx.save();
+    ctx.fillStyle = opts.color || "rgba(200,150,60,0.16)";
+    for (const b of bands) {
+      const x0 = x.getPixelForValue(Math.max(0, b.a));
+      const x1 = x.getPixelForValue(Math.min(1440, b.b));
+      if (x1 <= x0) continue;
+      ctx.fillRect(x0, area.top, Math.max(1, x1 - x0), area.bottom - area.top);
+    }
+    ctx.restore();
+  },
+};
+Chart.register(cebBandPlugin);
+
+function drawDay() {
+  // A CATEGORY axis takes its width from however many samples exist,
+  // so a half-empty day stretched a few morning readings across the
+  // whole canvas and the axis moved every time a sample landed.
+  // A fixed linear axis in minutes-of-day pins the chart to
+  // 00:00-24:00 always: the curve grows into a stable frame instead
+  // of the frame resizing around the curve.
+  const gen = ring.rows.map((s) => ({ x: minutesOfDay(s.t, ring.date), y: s.p > 0 ? s.p : 0 }));
+  const use = ring.rows.map((s) => ({ x: minutesOfDay(s.t, ring.date), y: s.p < 0 ? -s.p : 0 }));
+
+  chart.config.type = "line";
+  // The same axis pair the SoC chart uses, so the two line up and
+  // share every font, colour and padding value.
+  chart.options.scales.y = valueAxis("W", themeColor("--muted"), themeColor("--grid"));
+  chart.data.labels = [];                      // linear axis: points carry x
+
+  // Must be a PLAIN literal. chart.options is a Chart.js proxy, so
+  // Object.assign({}, chart.options.scales.x, ...) copies the
+  // resolver's own internals back into itself and the scriptable
+  // resolver then recurses forever ("Recursion detected").
+  chart.options.scales.x = timeAxis(themeColor("--muted"), themeColor("--grid"));
+  applyAxisPadding(chart);
+
+  // Usage first, generation second: the point of this system is to
+  // understand what the house consumed, with what the array made as
+  // the supporting number. The inline theme glue in index.html now
+  // colours by LABEL, not by index, so this order is safe to change.
+  chart.data.datasets = [
+    { label: "Electricity use", data: use, borderWidth: 2, pointRadius: 0,
+      fill: "origin", tension: 0.35, spanGaps: false },
+    { label: "Generation (charging)", data: gen, borderWidth: 2, pointRadius: 0,
+      fill: "origin", tension: 0.35, spanGaps: false },
+  ];
+  // Without an explicit title callback Chart.js prints the raw linear
+  // x value for a tooltip -- e.g. "457.8166666666667". Format it.
+  // NOTE: do NOT write `plugins.tooltip = plugins.tooltip || {}` here.
+  // chart.options is a Chart.js proxy, so assigning it into itself
+  // builds a self-reference and the resolver recurses forever
+  // ("Maximum call stack size exceeded"). plugins.tooltip always
+  // exists from the defaults, so just set the callbacks on it.
+  chart.options.plugins.tooltip.callbacks = {
+    title: (items) => (items.length ? hhmm(items[0].parsed.x) : ""),
+    label: (it) => ` ${it.dataset.label}: ${Math.round(it.parsed.y)} W`,
+  };
+  chart.options.plugins.legend.display = true;
+
+  // Part F. Shade the periods the house actually ran on CEB, and
+  // say how long that was underneath.
+  const runs = cebRuns(ring.rows, ring.date);
+  // Dedicated tokens, identical in both themes: the band is a 15%
+  // wash and the swatch border is the solid yellow. Reading --amber
+  // instead would pick up the darker light-theme stroke colour.
+  const bandFill = themeColor("--ceb-band");
+  const bandLine = themeColor("--ceb-line");
+  chart.options.plugins.cebBands = { bands: runs.bands, color: bandFill };
+  // An empty dataset renders nothing but gives the legend its
+  // swatch, which is cheaper and less fragile than overriding
+  // generateLabels.
+  chart.data.datasets.push({
+    label: "On CEB", data: [], backgroundColor: bandFill,
+    borderColor: bandLine, borderWidth: 0, pointRadius: 0, fill: true,
+    // The theme glue in index.html repaints datasets by label; this
+    // one owns its colour because it has to match the shading.
+    ownColor: true,
+  });
+
+  chart.update("none");                       // no animation = no flicker
+
+  const cebEl = $("ceb-caption");
+  if (cebEl) {
+    const known = runs.cebMin + runs.packMin;
+    cebEl.innerHTML = !known
+      ? "No source history stored for this day yet"
+      : `<span><span class="swatch"></span>CEB runtime today: <b>${hoursMins(runs.cebMin)}</b></span>` +
+        `<span>Pack runtime: <b>${hoursMins(runs.packMin)}</b></span>`;
+  }
+
+  // Same ring, same samples, further views of them.
+  drawSoc();
+  drawPred();
+
+  currentRows = {
+    kind: "day", date: ring.date,
+    columns: ["time", "voltage", "current", "power", "soc", "source"],
+    rows: ring.rows.map((s) => ({
+      time: new Date(s.t * 1000).toISOString(),
+      voltage: s.v, current: s.i, power: s.p, soc: s.soc,
+      source: s.src == null ? "" : (Number(s.src) === SRC_UTILITY ? "CEB" : "Pack"),
+    })),
+  };
+  const live = ring.date === localDate();
+  $("chart-caption").textContent = ring.rows.length
+    ? `Power in/out of the battery on ${ring.date} · ${ring.rows.length} samples${live ? " · live" : ""}`
+    : `No samples stored for ${ring.date} yet`;
+}
+
+
+/* ============================================================
+   BATTERY SoC OVER TIME
+
+   Reuses the SAME ring the generation chart is built from -- the
+   ESP has always shipped `soc` inside every /history sample, so
+   this needs no new data source, no new Firebase path and no
+   firmware change to feed it.
+
+   Truthful by construction: one point per stored sample, no
+   interpolation, and spanGaps:false so a logging gap renders as a
+   gap rather than a straight line pretending the pack was there.
+   ============================================================ */
+let socChart = null;
+
+function drawSoc() {
+  const pts = ring.rows
+    .filter((s) => s.soc != null && isFinite(s.soc))
+    .map((s) => ({ x: minutesOfDay(s.t, ring.date), y: Number(s.soc) }));
+
+  const dim  = themeColor("--muted");
+  const grid = themeColor("--grid");
+  const tealC = themeColor("--teal");
+
+  const ds = [{
+    label: "Battery SoC",
+    data: pts,
+    borderColor: tealC,
+    backgroundColor: tealC + "2E",
+    borderWidth: 2,
+    pointRadius: 0,
+    fill: "origin",
+    tension: 0.3,
+    spanGaps: false,
+  }];
+
+  if (!socChart) {
+    socChart = new Chart($("chart-soc"), {
+      type: "line",
+      data: { labels: [], datasets: ds },
+      options: {
+        maintainAspectRatio: false,
+        animation: { duration: 0 },
+        interaction: { mode: "index", intersect: false },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              title: (items) => (items.length ? hhmm(items[0].parsed.x) : ""),
+              label: (it) => ` ${Math.round(it.parsed.y)} %`,
+            },
+          },
+        },
+        scales: {
+          x: timeAxis(dim, grid),
+          // Identical construction to the usage chart; only the
+          // range, the unit suffix and the title differ.
+          y: valueAxis("SoC", dim, grid,
+                       { min: 0, max: 100, stepSize: 20, callback: (v) => v + "%" }),
+        },
+      },
+    });
+  } else {
+    socChart.data.datasets = ds;
+  }
+
+  const o = socChart.options;
+  // Rebuilt rather than patched: crossing the 600 px breakpoint has
+  // to change stepSize and font size too, not just the colours.
+  o.scales.x = timeAxis(dim, grid);
+  o.scales.y = valueAxis("SoC", dim, grid,
+                         { min: 0, max: 100, stepSize: 20, callback: (v) => v + "%" });
+  applyAxisPadding(socChart);
+  socChart.update("none");
+
+  const el = $("soc-caption");
+  if (!el) return;
+  if (!pts.length) {
+    el.textContent = `No state-of-charge samples stored for ${ring.date} yet`;
+    return;
+  }
+  let lo = pts[0].y, hi = pts[0].y;
+  for (const p of pts) { if (p.y < lo) lo = p.y; if (p.y > hi) hi = p.y; }
+  el.textContent =
+    `State of charge on ${ring.date} · now ${Math.round(pts[pts.length - 1].y)}%` +
+    ` · low ${Math.round(lo)}% · high ${Math.round(hi)}%`;
+}
+
+
+/* ============================================================
+   PART G - PREDICTION ACCURACY
+
+   Two curves: what this array HAS produced hour by hour on
+   previous days, and what it produced today.
+
+   WHERE THE EXPECTED CURVE COMES FROM. The ESP32 does not publish
+   an hourly profile, and adding one would mean touching the upload
+   path, which is locked. So it is computed here from history days
+   that are already in Firebase.
+
+   That is not free -- a day is roughly 1400 samples -- so:
+     - at most PROFILE_DAYS days are ever fetched,
+     - the fetch is deferred to idle time after the live day has
+       loaded, so it never competes with the charts above,
+     - and only the RESULT (24 hours x 3 numbers) is cached, in
+       localStorage, keyed by date. One fetch per day per browser.
+
+   With fewer than PROFILE_MIN_DAYS days the card says so rather
+   than drawing a confident band through two data points.
+   ============================================================ */
+const PROFILE_DAYS = 21;        // days pulled for the model
+const PROFILE_MIN_DAYS = 7;     // fewer valid days -> LEARNING, no curve
+const PROFILE_SLOT_MIN = 30;    // half-hour resolution
+const PROFILE_SLOTS = (24 * 60) / PROFILE_SLOT_MIN;
+const PROFILE_KEY = "sp.pvProfile.v2";   // v2: slots changed, cache invalidated
+const Y_MIN_TOP = 300;          // a quiet day must not look dramatic
+
+let predChart = null;
+let predDay = null;             // the date the current instance was built for
+let pvProfile = null;           // { date, days, slots:[{p25,p50,p75}|null] }
+let profileBusy = false;
+
+function loadProfileCache() {
+  try {
+    const raw = localStorage.getItem(PROFILE_KEY);
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    return (o && o.date === localDate() && Array.isArray(o.slots)
+            && o.slots.length === PROFILE_SLOTS) ? o : null;
+  } catch (e) { return null; }
+}
+
+function saveProfileCache(o) {
+  try { localStorage.setItem(PROFILE_KEY, JSON.stringify(o)); } catch (e) {}
+}
+
+function quantile(sorted, q) {
+  if (!sorted.length) return 0;
+  const i = (sorted.length - 1) * q;
+  const lo = Math.floor(i), hi = Math.ceil(i);
+  return lo === hi ? sorted[lo] : sorted[lo] + (sorted[hi] - sorted[lo]) * (i - lo);
+}
+
+/* A day is worth learning from only if it actually logged. These
+   rules exclude the obvious rubbish rather than trying to be clever:
+   a day the logger missed, a day with no generation at all, and a
+   day whose peak is impossible for a 580 W array. */
+const MIN_SAMPLES_PER_DAY = 600;    // ~10 h of one-minute logging
+const MAX_PLAUSIBLE_W = 2000;
+
+function dayIsValid(rows) {
+  if (!rows || rows.length < MIN_SAMPLES_PER_DAY) return false;
+  let peak = 0, anyCharge = false;
+  for (const r of rows) {
+    const p = r.p > 0 ? r.p : 0;
+    if (p > peak) peak = p;
+    if (p > 5) anyCharge = true;
+  }
+  return anyCharge && peak <= MAX_PLAUSIBLE_W;
+}
+
+/* One day -> a per-slot mean of charging power. Charging only, the
+   same definition the generation curve uses; this card must not
+   invent a second one. */
+function slotsFromRows(rows, dateStr) {
+  const acc = Array.from({ length: PROFILE_SLOTS }, () => ({ sum: 0, n: 0 }));
+  for (const r of rows) {
+    const m = minutesOfDay(r.t, dateStr);
+    if (!(m >= 0 && m < 1440)) continue;
+    const k = Math.floor(m / PROFILE_SLOT_MIN);
+    acc[k].sum += r.p > 0 ? r.p : 0;
+    acc[k].n++;
+  }
+  return acc.map((a) => (a.n ? a.sum / a.n : null));
+}
+
+async function buildProfile() {
+  if (profileBusy) return;
+  const cached = loadProfileCache();
+  if (cached) { pvProfile = cached; drawPred(); return; }
+
+  profileBusy = true;
+  const perDay = [];
+  let looked = 0, rejected = 0;
+  for (let back = 1; back <= PROFILE_DAYS; back++) {
+    const d = new Date();
+    d.setDate(d.getDate() - back);
+    const key = localDate(d);
+    let snap;
+    try {
+      snap = await db.ref("history/" + key).limitToLast(RING_MAX).once("value");
+    } catch (e) { continue; }
+    looked++;
+    const rows = [];
+    // DataSnapshot.forEach CANCELS on a truthy return -- braces matter.
+    snap.forEach((c) => { const v = c.val(); if (v && v.t) rows.push(v); });
+    if (!dayIsValid(rows)) { rejected++; continue; }
+    rows.sort((a, b) => a.t - b.t);
+    perDay.push(slotsFromRows(rows, key));
+  }
+
+  /* Per SLOT, across days: the median is the expected curve and the
+     25th/75th are the spread. Taken across DAYS, so one washout
+     cannot drag the shape -- which is exactly what the old
+     mean-of-5-days version let happen. */
+  const slots = [];
+  for (let k = 0; k < PROFILE_SLOTS; k++) {
+    const vals = perDay.map((d) => d[k]).filter((v) => v != null);
+    if (vals.length < 3) { slots.push(null); continue; }
+    vals.sort((a, b) => a - b);
+    slots.push({ p25: quantile(vals, 0.25), p50: quantile(vals, 0.5),
+                 p75: quantile(vals, 0.75) });
+  }
+
+  pvProfile = { date: localDate(), days: perDay.length, looked, rejected, slots };
+  saveProfileCache(pvProfile);
+  profileBusy = false;
+  drawPred();
+}
+
+/* PART E(e). A fixed top rounded up to the next 100 W above the
+   day's own peak, never below Y_MIN_TOP, so a 60 W day and a 500 W
+   day are read on comparable axes instead of each being stretched
+   to fill the box. */
+function predYMax(actual, slots) {
+  let peak = 0;
+  for (const p of actual) if (p.y > peak) peak = p.y;
+  if (slots) for (const sl of slots) if (sl && sl.p75 > peak) peak = sl.p75;
+  return Math.max(Y_MIN_TOP, Math.ceil((peak * 1.1) / 100) * 100);
+}
+
+function drawPred() {
+  const cv = $("chart-pred");
+  const cap = $("pred-caption");
+  if (!cv) return;
+
+  /* PART E(c). THE GHOST TEXT.
+
+     Chart.js paints tooltips onto the canvas. Re-pointing an
+     existing instance at a new day's datasets (what this used to do)
+     leaves the previous frame's tooltip composited underneath --
+     that is the "07:37 / Expected PV / Generation (charging) 2 W"
+     ghosted over the plot. Chart.getChart() also catches the other
+     half of it: any instance still bound to this canvas, including
+     one created before a day change.
+
+     So: on a day change, DESTROY and rebuild. */
+  const bound = Chart.getChart(cv);
+  if (bound && bound !== predChart) bound.destroy();
+  if (predChart && predDay !== ring.date) { predChart.destroy(); predChart = null; }
+  predDay = ring.date;
+
+  const dim = themeColor("--muted");
+  const grid = themeColor("--grid");
+  const green = themeColor("--gen");
+
+  const actual = ring.rows.map((s) => ({
+    x: minutesOfDay(s.t, ring.date),
+    y: s.p > 0 ? s.p : 0,
+  }));
+
+  const ds = [];
+  const enough = pvProfile && pvProfile.days >= PROFILE_MIN_DAYS;
+  let bandHidden = false;
+
+  if (enough) {
+    const at = (k, key) => (pvProfile.slots[k]
+      ? { x: k * PROFILE_SLOT_MIN + PROFILE_SLOT_MIN / 2, y: pvProfile.slots[k][key] }
+      : null);
+
+    /* PART E(b). If the p25-p75 spread is wider than the expected
+       value itself, the model is not saying anything useful about
+       this site yet -- so it says nothing, rather than drawing a
+       confident-looking grey band around noise. */
+    let wide = 0, counted = 0;
+    for (const sl of pvProfile.slots) {
+      if (!sl || sl.p50 < 20) continue;          // ignore the flat night
+      counted++;
+      if ((sl.p75 - sl.p25) > sl.p50) wide++;
+    }
+    bandHidden = counted > 0 && wide > counted / 2;
+
+    const mid = [], b25 = [], b75 = [];
+    for (let k = 0; k < PROFILE_SLOTS; k++) {
+      const m = at(k, "p50"), lo = at(k, "p25"), hi = at(k, "p75");
+      if (m) mid.push(m);
+      if (lo) b25.push(lo);
+      if (hi) b75.push(hi);
+    }
+
+    if (!bandHidden) {
+      ds.push({ label: "Typical spread", data: b75, borderColor: "transparent",
+                backgroundColor: dim + "22", borderWidth: 0, pointRadius: 0,
+                fill: "+1", tension: 0.35, ownColor: true });
+      ds.push({ label: "_p25", data: b25, borderColor: "transparent",
+                borderWidth: 0, pointRadius: 0, fill: false, tension: 0.35,
+                ownColor: true });
+    }
+    ds.push({ label: "Expected PV", data: mid, borderColor: dim,
+              borderDash: [6, 4], borderWidth: 2, pointRadius: 0, fill: false,
+              tension: 0.35, ownColor: true });
+  }
+
+  ds.push({ label: "Actual PV today", data: actual, borderColor: green,
+            backgroundColor: green + "22", borderWidth: 2, pointRadius: 0,
+            fill: "origin", tension: 0.3, spanGaps: false, ownColor: true });
+
+  const yMax = predYMax(actual, enough ? pvProfile.slots : null);
+
+  if (!predChart) {
+    predChart = new Chart(cv, {
+      type: "line",
+      data: { labels: [], datasets: ds },
+      options: {
+        maintainAspectRatio: false,
+        animation: { duration: 0 },
+        interaction: { mode: "index", intersect: false },
+        plugins: {
+          legend: { display: true,
+                    labels: { filter: (i) => i.text !== "_p25", boxWidth: 10,
+                              boxHeight: 3, font: legendFont() } },
+          tooltip: {
+            filter: (i) => i.dataset.label !== "_p25",
+            callbacks: {
+              title: (items) => (items.length ? hhmm(items[0].parsed.x) : ""),
+              label: (it) => ` ${it.dataset.label}: ${Math.round(it.parsed.y)} W`,
+            },
+          },
+        },
+        scales: { x: timeAxis(dim, grid), y: valueAxis("W", dim, grid) },
+      },
+    });
+  } else {
+    predChart.data.datasets = ds;
+  }
+  predChart.options.scales.x = timeAxis(dim, grid);
+  predChart.options.scales.y = valueAxis("W", dim, grid, { min: 0, max: yMax });
+  applyAxisPadding(predChart);
+  // Belt and braces against a stale tooltip surviving the update.
+  if (predChart.tooltip && predChart.tooltip.setActiveElements) {
+    predChart.tooltip.setActiveElements([], { x: 0, y: 0 });
+  }
+  predChart.update("none");
+
+  if (!cap) return;
+  if (!pvProfile) { cap.textContent = "Building the historical profile…"; return; }
+
+  /* PART E(a). Under PROFILE_MIN_DAYS valid days there is no curve
+     and no band -- it says LEARNING and how far along it is. */
+  if (!enough) {
+    cap.className = "panel-sub";
+    cap.textContent = `LEARNING · ${pvProfile.days} valid day` +
+      `${pvProfile.days === 1 ? "" : "s"} of ${PROFILE_MIN_DAYS} needed` +
+      (pvProfile.rejected ? ` · ${pvProfile.rejected} day${pvProfile.rejected === 1 ? "" : "s"} rejected as incomplete` : "");
+    return;
+  }
+
+  const bits = [];
+
+  /* PART E(d). Never a bare "none cached". Either the real label, or
+     a sentence that says what is actually being used instead. */
+  const fcOk = (live && live.fcConf > 0 && live.fcText && live.fcText !== "UNKNOWN");
+  bits.push(fcOk ? `Forecast today: <b>${live.fcText}</b>`
+                 : `<b>Forecast unavailable</b> · using PV history`);
+
+  const expWh = live && live.predTodayWh;
+  const actWh = live && live.harvestWh;
+  if (expWh != null && expWh > 0) bits.push(`Expected <b>${(expWh / 1000).toFixed(1)} kWh</b>`);
+  if (actWh != null) bits.push(`Actual <b>${(actWh / 1000).toFixed(1)} kWh</b>`);
+  if (expWh != null && expWh > 0 && actWh != null) {
+    /* PART E(f). Symmetric ratio accuracy:
+         acc = 100 * min(actual, expected) / max(actual, expected)
+       so 2x and 0.5x both score 50%, and the figure cannot exceed
+       100% by over-delivering. Stated in the report. */
+    const r = actWh / expWh;
+    const acc = Math.max(0, Math.round(100 * (r > 1 ? 1 / r : r)));
+    bits.push(`Accuracy <b>${acc}%</b>`);
+  }
+  bits.push(`model: ${pvProfile.days} day median`);
+  if (bandHidden) bits.push(`spread too wide to plot`);
+
+  cap.className = "panel-sub run-sum pred-acc";
+  cap.innerHTML = bits.map((b) => `<span>${b}</span>`).join("");
+}
+
+/* child_added listener for the day currently on screen. Detached
+   whenever the day changes so listeners cannot pile up -- that was
+   the memory leak path.
+
+   loadGen guards the await: spinning the date picker fires several
+   loadDay() calls, and without it a slow earlier fetch would land
+   its rows into the newer day's ring and attach a second listener. */
+let dayRef = null;
+let loadGen = 0;
+
+function detachDayFeed() {
+  if (dayRef) { dayRef.off(); dayRef = null; }
+}
+
+async function loadDay(dateStr) {
+  const gen = ++loadGen;
+  detachDayFeed();
+  ringReset(dateStr);
+  drawDay();                                   // paint empty immediately
+
+  let snap;
+  try {
+    snap = await db.ref("history/" + dateStr).limitToLast(RING_MAX).once("value");
+  } catch (e) {
+    $("chart-caption").textContent = `Could not load ${dateStr}: ${e.message || e}`;
+    return;
+  }
+  if (gen !== loadGen) return;                 // superseded while awaiting
+
+  // NOTE: Firebase's DataSnapshot.forEach ABORTS as soon as the
+  // callback returns a truthy value. ringPush returns true on a
+  // successful insert, so `forEach(c => ringPush(c.val()))` loaded
+  // exactly ONE sample and silently discarded the rest of the day.
+  // The braces matter: this callback must return undefined.
+  snap.forEach((c) => { ringPush(c.val()); });
+  drawDay();
+
+  // Only today keeps streaming; past days are static.
+  if (dateStr === localDate()) {
+    detachDayFeed();                           // belt and braces
+    dayRef = db.ref("history/" + dateStr).orderByKey().limitToLast(1);
+    dayRef.on("child_added", (c) => {
+      if (gen !== loadGen || ring.date !== dateStr) return;
+      if (ringPush(c.val())) queueDayDraw();
+    });
+  }
+
+  // The charts above are painted; now the historical profile may
+  // use the idle time and the network.
+  kickProfile();
+}
+
+/* ============================================================
+   DAILY TOTALS - QUERIED PER YEAR
+
+   limitToLast(400) silently truncated anything older than ~13
+   months, so a second year of history could never be totalled
+   correctly. Key-range queries return exactly the year asked for,
+   however far back it is.
+   ============================================================ */
+const dailyByYear = new Map();
+
+function harvestKwh(r) { return (r.harvestWh ?? r.chgWh ?? 0) / 1000; }
+function usedKwh(r)    { return (r.disWh ?? 0) / 1000; }
+
+async function daysForYear(year) {
+  const key = String(year);
+  if (dailyByYear.has(key)) return dailyByYear.get(key);
+  const snap = await db.ref("daily").orderByKey()
+    .startAt(key + "-01-01").endAt(key + "-12-31").once("value");
+  const rows = [];
+  // Same trap as loadDay: Array.prototype.push returns the new LENGTH,
+  // which is >= 1 and therefore truthy, so Firebase cancelled the
+  // enumeration after the first day. Every monthly and yearly total
+  // was computed from a single day. Braces = returns undefined.
+  snap.forEach((c) => { rows.push({ date: c.key, ...(c.val() || {}) }); });
+  dailyByYear.set(key, rows);
+  return rows;
+}
+
+function invalidateDaily() { dailyByYear.clear(); }
+
+async function loadMonth(monthStr) {           // "YYYY-MM"
+  detachDayFeed();
+  const rows = (await daysForYear(monthStr.slice(0, 4)))
+    .filter((r) => r.date.startsWith(monthStr));
+  const labels = rows.map((r) => r.date.slice(8));
+  const harvested = rows.map(harvestKwh);
+  const used = rows.map(usedKwh);
+  setChartType("bar", labels, [
+    { label: "Used", data: used, borderRadius: 4 },
+    { label: "Harvested", data: harvested, borderRadius: 4 },
+  ]);
+  chart.options.plugins.legend.display = true;
+  chart.update();
+  currentRows = { kind: "month", date: monthStr,
+    columns: ["date", "used_kWh", "harvested_kWh"],
+    rows: rows.map((r) => ({ date: r.date,
+      used_kWh: usedKwh(r).toFixed(3), harvested_kWh: harvestKwh(r).toFixed(3) })) };
+  const totUsed = used.reduce((a, b) => a + b, 0);
+  const total = harvested.reduce((a, b) => a + b, 0);
+  $("chart-caption").textContent =
+    `${monthStr} · drawn ${totUsed.toFixed(1)} kWh · harvested ${total.toFixed(1)} kWh`;
+}
+
+async function loadYear(yearStr) {              // "YYYY"
+  detachDayFeed();
+  const rows = await daysForYear(yearStr);
+  // Always twelve buckets: a month with no data must read 0, not
+  // vanish, or the bars silently shift along the axis.
+  const chg = Array(12).fill(0), dis = Array(12).fill(0);
+  rows.forEach((r) => {
+    const m = parseInt(r.date.slice(5, 7), 10) - 1;
+    if (m < 0 || m > 11) return;
+    chg[m] += harvestKwh(r);
+    dis[m] += usedKwh(r);
+  });
+  const labels = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  setChartType("bar", labels, [
+    { label: "Harvested", data: chg, borderRadius: 4 },
+    { label: "Used", data: dis, borderRadius: 4 },
+  ]);
+  chart.options.plugins.legend.display = true;
+  chart.update();
+  currentRows = { kind: "year", date: yearStr,
+    columns: ["month", "used_kWh", "harvested_kWh"],
+    rows: labels.map((name, i) => ({
+      month: `${yearStr}-${String(i + 1).padStart(2, "0")}`,
+      used_kWh: dis[i].toFixed(3), harvested_kWh: chg[i].toFixed(3) })) };
+  const totUsedY = dis.reduce((a, b) => a + b, 0);
+  const total = chg.reduce((a, b) => a + b, 0);
+  $("chart-caption").textContent =
+    `${yearStr} · drawn ${totUsedY.toFixed(1)} kWh · harvested ${total.toFixed(1)} kWh`;
+}
+
+function refreshChart() {
+  if (currentView === "day") loadDay($("pick-day").value || localDate());
+  else if (currentView === "month") loadMonth($("pick-month").value || localDate().slice(0, 7));
+  else loadYear($("pick-year").value || String(new Date().getFullYear()));
+}
+
+/* ---------------- view switcher ---------------- */
+document.querySelectorAll(".seg-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".seg-btn").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    currentView = btn.dataset.view;
+    $("pick-day").classList.toggle("hidden", currentView !== "day");
+    $("pick-month").classList.toggle("hidden", currentView !== "month");
+    $("pick-year").classList.toggle("hidden", currentView !== "year");
+    chart.options.plugins.legend.display = currentView !== "day";
+    refreshChart();
+  });
+});
+$("pick-day").value = localDate();
+$("pick-month").value = localDate().slice(0, 7);
+$("pick-year").value = String(new Date().getFullYear());
+$("pick-day").addEventListener("change", refreshChart);
+$("pick-month").addEventListener("change", refreshChart);
+$("pick-year").addEventListener("change", refreshChart);
+
+/* ---------------- CSV export ---------------- */
+function toCSV(columns, rows) {
+  const esc = (v) => `"${String(v).replace(/"/g, '""')}"`;
+  const head = columns.map(esc).join(",");
+  const body = rows.map((r) => columns.map((c) => esc(r[c] ?? "")).join(",")).join("\n");
+  return head + "\n" + body;
+}
+function downloadText(filename, text) {
+  const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+$("btn-export").addEventListener("click", () => {
+  if (!currentRows.rows || !currentRows.rows.length) return;
+  const csv = toCSV(currentRows.columns, currentRows.rows);
+  downloadText(`solar-pulse-${currentRows.kind}-${currentRows.date}.csv`, csv);
+});
+
+/* ============================================================
+   MONTHLY TAB
+   Built from /daily, the one-row-per-day log the ESP32 keeps in
+   its own flash and mirrors to Firebase. Twelve bars, one per
+   month of the chosen year, plus a table of the same numbers.
+   ============================================================ */
+const MONTH_NAMES = ["January","February","March","April","May","June",
+                     "July","August","September","October","November","December"];
+let monthlyChart = null;
+let monthlyRows = null;
+
+function themeColor(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+async function loadMonthlyTab() {
+  const year = String($("pick-myear").value || new Date().getFullYear());
+
+  const rows = await daysForYear(year);
+  const kwh = Array(12).fill(0), used = Array(12).fill(0), days = Array(12).fill(0);
+  rows.forEach((r) => {
+    const m = parseInt(r.date.slice(5, 7), 10) - 1;
+    if (m < 0 || m > 11) return;
+    // harvestWh is firmware v3; fall back to chgWh for older rows
+    kwh[m]  += (r.harvestWh ?? r.chgWh ?? 0) / 1000;
+    used[m] += (r.disWh || 0) / 1000;
+    days[m] += 1;
+  });
+
+  const total = kwh.reduce((a, b) => a + b, 0);
+  const totalUsed = used.reduce((a, b) => a + b, 0);
+  const totalDays = days.reduce((a, b) => a + b, 0);
+  // Busiest month is the biggest DRAW, not the biggest harvest:
+  // usage is the headline number on this dashboard now.
+  let bestIdx = 0;
+  used.forEach((v, i) => { if (v > used[bestIdx]) bestIdx = i; });
+
+  /* ---- summary cards ---- */
+  $("yr-kwh").textContent      = total.toFixed(1);
+  $("yr-days").textContent     = totalDays;
+  $("yr-best").textContent     = totalUsed > 0 ? MONTH_NAMES[bestIdx].slice(0, 3) : "--";
+  $("yr-best-kwh").textContent = used[bestIdx].toFixed(1);
+  $("yr-used").textContent     = totalUsed.toFixed(1);
+  $("yr-days2").textContent    = totalDays;
+
+  /* ---- bar chart ---- */
+  const labels = MONTH_NAMES.map((m) => m.slice(0, 3));
+  const solar = themeColor("--amber"), blue = themeColor("--use"), dim = themeColor("--muted");
+  const grid = themeColor("--grid");
+  const datasets = [
+    // Used first so it draws and legends first.
+    { label: "Used",      data: used, backgroundColor: blue,  borderRadius: 6 },
+    { label: "Harvested", data: kwh,  backgroundColor: solar, borderRadius: 6 },
+  ];
+
+  if (!monthlyChart) {
+    monthlyChart = new Chart($("chart-monthly"), {
+      type: "bar",
+      data: { labels, datasets },
+      options: {
+        maintainAspectRatio: false,
+        animation: { duration: 300 },
+        plugins: { legend: { labels: { boxWidth: 14, boxHeight: 3, font: { size: 11 } } } },
+        scales: { y: { beginAtZero: true, title: { display: true, text: "kWh" } } },
+      },
+    });
+  } else {
+    monthlyChart.data.labels = labels;
+    monthlyChart.data.datasets = datasets;
+  }
+  const o = monthlyChart.options;
+  o.scales.x.ticks = Object.assign(o.scales.x.ticks || {}, { color: dim });
+  o.scales.y.ticks = Object.assign(o.scales.y.ticks || {}, { color: dim });
+  o.scales.x.grid = Object.assign(o.scales.x.grid || {}, { color: grid });
+  o.scales.y.grid = Object.assign(o.scales.y.grid || {}, { color: grid });
+  o.scales.y.title.color = dim;
+  o.plugins.legend.labels.color = dim;
+  monthlyChart.update();
+
+  /* ---- table: used first, harvested second ---- */
+  $("mtbody").innerHTML =
+    used.map((u, i) =>
+      `<tr><td>${MONTH_NAMES[i]}</td><td>${u.toFixed(2)}</td>` +
+      `<td>${kwh[i].toFixed(2)}</td><td>${days[i]}</td></tr>`).join("") +
+    `<tr class="mtotal"><td>Total ${year}</td><td>${totalUsed.toFixed(2)}</td>` +
+    `<td>${total.toFixed(2)}</td><td>${totalDays}</td></tr>`;
+
+  $("monthly-caption").textContent =
+    `${year} · drawn ${totalUsed.toFixed(1)} kWh · harvested ${total.toFixed(1)} kWh`;
+
+  monthlyRows = {
+    kind: "monthly", date: year,
+    columns: ["month", "used_kWh", "harvested_kWh", "days_logged"],
+    rows: used.map((u, i) => ({
+      month: `${year}-${String(i + 1).padStart(2, "0")}`,
+      used_kWh: u.toFixed(3),
+      harvested_kWh: kwh[i].toFixed(3),
+      days_logged: days[i],
+    })),
+  };
+}
+
+$("pick-myear").value = String(new Date().getFullYear());
+$("pick-myear").addEventListener("change", loadMonthlyTab);
+$("btn-export-month").addEventListener("click", () => {
+  if (!monthlyRows) return;
+  downloadText(`solar-pulse-monthly-${monthlyRows.date}.csv`,
+               toCSV(monthlyRows.columns, monthlyRows.rows));
+});
+
+/* ---------------- bottom tab bar ---------------- */
+document.querySelectorAll(".nav-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".nav-btn").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    const tab = btn.dataset.tab;
+    $("tab-live").classList.toggle("hidden", tab !== "live");
+    $("tab-monthly").classList.toggle("hidden", tab !== "monthly");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    if (tab === "monthly") loadMonthlyTab();
+    else if (chart) chart.resize();
+  });
+});
+
+/* Build the historical PV profile once, at idle, so it never
+   competes with the live charts for the main thread or the network.
+   requestIdleCallback is not in every browser; setTimeout is the
+   fallback, not a race. */
+let profileKicked = false;
+function kickProfile() {
+  if (profileKicked) return;
+  profileKicked = true;
+  const go = () => buildProfile().catch(() => {});
+  if (window.requestIdleCallback) window.requestIdleCallback(go, { timeout: 8000 });
+  else setTimeout(go, 3000);
+}
+
+/* Crossing the 600 px breakpoint changes tick spacing and font
+   size, so the axes have to be rebuilt -- a plain canvas resize
+   does not do it. Debounced: a drag across the breakpoint fires
+   dozens of resize events. */
+let resizeT = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { if (currentView === "day") drawDay(); }, 150);
+});
+
+/* ---------------- wire it up ---------------- */
+db.ref("live").on("value", (snap) => {
+  live = snap.val();
+  render();
+
+  // Feed the live sample straight into the day ring. This is what
+  // makes the graph actually live at the ESP's 3 s cadence instead
+  // of waiting for the next one-minute history write.
+  if (live && currentView === "day" && ring.date === localDate()) {
+    if (ringPush({ t: live.ts, v: live.v, i: live.i, p: live.p, soc: live.soc }, true)) {
+      queueDayDraw();
+    }
+  }
+});
+
+setInterval(render, 3000);             // staleness watchdog
+
+/* Midnight in the browser: roll the day view over to the new date
+   so an overnight tab does not sit on yesterday forever. */
+setInterval(() => {
+  if (currentView !== "day") return;
+  const today = localDate();
+  if (ring.date && ring.date !== today && $("pick-day").value === ring.date) {
+    $("pick-day").value = today;
+    loadDay(today);
+  }
+}, 60 * 1000);
+
+refreshChart();
+
+setInterval(() => {
+  invalidateDaily();
+  if (currentView !== "day") refreshChart();
+  if (!$("tab-monthly").classList.contains("hidden")) loadMonthlyTab();
+}, 30 * 60 * 1000);
+
+/* redraw theme-coloured charts when the palette flips */
+new MutationObserver(() => {
+  if (monthlyChart && !$("tab-monthly").classList.contains("hidden")) loadMonthlyTab();
+  if (socChart) drawSoc();          // SoC line/fill are theme colours
+}).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
+</script>
+<script>
+/* Travel-only remote control. Telemetry confirms output; sending is never success. */
+(() => {
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const owner = (window.SOLARPULSE_CONTROL_OWNER_EMAIL || "").trim().toLowerCase();
+  let user = null, pending = null, latest = null, fresh = false, serverOffset = 0;
+  const auth = firebase.auth();
+  db.ref(".info/serverTimeOffset").on("value", snap => { serverOffset = Number(snap.val()) || 0; });
+  let systemNotice = false;
+  const status = (message, kind = "", system = false) => {
+    systemNotice = system;
+    $("house-command-status").textContent = message;
+    $("house-command-status").dataset.kind = kind;
+  };
+  const modeNames = ["Schedule", "On until next schedule change", "Off until next schedule change"];
+
+  window.renderTravelControl = (data, isFresh) => {
+    latest = data; fresh = isFresh && !!data.bmsLink;
+    const travel = !!data.travel;
+    $("morning-banner").classList.toggle("hidden", !(isFresh && data.bmsLink && !travel && data.morningSolar));
+    document.querySelector('.house-card').classList.toggle('is-travelling', travel);
+    $("house-travel-badge").textContent = travel ? "Travel mode on" : "Travel mode off";
+    $("house-travel-badge").classList.toggle("active", travel);
+    $("house-travel-panel").hidden = !travel;
+    $("house-normal-note").hidden = travel;
+    $("house-output").textContent = !isFresh ? "Unknown · monitor offline" : data.light ? "House output ON" : "House output OFF";
+    $("house-output").classList.toggle("is-on", isFresh && !!data.light);
+    $("house-schedule").textContent = `${data.lightOn || "--:--"} – ${data.lightOff || "--:--"} · Sri Lanka time`;
+    const mode = data.travelOverride === "on" ? 1 : data.travelOverride === "off" ? 2 : 0;
+    $("house-mode").textContent = data.loadCut ? "Battery protection has disconnected the house output" : modeNames[mode];
+    const supported = data.controlVersion === 1 && !!data.travelSession;
+    const allowed = !!(user && owner && (user.email || "").toLowerCase() === owner && user.emailVerified);
+    document.querySelectorAll("[data-house-mode]").forEach(button => {
+      button.disabled = !travel || !fresh || !supported || !allowed || !!pending || !!data.loadCut;
+      button.setAttribute("aria-pressed", String(+button.dataset.houseMode === mode));
+    });
+    $("house-sign-in").hidden = !!user;
+    $("house-sign-out").hidden = !user;
+    $("house-verify-email").hidden = !user || !!user.emailVerified;
+    $("house-account").textContent = !user ? "Sign in to control your house remotely." : !owner
+      ? "Setup required: add your owner email to control-settings.js and Firebase rules. No UID is needed."
+      : !user.emailVerified ? "Verify your email, then sign out and sign in again to enable control."
+      : allowed ? "Owner connected · command access approved" : "This email is not the configured owner.";
+    if (pending && data.houseCmdId === pending.id) {
+      status(data.houseCmdStatus === "applied" ? "Controller confirmed your command." : `Controller: ${data.houseCmdStatus || "command rejected"}`, data.houseCmdStatus === "applied" ? "ok" : "error");
+      pending = null;
+      window.renderTravelControl(data, isFresh);
+      return;
+    }
+    if (pending && Date.now() > pending.deadline) {
+      pending = null;
+      status("No confirmation received. Check the reported output before retrying.", "error");
+      window.renderTravelControl(data, isFresh);
+      return;
+    }
+    if (!pending) {
+      if (!travel) status("Automatic travel control is inactive.", "", true);
+      else if (!isFresh) status("Monitor offline. Remote commands are unavailable.", "error", true);
+      else if (!data.bmsLink) status("Battery telemetry unavailable. Remote commands are paused.", "error", true);
+      else if (!supported) status("Install the matching firmware release to enable remote control.", "error", true);
+      else if (systemNotice) status("Ready. Commands are confirmed by the controller.");
+    }
+  };
+
+  auth.onAuthStateChanged(current => {
+    user = current;
+    if (latest) window.renderTravelControl(latest, Date.now() - latest.ts * 1000 >= 0 && Date.now() - latest.ts * 1000 < 30000);
+  });
+  const dialog = $("house-login-dialog");
+  $("house-sign-in").addEventListener("click", () => {
+    $("house-login-email").value = owner || "";
+    $("house-login-error").textContent = "";
+    dialog.showModal();
+  });
+  $("house-login-cancel").addEventListener("click", () => dialog.close());
+  dialog.addEventListener("close", () => { $("house-login-password").value = ""; });
+  $("house-login-form").addEventListener("submit", async event => {
+    event.preventDefault();
+    $("house-login-submit").disabled = true;
+    $("house-login-error").textContent = "Signing in…";
+    try {
+      await auth.setPersistence(firebase.auth.Auth.Persistence.SESSION);
+      await auth.signInWithEmailAndPassword($("house-login-email").value.trim(), $("house-login-password").value);
+      dialog.close();
+    } catch (error) {
+      $("house-login-error").textContent = `Could not sign in (${error.code || "connection error"}). Check your email and password.`;
+    } finally { $("house-login-submit").disabled = false; }
+  });
+  $("house-verify-email").addEventListener("click", async () => {
+    if (!user) return;
+    try { await user.sendEmailVerification(); status("Verification email sent. Open its link, then sign out and sign in again."); }
+    catch (error) { status(`Could not send verification email: ${error.code || error.message}`, "error"); }
+  });
+  $("house-sign-out").addEventListener("click", () => auth.signOut().catch(error => status(error.message, "error")));
+  document.querySelectorAll("[data-house-mode]").forEach(button => button.addEventListener("click", async () => {
+    if (!latest || !latest.travel || !fresh || pending || !owner || !user || !user.emailVerified || (user.email || "").toLowerCase() !== owner || latest.loadCut) return;
+    const ref = db.ref("commands/house");
+    const id = db.ref().push().key;
+    pending = { id, deadline: Date.now() + 45000 };
+    status("Sending… waiting for the controller to confirm.", "pending");
+    window.renderTravelControl(latest, true);
+    try {
+      await ref.set({ id, mode: +button.dataset.houseMode, issuedAt: firebase.database.ServerValue.TIMESTAMP,
+        expiresAt: Date.now() + serverOffset + 45000, session: latest.travelSession });
+    } catch (error) {
+      if (!pending || pending.id !== id) return;
+      pending = null;
+      status(`Command not sent: ${error.code || error.message}. Check owner permissions and connection.`, "error");
+      if (latest) window.renderTravelControl(latest, fresh);
+    }
+  }));
+})();
+
+</script>
 
 <!-- ============================================================
      UI glue · lives here so app.js stays 100% untouched
@@ -492,5 +2412,6 @@
   });
 })();
 </script>
+
 </body>
 </html>
